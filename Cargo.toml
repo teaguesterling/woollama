@@ -1,0 +1,21 @@
+# Placeholder Cargo manifest. The Rust implementation will land later;
+# this exists so we can publish a v0.0.1 placeholder crate to claim the
+# crates.io name alongside the PyPI one. The Python implementation in
+# src/woollama/ is v0.1's working code; Rust comes when the architecture
+# is stable enough to warrant the rewrite.
+
+[package]
+name = "woollama"
+version = "0.0.1"
+edition = "2021"
+description = "Web Over Ollama (and Llamas) — an MCP + OpenAI router. Placeholder; Python implementation in src/woollama/."
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/teaguesterling/woollama"
+repository = "https://github.com/teaguesterling/woollama"
+keywords = ["mcp", "openai", "ollama", "router", "llm"]
+categories = ["api-bindings"]
+
+[lib]
+name = "woollama"
+path = "rust-stub/lib.rs"
