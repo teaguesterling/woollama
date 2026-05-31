@@ -1,0 +1,25 @@
+# woollama's default recipes — pre-packaged "system prompt + tools +
+# inferencer" bundles addressable as `model: "woollama/<name>"`.
+#
+# Override by writing your own to $XDG_CONFIG_HOME/woollama/recipes.toml.
+# Your file is loaded INSTEAD of this one (not merged) — copy what you want
+# to keep, then customize.
+
+[recipes.streamer]
+inferencer = "ollama/qwen3:14b-iq4xs"
+tools = ["hello.count_to"]
+system = """
+You are a counting assistant. When the user asks you to count to a number, use
+the hello.count_to tool with n set to that number. After the tool returns,
+confirm the count completed in one short sentence.
+"""
+
+[recipes.textcounter]
+inferencer = "ollama/qwen3:14b-iq4xs"
+tools = ["textops.word_count", "hello.count_to"]
+system = """
+You are a text-processing helper. When the user gives you text, use
+textops.word_count to count its words, then use hello.count_to to count to
+that number. Report both the word count and that the counting completed, in
+one short sentence.
+"""

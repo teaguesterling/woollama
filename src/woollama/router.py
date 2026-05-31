@@ -17,28 +17,18 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import recipes
+from . import config, recipes
 from .manager import Registry, ServerManager
 
 
 log = logging.getLogger("woollama.router")
 
-
-# v0.1: hardcoded — moves to mcp.json in slice (b).
 OLLAMA_URL = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
-
-_examples_dir = Path(__file__).resolve().parent.parent.parent / "examples"
-BUILTIN_SERVERS: list[tuple[str, str, list[str]]] = [
-    # (namespace, command, args)
-    ("hello",   "python", [str(_examples_dir / "mcp-hello"   / "server.py")]),
-    ("textops", "python", [str(_examples_dir / "mcp-textops" / "server.py")]),
-]
 
 
 # Module-level registry; populated by lifespan.
@@ -47,8 +37,9 @@ registry = Registry()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    for name, cmd, args in BUILTIN_SERVERS:
-        registry.add(ServerManager(name, cmd, args))
+    # Server bundle from mcp.json (user config or bundled defaults).
+    for name, cfg in config.load_mcp_servers().items():
+        registry.add(ServerManager(name, cfg["command"], cfg["args"]))
     await registry.start_all()
     log.info("registry ready: %s", registry.all_tool_names())
     try:

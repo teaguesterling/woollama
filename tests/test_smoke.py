@@ -18,9 +18,12 @@ def test_app_is_fastapi():
     assert "/v1/chat/completions" in paths
 
 
-def test_recipes_have_streamer():
+def test_recipes_have_streamer(monkeypatch, tmp_path):
     """The bundled single-server recipe is intact."""
+    # Point config dir at an empty location → falls back to bundled defaults
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     from woollama import recipes
+    recipes.reload()
     r = recipes.get("streamer")
     assert r is not None
     assert r["inferencer"].startswith("ollama/")
@@ -29,9 +32,11 @@ def test_recipes_have_streamer():
     assert "streamer" in recipes.names()
 
 
-def test_recipes_have_cross_server():
+def test_recipes_have_cross_server(monkeypatch, tmp_path):
     """The cross-server recipe references tools from both bundled servers."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     from woollama import recipes
+    recipes.reload()
     r = recipes.get("textcounter")
     assert r is not None
     assert "textops.word_count" in r["tools"]
@@ -49,8 +54,10 @@ def test_registry_namespacing():
         reg.lookup_tool("nonexistent.count_to")
 
 
-def test_recipes_unknown_returns_none():
+def test_recipes_unknown_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     from woollama import recipes
+    recipes.reload()
     assert recipes.get("does-not-exist") is None
 
 

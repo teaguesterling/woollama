@@ -1,0 +1,15 @@
+{
+  "_doc": "woollama's default MCP server configuration — Claude-Code-shaped.",
+  "_doc2": "Override by writing your own to $XDG_CONFIG_HOME/woollama/mcp.json. Env var substitution: ${VAR} is expanded at load time. ${WOOLLAMA_EXAMPLES_DIR} resolves to the package's examples/ directory; useful only in these bundled defaults.",
+
+  "mcpServers": {
+    "hello": {
+      "command": "python",
+      "args": ["${WOOLLAMA_EXAMPLES_DIR}/mcp-hello/server.py"]
+    },
+    "textops": {
+      "command": "python",
+      "args": ["${WOOLLAMA_EXAMPLES_DIR}/mcp-textops/server.py"]
+    }
+  }
+}

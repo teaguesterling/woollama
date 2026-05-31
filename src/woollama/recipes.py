@@ -1,11 +1,14 @@
 """Recipes — the "pre-packaged system prompt + tools + inferencer" bundle.
 
-In v0.1 recipes are a hardcoded dict here. In v0.2 they move to a real
-configuration file — the shape stays the same.
+Loaded from `$XDG_CONFIG_HOME/woollama/recipes.toml` (or the bundled
+default at `woollama/defaults/recipes.toml` if the user file doesn't
+exist). See `config.load_recipes` and `defaults/recipes.toml` for the
+schema.
 
-Tool names are **namespaced** as `<server>.<tool>`, matching woollama's
-multi-MCP-server registry. The router parses the namespace at dispatch time
-and routes the tool call to the owning manager."""
+Tool names are namespaced as `<server>.<tool>`, matching the multi-MCP
+unified registry in `manager.Registry`. The router parses the namespace
+at dispatch time and routes to the owning server.
+"""
 from __future__ import annotations
 
 from typing import TypedDict
@@ -20,36 +23,29 @@ class Recipe(TypedDict):
     tools: list[str]       # `<server>.<tool>` names — see manager.Registry
 
 
-BUILTIN: dict[str, Recipe] = {
-    # Single-server recipe — uses one tool from one server.
-    "streamer": {
-        "inferencer": "ollama/qwen3:14b-iq4xs",
-        "system": (
-            "You are a counting assistant. When the user asks you to count to "
-            "a number, use the hello.count_to tool with n set to that number. "
-            "After the tool returns, confirm the count completed in one short "
-            "sentence."
-        ),
-        "tools": ["hello.count_to"],
-    },
-    # Cross-server recipe — combines tools from BOTH bundled example servers,
-    # proving the multi-server unified registry composes in a single chat-loop.
-    "textcounter": {
-        "inferencer": "ollama/qwen3:14b-iq4xs",
-        "system": (
-            "You are a text-processing helper. When the user gives you text, "
-            "use textops.word_count to count its words, then use "
-            "hello.count_to to count to that number. Report both the word "
-            "count and that the counting completed, in one short sentence."
-        ),
-        "tools": ["textops.word_count", "hello.count_to"],
-    },
-}
+# Populated lazily on first access; reloaded if `reload()` is called.
+_LOADED: dict[str, Recipe] | None = None
+
+
+def _load() -> dict[str, Recipe]:
+    global _LOADED
+    if _LOADED is None:
+        # Imported here to avoid a circular import between config <-> recipes.
+        from . import config
+        _LOADED = config.load_recipes()
+    return _LOADED
+
+
+def reload() -> None:
+    """Force a re-read of recipes.toml on next access. Useful for tests
+    and for a future `woollama config reload` op."""
+    global _LOADED
+    _LOADED = None
 
 
 def get(name: str) -> Recipe | None:
-    return BUILTIN.get(name)
+    return _load().get(name)
 
 
 def names() -> list[str]:
-    return list(BUILTIN.keys())
+    return list(_load().keys())
