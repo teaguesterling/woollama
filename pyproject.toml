@@ -29,8 +29,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "openai>=1.0",        # for client-side integration tests
-    "fastmcp>=2.0",       # for the bundled hello example server
+    "pytest-asyncio>=0.23",  # for async test functions
+    "openai>=1.0",           # for client-side integration tests
+    "fastmcp>=2.0",          # for the bundled hello example server
     "ruff",
 ]
 
@@ -73,3 +74,10 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B"]
 ignore = ["E501"]   # line length handled by formatter
+
+[tool.pytest.ini_options]
+addopts = "-m 'not integration'"     # default: skip live tests; opt in with -m integration
+markers = [
+    "integration: live tests against a real Ollama and the bundled MCP servers",
+]
+asyncio_mode = "auto"                # @pytest.mark.asyncio not needed on async tests
