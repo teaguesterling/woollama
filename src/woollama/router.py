@@ -1,15 +1,15 @@
 """The router — woollama's OpenAI-compatible HTTP surface.
 
-What it does:
-  * `GET  /v1/models`         — enumerate Ollama models (prefixed) + recipes
+Endpoints:
+  * `GET  /v1/models`         — list Ollama models (prefixed) + recipes
   * `POST /v1/chat/completions`
       - model = "ollama/X"     → pass-through to local Ollama
-      - model = "woollama/X"   → resolve recipe; orchestrate chat-loop with
-                                  MCP tools; return final answer transparently
+      - model = "woollama/X"   → recipe orchestration with multi-MCP-server
+                                  tool dispatch through the Registry
 
-Per-request MCP subprocess spawn (correct but not optimal — long-lived
-connection pooling is a follow-on). Non-streaming on both sides in v0.1
-(streaming is queued for v0.2).
+Connections to MCP servers are long-lived (one task per server, queue-
+mediated) so we don't pay subprocess-spawn cost per request and we sidestep
+FastAPI lifespan's split startup/shutdown task scope.
 """
 from __future__ import annotations
 
@@ -22,65 +22,46 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from mcp.client.session import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from . import recipes
+from .manager import Registry, ServerManager
 
 
 log = logging.getLogger("woollama.router")
 
 
-# v0.1: hardcoded backend addresses. Move to config in v0.2.
+# v0.1: hardcoded — moves to mcp.json in slice (b).
 OLLAMA_URL = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
 
-# v0.1: the bundled hello MCP server is the only tool source. v0.2 adds
-# multi-server discovery via mcp.json.
-HELLO_SERVER_PATH = str(
-    Path(__file__).resolve().parent.parent.parent
-    / "examples" / "mcp-hello" / "server.py"
-)
+_examples_dir = Path(__file__).resolve().parent.parent.parent / "examples"
+BUILTIN_SERVERS: list[tuple[str, str, list[str]]] = [
+    # (namespace, command, args)
+    ("hello",   "python", [str(_examples_dir / "mcp-hello"   / "server.py")]),
+    ("textops", "python", [str(_examples_dir / "mcp-textops" / "server.py")]),
+]
+
+
+# Module-level registry; populated by lifespan.
+registry = Registry()
 
 
 @asynccontextmanager
-async def _mcp_session():
-    """Spawn the bundled hello MCP server, initialize a client, yield it,
-    clean up. Per-request to sidestep FastAPI's lifespan task-scope split
-    that breaks anyio cancel scopes (see docs/architecture.md, "What v0.1
-    does not include")."""
-    params = StdioServerParameters(command="python", args=[HELLO_SERVER_PATH])
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as sess:
-            await sess.initialize()
-            yield sess
+async def lifespan(_app: FastAPI):
+    for name, cmd, args in BUILTIN_SERVERS:
+        registry.add(ServerManager(name, cmd, args))
+    await registry.start_all()
+    log.info("registry ready: %s", registry.all_tool_names())
+    try:
+        yield
+    finally:
+        await registry.stop_all()
 
 
-def _mcp_tools_for_openai(tools_result, allow_list: list[str]) -> list[dict]:
-    """Translate MCP ToolSpec → OpenAI function-calling format.
-    MCP's `inputSchema` is already JSON-Schema; the OpenAI shape is one
-    level of nesting deeper."""
-    out = []
-    for t in tools_result.tools:
-        if t.name not in allow_list:
-            continue
-        out.append({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description or "",
-                "parameters": t.inputSchema or {"type": "object", "properties": {}},
-            },
-        })
-    return out
-
-
-app = FastAPI(title="woollama", version="0.1.0")
+app = FastAPI(title="woollama", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/v1/models")
 async def list_models() -> JSONResponse:
-    """OpenAI-compatible model list: Ollama models (prefixed with `ollama/`)
-    + woollama recipes (prefixed with `woollama/`)."""
     data: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as c:
         try:
@@ -96,12 +77,15 @@ async def list_models() -> JSONResponse:
     return JSONResponse({"object": "list", "data": data})
 
 
+@app.get("/v1/tools")
+async def list_tools() -> JSONResponse:
+    """Non-OpenAI introspection: what tools across all servers we know about.
+    Useful for debugging multi-server discovery."""
+    return JSONResponse({"tools": registry.all_tool_names()})
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
-    """The dispatch verb. Parses `model` and routes:
-      - `ollama/X`    → pass-through
-      - `woollama/X`  → recipe orchestration
-    """
     body = await request.json()
     model = body.get("model", "")
 
@@ -132,11 +116,6 @@ async def _passthrough_ollama(body: dict) -> JSONResponse:
 
 
 async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONResponse:
-    """The chat-loop. Build messages from system + user turns; call the
-    recipe's inferencer with the recipe's tool allow-list; dispatch any
-    tool_calls to the MCP session; loop until no more tool_calls or
-    max_turns hit; return the final assistant message in OpenAI format.
-    """
     user_msgs = body.get("messages", [])
     messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
 
@@ -148,61 +127,56 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
         )
     inferencer_model = inferencer[len("ollama/"):]
 
-    async with _mcp_session() as sess:
-        tools_list = await sess.list_tools()
-        tools = _mcp_tools_for_openai(tools_list, recipe["tools"])
-        log.info("orchestrating: tools=%s inferencer=%s",
-                 [t["function"]["name"] for t in tools], inferencer_model)
+    tools = registry.openai_tools_for(recipe["tools"])
+    log.info("orchestrating: tools=%s inferencer=%s",
+             [t["function"]["name"] for t in tools], inferencer_model)
 
-        for turn in range(1, 9):
-            req = {
-                "model": inferencer_model,
-                "messages": messages,
-                "tools": tools,
-                "stream": False,
-                "options": {"temperature": 0},
-            }
-            async with httpx.AsyncClient(timeout=180) as c:
-                r = await c.post(f"{OLLAMA_URL}/v1/chat/completions", json=req)
-                resp = r.json()
-            if "choices" not in resp:
-                log.warning("inferencer error: %s", resp)
-                return JSONResponse(resp, status_code=502)
+    for turn in range(1, 9):
+        req = {
+            "model": inferencer_model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+        async with httpx.AsyncClient(timeout=180) as c:
+            r = await c.post(f"{OLLAMA_URL}/v1/chat/completions", json=req)
+            resp = r.json()
+        if "choices" not in resp:
+            log.warning("inferencer error: %s", resp)
+            return JSONResponse(resp, status_code=502)
 
-            msg = resp["choices"][0]["message"]
-            calls = msg.get("tool_calls") or []
-            content = msg.get("content") or ""
-            log.info("turn %d: content[%d] tool_calls=%d",
-                     turn, len(content), len(calls))
+        msg = resp["choices"][0]["message"]
+        calls = msg.get("tool_calls") or []
+        content = msg.get("content") or ""
+        log.info("turn %d: content[%d] tool_calls=%d",
+                 turn, len(content), len(calls))
 
-            if not calls:
-                # Final answer — return as-is in OpenAI shape.
-                return JSONResponse(resp)
+        if not calls:
+            return JSONResponse(resp)
 
-            # Tool dispatch: echo the assistant decision, then append each
-            # tool result. Loop continues.
-            messages.append({"role": "assistant", "content": content,
-                             "tool_calls": calls})
-            for call in calls:
-                fn = call.get("function") or {}
-                name = fn.get("name", "")
-                raw_args = fn.get("arguments") or "{}"
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                log.info("  → %s(%s)", name, json.dumps(args)[:120])
-                try:
-                    r2 = await sess.call_tool(name, args)
-                    parts = [c.text for c in r2.content if hasattr(c, "text")]
-                    result = "\n".join(parts) if parts else json.dumps(
-                        [c.model_dump() for c in r2.content], default=str)
-                except Exception as e:
-                    result = f"ERROR: {type(e).__name__}: {e}"
-                preview = (result[:80] + "…") if len(result) > 80 else result
-                log.info("  ← %s", preview)
-                messages.append({
-                    "role": "tool",
-                    "content": result,
-                    "tool_call_id": call.get("id", f"call_{turn}_{name}"),
-                })
+        messages.append({"role": "assistant", "content": content,
+                         "tool_calls": calls})
+        for call in calls:
+            fn = call.get("function") or {}
+            namespaced = fn.get("name", "")
+            raw_args = fn.get("arguments") or "{}"
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            log.info("  → %s(%s)", namespaced, json.dumps(args)[:120])
+            try:
+                r2 = await registry.dispatch(namespaced, args)
+                parts = [c.text for c in r2.content if hasattr(c, "text")]
+                result = "\n".join(parts) if parts else json.dumps(
+                    [c.model_dump() for c in r2.content], default=str)
+            except Exception as e:
+                result = f"ERROR: {type(e).__name__}: {e}"
+            preview = (result[:80] + "…") if len(result) > 80 else result
+            log.info("  ← %s", preview)
+            messages.append({
+                "role": "tool",
+                "content": result,
+                "tool_call_id": call.get("id", f"call_{turn}_{namespaced}"),
+            })
 
     return _error("max turns (8) exceeded", "server_error", 500)
 

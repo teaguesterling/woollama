@@ -19,13 +19,34 @@ def test_app_is_fastapi():
 
 
 def test_recipes_have_streamer():
-    """The bundled v0.1 example recipe is intact."""
+    """The bundled single-server recipe is intact."""
     from woollama import recipes
     r = recipes.get("streamer")
     assert r is not None
     assert r["inferencer"].startswith("ollama/")
-    assert "count_to" in r["tools"]
+    # Tools are now namespaced as <server>.<tool>
+    assert "hello.count_to" in r["tools"]
     assert "streamer" in recipes.names()
+
+
+def test_recipes_have_cross_server():
+    """The cross-server recipe references tools from both bundled servers."""
+    from woollama import recipes
+    r = recipes.get("textcounter")
+    assert r is not None
+    assert "textops.word_count" in r["tools"]
+    assert "hello.count_to" in r["tools"]
+
+
+def test_registry_namespacing():
+    """The registry's tool lookup parses `<server>.<tool>` correctly."""
+    from woollama.manager import Registry
+    import pytest
+    reg = Registry()
+    with pytest.raises(KeyError, match="namespaced"):
+        reg.lookup_tool("count_to")  # bare name should reject
+    with pytest.raises(KeyError, match="unknown server"):
+        reg.lookup_tool("nonexistent.count_to")
 
 
 def test_recipes_unknown_returns_none():
