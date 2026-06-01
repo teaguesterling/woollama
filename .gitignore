@@ -41,3 +41,6 @@ Thumbs.db
 
 # Local throwaway probes / experiments (not committed)
 scratch/
+
+# jetsam internal tool state
+.jetsam/
