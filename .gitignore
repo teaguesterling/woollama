@@ -38,3 +38,6 @@ Thumbs.db
 # Project-specific
 *.log
 .woollama/
+
+# Local throwaway probes / experiments (not committed)
+scratch/

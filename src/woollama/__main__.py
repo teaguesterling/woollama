@@ -1,7 +1,11 @@
 """`python -m woollama` and the `woollama` console script entrypoint.
 
-Resolves the bind address, prints it (and the persisted addr-file path),
-starts uvicorn.
+Two modes:
+  * `woollama`        — the OpenAI-compatible HTTP server (default). Resolves
+                        the bind address, prints it, starts uvicorn.
+  * `woollama mcp`    — woollama as an MCP server over stdio (slice e). This
+                        is what an MCP client puts in its mcp.json:
+                        { "command": "woollama", "args": ["mcp"] }.
 """
 from __future__ import annotations
 
@@ -15,10 +19,27 @@ from .binding import addr_file_path, resolve_bind
 from .router import app
 
 
+def _run_mcp() -> int:
+    """`woollama mcp` — stdio MCP server. stdout is the JSON-RPC channel, so
+    logging must go to stderr and nothing else may print to stdout."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
+    from .mcp_server import serve
+    serve()
+    return 0
+
+
 def main() -> int:
     if "--version" in sys.argv:
         print(f"woollama {__version__}")
         return 0
+
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp":
+        return _run_mcp()
 
     logging.basicConfig(
         level=logging.INFO,

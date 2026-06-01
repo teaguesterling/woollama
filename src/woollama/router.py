@@ -28,6 +28,22 @@ from .manager import Registry, ServerManager
 
 log = logging.getLogger("woollama.router")
 
+
+class OrchestrationError(Exception):
+    """Raised by the transport-agnostic orchestration loop. Each transport
+    maps it to its own error surface (HTTP status / MCP error).
+
+    `payload` carries the raw upstream response when the inferencer itself
+    errored, so the HTTP surface can pass it through verbatim."""
+
+    def __init__(self, message: str, kind: str, status: int,
+                 payload: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.kind = kind
+        self.status = status
+        self.payload = payload
+
 OLLAMA_URL = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
 
 
@@ -106,19 +122,28 @@ async def _passthrough_ollama(body: dict) -> JSONResponse:
         return JSONResponse(r.json(), status_code=r.status_code)
 
 
-async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONResponse:
-    user_msgs = body.get("messages", [])
+async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
+                      reg: Registry) -> dict:
+    """Transport-agnostic recipe chat-loop. Prepends the recipe's system
+    prompt, runs the inferencer ↔ tool-dispatch loop (≤8 turns), and returns
+    the final OpenAI-shaped response dict (the one with `choices`).
+
+    Both the HTTP `/v1/chat/completions` handler and the MCP `chat` tool call
+    this — do NOT reimplement the loop. Tool dispatch routes through `reg`
+    (the caller's `Registry`), so each transport owns its own registry
+    lifecycle. Raises `OrchestrationError` for the unsupported-inferencer,
+    inferencer-error, and max-turns-exceeded cases."""
     messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
 
     inferencer = recipe["inferencer"]
     if not inferencer.startswith("ollama/"):
-        return _error(
+        raise OrchestrationError(
             f"v0.1 supports ollama/ inferencers only (got '{inferencer}')",
             "not_implemented", 501,
         )
     inferencer_model = inferencer[len("ollama/"):]
 
-    tools = registry.openai_tools_for(recipe["tools"])
+    tools = reg.openai_tools_for(recipe["tools"])
     log.info("orchestrating: tools=%s inferencer=%s",
              [t["function"]["name"] for t in tools], inferencer_model)
 
@@ -135,7 +160,8 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
             resp = r.json()
         if "choices" not in resp:
             log.warning("inferencer error: %s", resp)
-            return JSONResponse(resp, status_code=502)
+            raise OrchestrationError("inferencer error", "server_error", 502,
+                                     payload=resp)
 
         msg = resp["choices"][0]["message"]
         calls = msg.get("tool_calls") or []
@@ -144,7 +170,7 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
                  turn, len(content), len(calls))
 
         if not calls:
-            return JSONResponse(resp)
+            return resp
 
         messages.append({"role": "assistant", "content": content,
                          "tool_calls": calls})
@@ -155,7 +181,7 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             log.info("  → %s(%s)", namespaced, json.dumps(args)[:120])
             try:
-                r2 = await registry.dispatch(namespaced, args)
+                r2 = await reg.dispatch(namespaced, args)
                 parts = [c.text for c in r2.content if hasattr(c, "text")]
                 result = "\n".join(parts) if parts else json.dumps(
                     [c.model_dump() for c in r2.content], default=str)
@@ -169,7 +195,18 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
                 "tool_call_id": call.get("id", f"call_{turn}_{namespaced}"),
             })
 
-    return _error("max turns (8) exceeded", "server_error", 500)
+    raise OrchestrationError("max turns (8) exceeded", "server_error", 500)
+
+
+async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONResponse:
+    """HTTP adapter: run the shared loop, map results/errors onto JSON."""
+    try:
+        resp = await orchestrate(recipe, body.get("messages", []), registry)
+    except OrchestrationError as e:
+        if e.payload is not None:
+            return JSONResponse(e.payload, status_code=e.status)
+        return _error(e.message, e.kind, e.status)
+    return JSONResponse(resp)
 
 
 def _error(message: str, kind: str, status: int) -> JSONResponse:

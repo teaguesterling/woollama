@@ -150,3 +150,85 @@ def test_orchestrated_recipe_hides_tool_loop_from_client(woollama_server):
     assert r.choices[0].message.content
     assert r.choices[0].message.tool_calls is None, \
         "client should not see internal tool_calls"
+
+
+# ---------------------------------------------------------------------------
+# woollama-as-MCP-server over real stdio (slice e)
+# ---------------------------------------------------------------------------
+#
+# Unlike the in-memory unit tests in test_mcp_server.py, this drives a real
+# `woollama mcp` subprocess over stdio with a real MCP client AND a *started*
+# registry (the bundled hello + textops example servers spawn as their own
+# subprocesses). That started registry is what the in-memory unit tests can't
+# exercise — it's the only thing that proves registry.start_all() binds its
+# connection-owning tasks to the same event loop that serves tool calls. No
+# Ollama needed for the MCP surface itself, so this isn't gated on it.
+
+async def test_mcp_stdio_surface_with_started_registry(tmp_path):
+    """Spawn `woollama mcp` over stdio with bundled defaults; verify the MCP
+    surface (capabilities, recipe prompts, the chat tool) AND that the real
+    registry starts cleanly over stdio (hello + textops example servers)."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+
+    transport = StdioTransport(
+        command=sys.executable,
+        args=["-m", "woollama", "mcp"],
+        env={**os.environ, "WOOLLAMA_CONFIG_DIR": str(tmp_path)},
+        cwd=str(REPO_ROOT),
+    )
+    from fastmcp.exceptions import ToolError
+
+    async with Client(transport) as c:
+        caps = c.initialize_result.capabilities
+        assert caps.tools is not None and caps.prompts is not None
+
+        prompt_names = {p.name for p in await c.list_prompts()}
+        assert {"streamer", "textcounter"} <= prompt_names
+
+        tool_names = {t.name for t in await c.list_tools()}
+        assert "chat" in tool_names
+
+        # Connecting at all already proves the lifespan's registry.start_all()
+        # didn't deadlock over stdio (the cross-loop hazard) and the server
+        # came up clean (no banner corrupting the JSON-RPC stream). Calling the
+        # tool proves it executes: an unknown recipe surfaces as a clean
+        # ToolError rather than the transport silently dropping the request.
+        # (This stops short of orchestration — recipes.get() short-circuits
+        # before dispatch; the Ollama-gated test below drives the full loop.)
+        with pytest.raises(ToolError, match="unknown recipe"):
+            await c.call_tool("chat", {
+                "recipe": "_no_such_recipe_",
+                "messages": [{"role": "user", "content": "hi"}],
+            })
+
+
+@needs_ollama
+async def test_mcp_stdio_chat_orchestrates_end_to_end(tmp_path):
+    """Drive woollama as an MCP server over real stdio and run the `chat` tool
+    through a full recipe orchestration (inferencer + tool dispatch). The MCP
+    counterpart of test_orchestrated_recipe_hides_tool_loop_from_client — gives
+    the MCP transport the same end-to-end parity the HTTP surface has."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+
+    # The bundled streamer recipe needs qwen3:14b-iq4xs.
+    if not _ollama_reachable() or "qwen3:14b-iq4xs" not in (
+        httpx.get(f"{OLLAMA_URL}/api/tags", timeout=2).text
+    ):
+        pytest.skip("qwen3:14b-iq4xs not available; bundled recipe needs it")
+
+    transport = StdioTransport(
+        command=sys.executable,
+        args=["-m", "woollama", "mcp"],
+        env={**os.environ, "WOOLLAMA_CONFIG_DIR": str(tmp_path)},
+        cwd=str(REPO_ROOT),
+    )
+    async with Client(transport) as c:
+        result = await c.call_tool("chat", {
+            "recipe": "streamer",
+            "messages": [{"role": "user", "content": "Count to 3."}],
+        })
+    # Client sees only the final assistant string — the internal inferencer ↔
+    # tool loop stays hidden, same contract as the OpenAI surface.
+    assert isinstance(result.data, str) and result.data.strip()
