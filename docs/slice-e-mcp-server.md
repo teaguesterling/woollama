@@ -180,9 +180,10 @@ The MCP server is a thin projection over machinery that already exists:
 ```
 
 ### Natural next slices
-- HTTP/SSE transport (FastMCP supports it; `serve()` picks the transport). Open
-  sub-decision: mount the MCP surface into the existing FastAPI/uvicorn app
-  (one process, one port, alongside the OpenAI surface) vs. a separate server.
+- ~~HTTP/SSE transport~~ — DONE as Streamable HTTP, mounted (see follow-on below).
+- Re-export `output_schema` pass-through on proxy tools (currently content +
+  structuredContent only).
+- Legacy SSE transport, if a client ever needs it (FastMCP `transport="sse"`).
 
 ## Follow-on slice — tool re-export (decision #3, 2026-06-01)
 
@@ -268,3 +269,57 @@ count_to across two sessions, returning a single hidden-loop answer.
 
 - **Verified**: default suite 56 passed / 6 deselected; full integration suite
   6 passed (incl. the live two-provider chat); the demo runs end-to-end.
+
+## Follow-on slice — MCP over Streamable HTTP, mounted on one port (2026-06-01)
+
+woollama now serves BOTH surfaces on a single port: `/v1/*` (OpenAI) and `/mcp`
+(MCP over Streamable HTTP), over ONE shared registry — the router thesis. Both
+`/mcp` and `/mcp/` work; the mount does not shadow `/v1/*`. (User decisions:
+mount-into-FastAPI over standalone; Streamable HTTP over legacy SSE.)
+
+The load-bearing design (Design Y — registry owned in one place):
+- **Single shared registry** (`router.registry`) started once by router's
+  FastAPI lifespan and used by BOTH the OpenAI orchestration path and the MCP
+  chat/proxy tools. Under uvicorn there's one event loop, so `start_all()` and
+  every request (both surfaces) run on it — the `ServerManager` loop-binding
+  invariant holds for free.
+- **`build_server(registry, *, manage_registry=False)`** for the mounted server:
+  it must NOT start/stop the registry (FastAPI's lifespan owns it) — avoids a
+  double-start. The stdio path keeps `manage_registry=True`.
+- **Lifespan composition** in `router.lifespan`: populate + `start_all` →
+  `register_reexported_tools(_mcp, registry)` (re-export is dynamic, post-start,
+  and — verified — visible over the HTTP transport even though tools are added
+  after `http_app()` is constructed) → `async with _mcp_app.lifespan(app)` (the
+  Streamable HTTP session manager) → yield → `stop_all`.
+- **Import cycle broken**: `mcp_server` lazy-imports `orchestrate`/
+  `OrchestrationError` inside the `chat` tool, so `router` can import
+  `build_server`/`register_reexported_tools` at module top and mount at import
+  (`_mcp_app = _mcp.http_app(path="/")`; `app.mount("/mcp", _mcp_app)`).
+- **`register_reexported_tools`** is now public (was `_register_…`) since both
+  `build_server`'s stdio lifespan and router's HTTP lifespan call it.
+
+Client mcp.json entry (HTTP): `{ "url": "http://<host>:<port>/mcp" }`.
+
+**Tests** (`tests/test_integration.py`, opt-in): `test_mcp_over_http_shares_
+one_port_and_registry` (not Ollama-gated) — `/v1/models` still 200 (mount didn't
+shadow it), `/mcp` lists chat + re-exported tools, and `hello.count_to{n:3}`
+dispatches over HTTP returning the structured dict; `test_mcp_over_http_chat_
+orchestrates_end_to_end` (`@needs_ollama`) — full `chat` orchestration over the
+mounted HTTP surface.
+
+**`examples/routing_demo.py`** updated: its MCP-aggregator section now connects
+to `/mcp` on the SAME running HTTP server (Streamable HTTP) instead of spawning
+a separate `woollama mcp` stdio process — so the demo actually showcases the
+one-port-both-surfaces capability. Confirmed end-to-end against real Ollama.
+
+**Coupling note (intentional):** `router.lifespan` now starts the shared
+registry entangled with the mounted MCP app's lifespan, and `_mcp`/`_mcp_app`
+are built at import. So the OpenAI surface (`/v1/*`) now has a hard dependency
+on the MCP server constructing + its lifespan entering cleanly — if MCP mounting
+throws, `/v1/*` goes down with it. Acceptable for "one unified router," but it
+widens the OpenAI surface's blast radius.
+
+- **Verified**: default suite 56 passed / 6 deselected (the import-time mount
+  construction is exercised by every `import woollama.router`); full integration
+  suite 8 passed (incl. both new HTTP-mount tests + the live chat-over-HTTP);
+  the one-port demo runs end-to-end.

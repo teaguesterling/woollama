@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from . import config, recipes
 from .manager import Registry, ServerManager
+from .mcp_server import build_server, register_reexported_tools
 
 
 log = logging.getLogger("woollama.router")
@@ -47,24 +48,41 @@ class OrchestrationError(Exception):
 OLLAMA_URL = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
 
 
-# Module-level registry; populated by lifespan.
+# Module-level registry; SHARED by both surfaces — the OpenAI orchestration
+# path (below) and the mounted MCP server. Populated + started once by the
+# lifespan, so there is a single connection layer to the downstream MCP servers.
 registry = Registry()
+
+# The MCP server, mounted onto this same FastAPI app so woollama exposes BOTH
+# surfaces on one port: /v1/* (OpenAI-compatible) and /mcp (MCP over Streamable
+# HTTP). Built with manage_registry=False — the FastAPI lifespan owns the shared
+# registry, so the MCP server must not start/stop it (double-start). The MCP app
+# carries its own (session-manager) lifespan, composed into ours below.
+_mcp = build_server(registry, manage_registry=False)
+_mcp_app = _mcp.http_app(path="/", transport="http")
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     # Server bundle from mcp.json (user config or bundled defaults).
     for name, cfg in config.load_mcp_servers().items():
         registry.add(ServerManager(name, cfg["command"], cfg["args"]))
     await registry.start_all()
     log.info("registry ready: %s", registry.all_tool_names())
-    try:
-        yield
-    finally:
-        await registry.stop_all()
+    # Downstream tools are known now → re-export them onto the MCP surface
+    # (same dynamic registration the stdio path does in build_server's lifespan).
+    register_reexported_tools(_mcp, registry)
+    # Run the mounted MCP app's own lifespan (Streamable HTTP session manager)
+    # for the duration of the server, then tear the registry down.
+    async with _mcp_app.lifespan(app):
+        try:
+            yield
+        finally:
+            await registry.stop_all()
 
 
 app = FastAPI(title="woollama", version="0.1.0", lifespan=lifespan)
+app.mount("/mcp", _mcp_app)
 
 
 @app.get("/v1/models")

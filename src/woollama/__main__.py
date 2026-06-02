@@ -52,6 +52,7 @@ def main() -> int:
     print(f"  OpenAI base_url:      http://{host}:{port}/v1", flush=True)
     print(f"  models:               GET /v1/models", flush=True)
     print(f"  chat:                 POST /v1/chat/completions", flush=True)
+    print(f"  MCP (Streamable HTTP): http://{host}:{port}/mcp", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")
     return 0
 

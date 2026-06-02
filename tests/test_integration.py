@@ -270,3 +270,55 @@ async def test_mcp_stdio_chat_orchestrates_end_to_end(tmp_path):
     # Client sees only the final assistant string — the internal inferencer ↔
     # tool loop stays hidden, same contract as the OpenAI surface.
     assert isinstance(result.data, str) and result.data.strip()
+
+
+# ---------------------------------------------------------------------------
+# woollama-as-MCP-server over HTTP, MOUNTED on the same port as the OpenAI
+# surface (slice g — Streamable HTTP). Reuses the woollama_server fixture (a
+# real `python -m woollama` HTTP server), which now also serves /mcp.
+# ---------------------------------------------------------------------------
+
+async def test_mcp_over_http_shares_one_port_and_registry(woollama_server):
+    """The mounted MCP surface and the OpenAI surface live on ONE port over ONE
+    shared registry. Proves: /v1/* still works (mount didn't shadow it), the MCP
+    endpoint lists chat + re-exported downstream tools, and a proxy tool
+    dispatches over HTTP end-to-end (registry dispatch on the serving loop, not
+    by analogy to stdio). No Ollama needed."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    # Same port, OpenAI surface intact.
+    assert httpx.get(f"{woollama_server}/v1/models", timeout=5).status_code == 200
+
+    async with Client(transport=StreamableHttpTransport(url=f"{woollama_server}/mcp")) as c:
+        caps = c.initialize_result.capabilities
+        assert caps.tools is not None and caps.prompts is not None
+        assert {"streamer", "textcounter"} <= {p.name for p in await c.list_prompts()}
+
+        tool_names = {t.name for t in await c.list_tools()}
+        assert "chat" in tool_names
+        assert {"hello.count_to", "textops.word_count"} <= tool_names
+
+        # Proxy dispatch over HTTP, end-to-end through the shared registry.
+        counted = await c.call_tool("hello.count_to", {"n": 3})
+        assert counted.data == {"count": 3, "total": 3, "done": True}
+
+
+@needs_ollama
+async def test_mcp_over_http_chat_orchestrates_end_to_end(woollama_server):
+    """Full recipe orchestration over the mounted HTTP MCP surface — the
+    Streamable-HTTP counterpart of the stdio chat test. Uses the SAME shared
+    registry as the OpenAI surface on the same port."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; bundled recipe needs it")
+
+    async with Client(transport=StreamableHttpTransport(url=f"{woollama_server}/mcp")) as c:
+        result = await c.call_tool("chat", {
+            "recipe": "streamer",
+            "messages": [{"role": "user", "content": "Count to 3."}],
+        })
+    assert isinstance(result.data, str) and result.data.strip()

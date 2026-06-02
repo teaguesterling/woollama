@@ -44,7 +44,9 @@ from pydantic import PrivateAttr
 
 from . import config, recipes
 from .manager import Registry, ServerManager
-from .router import OrchestrationError, orchestrate
+# NOTE: `orchestrate`/`OrchestrationError` are imported lazily inside the chat
+# tool (not at module top) to break the import cycle: router.py imports this
+# module to mount the MCP server onto its FastAPI app.
 
 
 log = logging.getLogger("woollama.mcp_server")
@@ -136,6 +138,8 @@ def _chat_tool(reg: Registry) -> Tool:
             model: optional "woollama/<recipe>" form, accepted for symmetry
                 with the OpenAI surface; used only when `recipe` is empty.
         """
+        from .router import OrchestrationError, orchestrate  # lazy: breaks cycle
+
         name = recipe or (model[len("woollama/"):]
                           if model.startswith("woollama/") else model)
         if not name:
@@ -152,17 +156,19 @@ def _chat_tool(reg: Registry) -> Tool:
     return Tool.from_function(chat, name="chat")
 
 
-def _register_reexported_tools(mcp: FastMCP, reg: Registry) -> None:
+def register_reexported_tools(mcp: FastMCP, reg: Registry) -> None:
     """Re-export every discovered downstream tool (namespaced) onto tools/list,
     so an MCP client connecting to woollama sees the union of all configured
     servers' tools plus the `chat` verb — woollama as an MCP aggregator
     (decision #3, now realized).
 
     This MUST run after `reg.start_all()`: a server's tools are only known once
-    its connection is up. That's why it's a lifespan-time *dynamic*
-    registration (FastMCP advertises tools.listChanged, and the tools are in
-    place before the server serves its first tools/list) — NOT a build-time
-    concat, since the registry isn't started when `build_server` runs."""
+    its connection is up. That's why it's a *dynamic* registration (FastMCP
+    advertises tools.listChanged, and the tools are in place before the server
+    serves its first tools/list) — NOT a build-time concat, since the registry
+    isn't started when `build_server` runs. Stdio drives this from
+    `build_server`'s own lifespan; the mounted HTTP path (manage_registry=False)
+    drives it from router's FastAPI lifespan, which owns the shared registry."""
     count = 0
     for mgr in reg.servers.values():
         for spec in mgr.tools:
@@ -178,25 +184,33 @@ def _register_reexported_tools(mcp: FastMCP, reg: Registry) -> None:
              count, reg.all_tool_names())
 
 
-def build_server(registry: Registry) -> FastMCP:
-    """Construct the FastMCP server: recipe prompts + the `chat` tool, with a
-    lifespan that start_all/stop_all the registry on the serving loop.
+def build_server(registry: Registry, *, manage_registry: bool = True) -> FastMCP:
+    """Construct the FastMCP server: recipe prompts + the `chat` tool.
+
+    `manage_registry` (default True): attach a lifespan that start_all/stop_all
+    the registry on the serving loop and re-exports downstream tools — used by
+    the stdio (`woollama mcp`) path, which owns the registry. Set False when the
+    server is MOUNTED into another app (the HTTP path): there, router's FastAPI
+    lifespan owns the shared registry and calls `register_reexported_tools`
+    itself, so this server must NOT also start/stop it (double-start).
 
     Prompts snapshot the currently-loaded recipes — callers that need a
     specific recipe set should `recipes.reload()` (with WOOLLAMA_CONFIG_DIR)
     before building."""
 
-    @asynccontextmanager
-    async def lifespan(server: FastMCP):
-        # Started here (not eagerly) so the connection-owning tasks bind to the
-        # same event loop that serves tool calls — see manager.ServerManager.
-        await registry.start_all()
-        # Now the downstream tools are known: re-export them onto tools/list.
-        _register_reexported_tools(server, registry)
-        try:
-            yield
-        finally:
-            await registry.stop_all()
+    lifespan = None
+    if manage_registry:
+        @asynccontextmanager
+        async def lifespan(server: FastMCP):
+            # Started here (not eagerly) so the connection-owning tasks bind to
+            # the same event loop that serves tool calls — see ServerManager.
+            await registry.start_all()
+            # Now the downstream tools are known: re-export them onto tools/list.
+            register_reexported_tools(server, registry)
+            try:
+                yield
+            finally:
+                await registry.stop_all()
 
     mcp = FastMCP("woollama", lifespan=lifespan)
     for prompt in _recipe_prompts():

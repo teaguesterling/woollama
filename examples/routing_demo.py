@@ -1,19 +1,20 @@
 #!/usr/bin/env python
 """routing_demo.py — watch woollama route requests, live.
 
-Spins up woollama (both its OpenAI HTTP surface and its MCP stdio surface) with
-the bundled default config (the hello + textops example servers) and walks
-through every routing activity, printing what goes where:
+Spins up ONE woollama HTTP server with the bundled default config (the hello +
+textops example servers) — it exposes BOTH surfaces on one port: the OpenAI
+/v1/* API and the MCP /mcp endpoint (Streamable HTTP). Walks through every
+routing activity, printing what goes where:
 
   1. Discovery        — /v1/models and /v1/tools (the union across providers)
   2. Passthrough      — ollama/<model> straight to Ollama (needs Ollama)
   3. Orchestration    — woollama/textcounter: ONE chat using tools from TWO
                         providers (textops + hello), proxied across two sessions
                         (needs Ollama)
-  4. MCP aggregator   — connect AS an MCP client; list recipes-as-prompts and
-                        the chat verb + every re-exported downstream tool, then
-                        call hello.count_to and textops.word_count directly
-                        (no Ollama needed)
+  4. MCP aggregator   — connect AS an MCP client to /mcp on the SAME port; list
+                        recipes-as-prompts and the chat verb + every re-exported
+                        downstream tool, then call hello.count_to and
+                        textops.word_count directly (no Ollama needed)
   5. Rejections       — the things that must NOT work
 
 Run:    python examples/routing_demo.py
@@ -84,62 +85,58 @@ def woollama_http(config_dir: str):
             proc.kill()
 
 
-def http_demo(config_dir: str) -> None:
-    with woollama_http(config_dir) as base:
-        c = httpx.Client(base_url=base, timeout=180)
+def http_demo(c: httpx.Client) -> None:
+    """Sections 1-3 + 5a, over the OpenAI /v1/* surface (server already up)."""
+    hdr("1. Discovery")
+    models = c.get("/v1/models").json()["data"]
+    print("  /v1/models:")
+    for m in models:
+        print(f"    {m['id']:32}  (owned_by={m['owned_by']})")
+    tools = c.get("/v1/tools").json()["tools"]
+    print(f"  /v1/tools (namespaced across providers): {tools}")
 
-        hdr("1. Discovery")
-        models = c.get("/v1/models").json()["data"]
-        print("  /v1/models:")
-        for m in models:
-            print(f"    {m['id']:32}  (owned_by={m['owned_by']})")
-        tools = c.get("/v1/tools").json()["tools"]
-        print(f"  /v1/tools (namespaced across providers): {tools}")
-
-        if ollama_up():
-            ollama_ids = [m["id"][len("ollama/"):] for m in models
-                          if m["id"].startswith("ollama/")]
-            hdr("2. Passthrough — ollama/<model> (no tools, straight through)")
-            if ollama_ids:
-                r = c.post("/v1/chat/completions", json={
-                    "model": f"ollama/{ollama_ids[0]}",
-                    "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-                }).json()
-                print(f"  ollama/{ollama_ids[0]} → {r['choices'][0]['message']['content']!r}")
-
-            hdr("3. Orchestration — woollama/textcounter (TWO providers, one chat)")
-            print("  recipe textcounter allow-lists: textops.word_count + hello.count_to")
-            print("  → model calls word_count (textops session), then count_to (hello session)")
+    if ollama_up():
+        ollama_ids = [m["id"][len("ollama/"):] for m in models
+                      if m["id"].startswith("ollama/")]
+        hdr("2. Passthrough — ollama/<model> (no tools, straight through)")
+        if ollama_ids:
             r = c.post("/v1/chat/completions", json={
-                "model": "woollama/textcounter",
-                "messages": [{"role": "user",
-                              "content": "Count the words in: the quick brown fox"}],
+                "model": f"ollama/{ollama_ids[0]}",
+                "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
             }).json()
-            msg = r["choices"][0]["message"]
-            print(f"  final answer (tool loop hidden): {msg['content']!r}")
-            print(f"  tool_calls leaked to client? {msg.get('tool_calls')}")
-        else:
-            hdr("2-3. Passthrough + orchestration — SKIPPED (Ollama not reachable)")
-            print(f"  start Ollama at {OLLAMA_URL} to see these.")
+            print(f"  ollama/{ollama_ids[0]} → {r['choices'][0]['message']['content']!r}")
 
-        hdr("5a. Rejections (HTTP) — must NOT work")
-        for model in ("bogus/x", "woollama/does-not-exist"):
-            r = c.post("/v1/chat/completions",
-                       json={"model": model, "messages": []})
-            print(f"  model={model!r:28} → HTTP {r.status_code}  {r.json()['error']['type']}")
+        hdr("3. Orchestration — woollama/textcounter (TWO providers, one chat)")
+        print("  recipe textcounter allow-lists: textops.word_count + hello.count_to")
+        print("  → model calls word_count (textops session), then count_to (hello session)")
+        r = c.post("/v1/chat/completions", json={
+            "model": "woollama/textcounter",
+            "messages": [{"role": "user",
+                          "content": "Count the words in: the quick brown fox"}],
+        }).json()
+        msg = r["choices"][0]["message"]
+        print(f"  final answer (tool loop hidden): {msg['content']!r}")
+        print(f"  tool_calls leaked to client? {msg.get('tool_calls')}")
+    else:
+        hdr("2-3. Passthrough + orchestration — SKIPPED (Ollama not reachable)")
+        print(f"  start Ollama at {OLLAMA_URL} to see these.")
+
+    hdr("5a. Rejections (HTTP) — must NOT work")
+    for model in ("bogus/x", "woollama/does-not-exist"):
+        r = c.post("/v1/chat/completions",
+                   json={"model": model, "messages": []})
+        print(f"  model={model!r:28} → HTTP {r.status_code}  {r.json()['error']['type']}")
 
 
-async def mcp_demo(config_dir: str) -> None:
+async def mcp_over_http_demo(base: str) -> None:
+    """Section 4 + 5b: connect AS an MCP client to /mcp on the SAME running
+    server (no separate process) — the one-port-both-surfaces capability."""
     from fastmcp import Client
-    from fastmcp.client.transports import StdioTransport
+    from fastmcp.client.transports import StreamableHttpTransport
     from fastmcp.exceptions import ToolError
 
-    transport = StdioTransport(
-        command=sys.executable, args=["-m", "woollama", "mcp"],
-        env={**os.environ, "WOOLLAMA_CONFIG_DIR": config_dir}, cwd=REPO_ROOT)
-
-    hdr("4. MCP aggregator — woollama AS an MCP server (no Ollama needed)")
-    async with Client(transport) as client:
+    hdr("4. MCP aggregator — /mcp on the SAME port as /v1 (no Ollama needed)")
+    async with Client(transport=StreamableHttpTransport(url=f"{base}/mcp")) as client:
         prompts = await client.list_prompts()
         print(f"  prompts (recipes): {[p.name for p in prompts]}")
         tools = sorted(t.name for t in await client.list_tools())
@@ -171,8 +168,11 @@ def main() -> int:
     print("woollama routing demo — bundled defaults (hello + textops servers)")
     print(f"Ollama at {OLLAMA_URL}: {'reachable' if ollama_up() else 'NOT reachable (parts 2-3 skip)'}")
     with tempfile.TemporaryDirectory() as config_dir:  # forces bundled defaults
-        http_demo(config_dir)
-        asyncio.run(mcp_demo(config_dir))
+        with woollama_http(config_dir) as base:
+            print(f"\nwoollama up at {base} — OpenAI /v1/* AND MCP /mcp on ONE port")
+            with httpx.Client(base_url=base, timeout=180) as c:
+                http_demo(c)
+            asyncio.run(mcp_over_http_demo(base))
     print("\nDone.")
     return 0
 
