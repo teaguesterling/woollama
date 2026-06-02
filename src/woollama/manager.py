@@ -19,7 +19,6 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-
 log = logging.getLogger("woollama.manager")
 
 

@@ -16,7 +16,6 @@ import pytest
 from woollama import manager
 from woollama.manager import Registry, ServerManager
 
-
 # ---------------------------------------------------------------------------
 # Stubs for the MCP client surfaces ServerManager wraps
 # ---------------------------------------------------------------------------

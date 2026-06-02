@@ -44,6 +44,7 @@ from pydantic import PrivateAttr
 
 from . import config, recipes
 from .manager import Registry, ServerManager
+
 # NOTE: `orchestrate`/`OrchestrationError` are imported lazily inside the chat
 # tool (not at module top) to break the import cycle: router.py imports this
 # module to mount the MCP server onto its FastAPI app.

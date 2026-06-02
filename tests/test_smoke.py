@@ -45,8 +45,9 @@ def test_recipes_have_cross_server(monkeypatch, tmp_path):
 
 def test_registry_namespacing():
     """The registry's tool lookup parses `<server>.<tool>` correctly."""
-    from woollama.manager import Registry
     import pytest
+
+    from woollama.manager import Registry
     reg = Registry()
     with pytest.raises(KeyError, match="namespaced"):
         reg.lookup_tool("count_to")  # bare name should reject

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastmcp import FastMCP, Context
+from fastmcp import Context, FastMCP
 
 mcp = FastMCP("cosmic-mcp-hello")
 

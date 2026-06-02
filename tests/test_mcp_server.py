@@ -30,7 +30,6 @@ from mcp.types import TextContent
 from woollama import mcp_server, recipes
 from woollama.manager import Registry, ServerManager
 
-
 # fastmcp's Client is async; mark the whole module.
 pytestmark = pytest.mark.asyncio
 

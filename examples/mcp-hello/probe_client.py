@@ -18,7 +18,6 @@ from pathlib import Path
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-
 PROGRESS_LOG: list[tuple[float, dict]] = []
 ELICITATIONS: list[dict] = []
 _T0 = 0.0
@@ -93,7 +92,7 @@ async def main():
                                           "total": total, "message": message})))
             )
             print(f"  result: {[getattr(c, 'text', None) for c in r.content]}")
-            print(f"  events during call (chronological):")
+            print("  events during call (chronological):")
             for ts, ev in PROGRESS_LOG:
                 # Compact representation: focus on progress data
                 if ev.get("progress_cb"):
@@ -121,7 +120,7 @@ async def main():
             # ---- verdict ----
             print("=" * 60)
             print("VERDICT:")
-            print(f"  T1 (basic tool):           round-trip OK")
+            print("  T1 (basic tool):           round-trip OK")
             print(f"  T2 (progress streaming):   {'OK' if PROGRESS_LOG or True else 'BROKEN'}")
             print(f"  T3 (bidirectional/elicit): {'OK' if ELICITATIONS else 'NOT SUPPORTED — '+ str(r.content[0].text if r.content else '')[:120]}")
 

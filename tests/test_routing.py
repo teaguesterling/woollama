@@ -34,7 +34,6 @@ from mcp.types import TextContent
 from woollama import claude_code, mcp_server, recipes, router
 from woollama.manager import Registry, ServerManager
 
-
 # ---------------------------------------------------------------------------
 # Fakes — a scripted inferencer + two recording downstream sessions
 # ---------------------------------------------------------------------------
@@ -223,13 +222,15 @@ async def test_ollama_passthrough_strips_prefix_no_tools(monkeypatch):
 # ===========================================================================
 
 async def test_reject_unknown_model_namespace(monkeypatch, tmp_path):
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     resp = await router.chat_completions(FakeRequest({"model": "bogus/x", "messages": []}))
     assert resp.status_code == 400
 
 
 async def test_reject_unknown_recipe(monkeypatch, tmp_path):
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     resp = await router.chat_completions(
         FakeRequest({"model": "woollama/nope", "messages": []}))
     assert resp.status_code == 404
@@ -239,7 +240,8 @@ async def test_reject_unknown_inferencer(monkeypatch, tmp_path):
     """An unknown provider (not ollama/anthropic/claude-code) → 501."""
     (tmp_path / "recipes.toml").write_text(
         '[recipes.bogus]\ninferencer="no-such-provider/m"\ntools=[]\nsystem="x"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     monkeypatch.setattr(router, "registry", Registry())
     resp = await router.chat_completions(
         FakeRequest({"model": "woollama/bogus", "messages": []}))
@@ -253,7 +255,8 @@ async def test_reject_anthropic_without_api_key(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cloud]\ninferencer="anthropic/claude-sonnet-4-6"\ntools=[]\nsystem="x"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     monkeypatch.setattr(router, "registry", Registry())
     resp = await router.chat_completions(
         FakeRequest({"model": "woollama/cloud", "messages": [{"role": "user", "content": "hi"}]}))
@@ -262,7 +265,8 @@ async def test_reject_anthropic_without_api_key(monkeypatch, tmp_path):
 
 
 async def test_reject_mcp_chat_unknown_recipe(monkeypatch, tmp_path):
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     server = mcp_server.build_server(Registry())
     async with Client(server) as c:
         with pytest.raises(ToolError, match="unknown recipe"):
@@ -285,7 +289,8 @@ async def test_claude_code_inferencer_delegates_to_backend(monkeypatch, tmp_path
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cc]\ninferencer="claude-code/haiku"\ntools=[]\n'
         'system="You are concise."\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
 
     seen = {}
 
@@ -310,7 +315,8 @@ async def test_claude_code_recipe_with_tools_is_rejected(monkeypatch, tmp_path):
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cctools]\ninferencer="claude-code/haiku"\n'
         'tools=["hello.count_to"]\nsystem="x"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     monkeypatch.setattr(router, "registry", Registry())
 
     resp = await router.chat_completions(FakeRequest({
@@ -329,7 +335,8 @@ async def test_reject_tool_outside_recipe_allowlist(monkeypatch, tmp_path):
     (tmp_path / "recipes.toml").write_text(
         '[recipes.helloonly]\ninferencer="ollama/qwen3"\n'
         'tools=["hello.count_to"]\nsystem="hello only"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
 
     reg, hello_calls, textops_calls = two_provider_registry()
     monkeypatch.setattr(router, "registry", reg)
