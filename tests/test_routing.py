@@ -31,7 +31,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 
-from woollama import mcp_server, recipes, router
+from woollama import claude_code, mcp_server, recipes, router
 from woollama.manager import Registry, ServerManager
 
 
@@ -260,6 +260,49 @@ async def test_reject_dispatch_to_unknown_provider():
         await reg.dispatch("ghost.tool", {})
     with pytest.raises(KeyError):
         await reg.dispatch("hello.does_not_exist", {})  # known server, unknown tool
+
+
+async def test_claude_code_inferencer_delegates_to_backend(monkeypatch, tmp_path):
+    """A tool-less `claude-code/<model>` recipe routes to the Claude Code
+    backend (NOT the ollama loop), and its completion comes back to the client.
+    The backend is mocked — real `claude` invocation is the opt-in live test."""
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.cc]\ninferencer="claude-code/haiku"\ntools=[]\n'
+        'system="You are concise."\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+
+    seen = {}
+
+    async def fake_run(system, user_msgs, model):
+        seen["system"], seen["model"] = system, model
+        return {"choices": [{"message": {"role": "assistant", "content": "hi from claude"}}]}
+
+    monkeypatch.setattr(claude_code, "run_completion", fake_run)
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/cc",
+        "messages": [{"role": "user", "content": "hello"}]}))
+
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "hi from claude"
+    assert seen == {"system": "You are concise.", "model": "haiku"}
+
+
+async def test_claude_code_recipe_with_tools_is_rejected(monkeypatch, tmp_path):
+    """Tool delegation to claude-code isn't built yet, so a claude-code recipe
+    that declares tools must fail clearly (501) rather than silently dropping
+    them — the honest seam between this slice and the delegation slice."""
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.cctools]\ninferencer="claude-code/haiku"\n'
+        'tools=["hello.count_to"]\nsystem="x"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/cctools", "messages": [{"role": "user", "content": "x"}]}))
+    assert resp.status_code == 501
+    body = json.loads(resp.body)
+    assert body["error"]["type"] == "not_implemented"
+    assert "tool delegation" in body["error"]["message"]
 
 
 async def test_reject_tool_outside_recipe_allowlist(monkeypatch, tmp_path):

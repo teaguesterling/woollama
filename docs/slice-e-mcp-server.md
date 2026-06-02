@@ -323,3 +323,66 @@ widens the OpenAI surface's blast radius.
   construction is exercised by every `import woollama.router`); full integration
   suite 8 passed (incl. both new HTTP-mount tests + the live chat-over-HTTP);
   the one-port demo runs end-to-end.
+
+## Follow-on slice — Claude Code as a (tool-less) inference backend (2026-06-01)
+
+A recipe whose inferencer is `claude-code/<model>` routes to the local `claude`
+CLI in headless print mode (`src/woollama/claude_code.py`), using the user's
+EXISTING Claude auth — no `ANTHROPIC_API_KEY`. A keyless path to Claude. (Chosen
+over the OpenAI-compat Anthropic-API shim because there's no API key in the env;
+the user asked for "a claude code adapter".)
+
+**Scope: TOOL-LESS completions only.** `orchestrate` dispatches by inferencer
+provider: `claude-code/` (recipe with `tools=[]`) → `claude_code.run_completion`;
+`claude-code/` WITH tools → 501 ("tool delegation not yet supported"); `ollama/`
+→ the existing woollama-owned loop; else → 501. Serves both the HTTP and MCP
+`chat` transports (both call `orchestrate`). Tool DELEGATION (Claude Code owns
+the loop and runs the recipe's MCP tools) is a deliberately separate, larger
+concept — an *executor*, not an inferencer — and a later slice with its own
+adversarial safety pass.
+
+**Subprocess, not the Agent SDK** — the SDK needs the `claude` CLI on PATH
+anyway, so shelling out is fewer deps and trivially mockable (tests patch
+`claude_code._invoke`).
+
+**Findings pinned empirically against `claude` v2.1.160 (docs were wrong):**
+- `--output-format json` emits a JSON **array** of events (system → assistant →
+  `result`); the final text is the `result` event's `result` field. (Docs say a
+  single object.)
+- 🔴 **`--permission-mode dontAsk` does NOT make it tool-less** — it auto-RUNS
+  read-only Bash (verified: `echo` executed, `permission_denials: []`). The docs'
+  "dontAsk denies everything unallowed" is false for read-only commands. So a
+  naive tool-less backend would let crafted input run shell on the host.
+- There is **no clean "disable all tools" flag**. The lockdown used:
+  `--permission-mode dontAsk` (non-interactive, no hang) + `--strict-mcp-config`
+  (zero MCP servers) + `--disallowedTools "Bash,Read,Write,Edit,NotebookEdit,
+  WebFetch,WebSearch,Glob,Grep,Task"` (closes the read-only-Bash gap + the other
+  exec/file/network/subagent vectors; other tools are auto-denied by dontAsk).
+  Plus a neutral temp cwd (don't inherit host CLAUDE.md/settings/plugins) and
+  `ANTHROPIC_API_KEY` stripped from the child env (force subscription auth).
+
+**Verification split (honest):** the runtime safety boundary could NOT be
+verified from inside this Claude Code session — nested `claude` invocations crash
+the harness (the `H.replace` glitch). So:
+- Hermetic `tests/test_claude_code.py` asserts the command is built locked-down
+  (strict-mcp-config, dontAsk, Bash in disallowedTools), the API key is stripped,
+  and the JSON-array output is parsed / errors surfaced. It CANNOT prove the
+  lockdown actually holds at runtime.
+- Opt-in `tests/test_integration.py::test_claude_code_backend_completes_and_
+  refuses_shell` (`@needs_claude_code`: requires `claude` on PATH AND
+  `WOOLLAMA_TEST_CLAUDE_CODE=1`, default-skipped — REAL subscription cost) is the
+  runtime check: a real completion works AND a shell-exec attempt does NOT create
+  an absolute-path canary file. **This is the test to run (outside a nested
+  Claude Code session) to confirm the safety boundary before trusting it.**
+
+**Bundled recipe:** `cc-assistant` (`inferencer = "claude-code/haiku"`, `tools =
+[]`) — a tool-less example to demo/test against. `haiku` keeps live cost low.
+
+**Roadmap honesty:** this does NOT close "cloud inferencers." The OpenAI-compat
+HTTP seam architecture.md calls for (vLLM/Together/Groq/OpenRouter/anthropic-api)
+is still unbuilt; claude-code is an alternative, keyless path to Claude via a
+totally different mechanism (subprocess delegation), not that seam.
+
+- **Verified**: default suite 68 passed / 9 deselected; integration suite 8
+  passed + 1 skipped (the claude-code live test — awaiting opt-in). Runtime
+  tool-lockdown verification PENDING the opt-in live run.

@@ -22,7 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import config, recipes
+from . import claude_code, config, recipes
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -150,15 +150,37 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
     this — do NOT reimplement the loop. Tool dispatch routes through `reg`
     (the caller's `Registry`), so each transport owns its own registry
     lifecycle. Raises `OrchestrationError` for the unsupported-inferencer,
-    inferencer-error, and max-turns-exceeded cases."""
-    messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
+    inferencer-error, and max-turns-exceeded cases.
 
+    Inferencer dispatch by `<provider>/`:
+      * `claude-code/<model>` → delegate a TOOL-LESS completion to the local
+        Claude Code CLI (keyless, uses the user's Claude auth). Recipes with a
+        non-empty tools list are rejected — tool delegation is a later slice.
+      * `ollama/<model>`      → the woollama-owned inferencer ↔ tool loop below.
+      * anything else         → unsupported (501)."""
     inferencer = recipe["inferencer"]
-    if not inferencer.startswith("ollama/"):
+    provider = inferencer.split("/", 1)[0]
+
+    if provider == "claude-code":
+        if recipe["tools"]:
+            raise OrchestrationError(
+                "tool delegation to claude-code is not yet supported "
+                "(route tool-using recipes to an ollama/ inferencer, or use a "
+                "tool-less claude-code recipe)", "not_implemented", 501)
+        model = inferencer.split("/", 1)[1] if "/" in inferencer else ""
+        try:
+            return await claude_code.run_completion(
+                recipe["system"], user_msgs, model)
+        except claude_code.ClaudeCodeError as e:
+            raise OrchestrationError(
+                f"claude-code backend: {e}", "server_error", 502) from e
+
+    if provider != "ollama":
         raise OrchestrationError(
-            f"v0.1 supports ollama/ inferencers only (got '{inferencer}')",
-            "not_implemented", 501,
-        )
+            f"unsupported inferencer '{inferencer}' (supported: ollama/<model>, "
+            f"claude-code/<model>)", "not_implemented", 501)
+
+    messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
     inferencer_model = inferencer[len("ollama/"):]
 
     tools = reg.openai_tools_for(recipe["tools"])

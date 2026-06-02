@@ -23,3 +23,14 @@ textops.word_count to count its words, then use hello.count_to to count to
 that number. Report both the word count and that the counting completed, in
 one short sentence.
 """
+
+# Tool-less Claude Code backend. Routes to the local `claude` CLI headless,
+# using your existing Claude auth — no API key. `tools = []` is required for
+# claude-code recipes today (tool delegation is a later slice). Uses the cheap
+# `haiku` alias to keep cost down.
+[recipes.cc-assistant]
+inferencer = "claude-code/haiku"
+tools = []
+system = """
+You are a concise, helpful assistant. Answer the user directly and briefly.
+"""
