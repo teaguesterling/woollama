@@ -50,6 +50,13 @@ needs_claude_code = pytest.mark.skipif(
     reason="set WOOLLAMA_TEST_CLAUDE_CODE=1 and have `claude` on PATH (real cost)",
 )
 
+# Anthropic compat-endpoint tests hit the real Claude API (costs money), so
+# they're gated on the key being present.
+needs_anthropic = pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"),
+    reason="ANTHROPIC_API_KEY not set",
+)
+
 
 def _free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -377,3 +384,28 @@ async def test_claude_code_backend_completes_and_refuses_shell(tmp_path, monkeyp
         f"exact contents."}], router.registry)
     assert sentinel not in resp3["choices"][0]["message"]["content"], \
         "claude-code backend exfiltrated a host file — tool lockdown FAILED"
+
+
+# ---------------------------------------------------------------------------
+# Anthropic via the OpenAI-compat inferencer seam (opt-in: ANTHROPIC_API_KEY)
+# ---------------------------------------------------------------------------
+
+@needs_anthropic
+async def test_anthropic_inferencer_completes_live(tmp_path, monkeypatch):
+    """Live round-trip through the anthropic inferencer: a tool-less recipe
+    orchestrates against Anthropic's OpenAI-compat endpoint and returns content.
+    Proves auth + routing + the real round-trip (tool support over the compat
+    endpoint is doc-confirmed; a tool-using live test can be added later)."""
+    from woollama import recipes, router
+
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.cloud]\ninferencer="anthropic/claude-haiku-4-5"\ntools=[]\n'
+        'system="You are concise."\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    resp = await router.orchestrate(
+        recipes.get("cloud"),
+        [{"role": "user", "content": "Reply with exactly: pong"}],
+        router.registry)
+    assert resp["choices"][0]["message"]["content"].strip()

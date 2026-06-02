@@ -15,14 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import claude_code, config, recipes
+from . import claude_code, config, inferencers, recipes
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -44,8 +43,6 @@ class OrchestrationError(Exception):
         self.kind = kind
         self.status = status
         self.payload = payload
-
-OLLAMA_URL = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
 
 
 # Module-level registry; SHARED by both surfaces — the OpenAI orchestration
@@ -90,7 +87,7 @@ async def list_models() -> JSONResponse:
     data: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as c:
         try:
-            r = await c.get(f"{OLLAMA_URL}/v1/models")
+            r = await c.get(f"{inferencers.get('ollama').base_url}/models")
             for m in r.json().get("data", []):
                 data.append({"id": f"ollama/{m['id']}", "object": "model",
                              "owned_by": "ollama"})
@@ -114,9 +111,6 @@ async def chat_completions(request: Request) -> JSONResponse:
     body = await request.json()
     model = body.get("model", "")
 
-    if model.startswith("ollama/"):
-        return await _passthrough_ollama(body)
-
     if model.startswith("woollama/"):
         name = model[len("woollama/"):]
         recipe = recipes.get(name)
@@ -124,19 +118,33 @@ async def chat_completions(request: Request) -> JSONResponse:
             return _error(f"unknown recipe '{name}'", "not_found", 404)
         return await _orchestrate_recipe(recipe, body)
 
+    # `<provider>/<model>` against a known OpenAI-compat inferencer → pass-through.
+    provider = model.split("/", 1)[0]
+    if inferencers.get(provider) is not None:
+        return await _passthrough(body)
+
     return _error(
-        f"unknown model namespace: '{model}'. Use 'ollama/<name>' or "
-        f"'woollama/<recipe>'.",
+        f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
+        f"'<provider>/<model>' for a known inferencer ({', '.join(inferencers.names())}).",
         "invalid_request_error", 400,
     )
 
 
-async def _passthrough_ollama(body: dict) -> JSONResponse:
+async def _passthrough(body: dict) -> JSONResponse:
+    """Forward `<provider>/<model>` straight to that inferencer's OpenAI-compat
+    endpoint (no orchestration). The client owns the body; we only swap the
+    namespaced model for the bare name, force non-streaming, and add auth."""
     body = dict(body)
-    body["model"] = body["model"][len("ollama/"):]
-    body["stream"] = False  # v0.1: non-streaming
+    provider, _, bare = body["model"].partition("/")
+    inf = inferencers.get(provider)        # caller verified it's known
+    body["model"] = bare
+    body["stream"] = False                 # v0.1: non-streaming
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        return _error(str(e), "invalid_request_error", 400)
     async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(f"{OLLAMA_URL}/v1/chat/completions", json=body)
+        r = await c.post(inf.chat_url(), json=body, headers=headers)
         return JSONResponse(r.json(), status_code=r.status_code)
 
 
@@ -175,13 +183,18 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
             raise OrchestrationError(
                 f"claude-code backend: {e}", "server_error", 502) from e
 
-    if provider != "ollama":
+    inf = inferencers.get(provider)
+    if inf is None:
         raise OrchestrationError(
-            f"unsupported inferencer '{inferencer}' (supported: ollama/<model>, "
-            f"claude-code/<model>)", "not_implemented", 501)
+            f"unsupported inferencer '{inferencer}' (supported providers: "
+            f"{', '.join(inferencers.names())}, claude-code)", "not_implemented", 501)
+    try:
+        headers = inf.headers()           # fail fast on a missing API key
+    except inferencers.InferencerError as e:
+        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
 
     messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
-    inferencer_model = inferencer[len("ollama/"):]
+    inferencer_model = inferencer.split("/", 1)[1]
 
     tools = reg.openai_tools_for(recipe["tools"])
     # The recipe's allow-list is a BOUNDARY, not a hint: only these tools are
@@ -192,7 +205,7 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
     # function name, so membership matches the emitted name directly.
     allowed = set(recipe["tools"])
     log.info("orchestrating: tools=%s inferencer=%s",
-             [t["function"]["name"] for t in tools], inferencer_model)
+             [t["function"]["name"] for t in tools], inferencer)
 
     for turn in range(1, 9):
         req = {
@@ -200,10 +213,10 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
             "messages": messages,
             "tools": tools,
             "stream": False,
-            "options": {"temperature": 0},
+            **inf.extra_body,             # provider-specific (Ollama options / Anthropic max_tokens)
         }
         async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post(f"{OLLAMA_URL}/v1/chat/completions", json=req)
+            r = await c.post(inf.chat_url(), json=req, headers=headers)
             resp = r.json()
         if "choices" not in resp:
             log.warning("inferencer error: %s", resp)

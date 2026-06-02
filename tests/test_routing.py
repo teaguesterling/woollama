@@ -235,14 +235,30 @@ async def test_reject_unknown_recipe(monkeypatch, tmp_path):
     assert resp.status_code == 404
 
 
-async def test_reject_non_ollama_inferencer(monkeypatch, tmp_path):
+async def test_reject_unknown_inferencer(monkeypatch, tmp_path):
+    """An unknown provider (not ollama/anthropic/claude-code) → 501."""
     (tmp_path / "recipes.toml").write_text(
-        '[recipes.cloud]\ninferencer="anthropic/claude"\ntools=[]\nsystem="x"\n')
+        '[recipes.bogus]\ninferencer="no-such-provider/m"\ntools=[]\nsystem="x"\n')
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
     monkeypatch.setattr(router, "registry", Registry())
     resp = await router.chat_completions(
-        FakeRequest({"model": "woollama/cloud", "messages": []}))
+        FakeRequest({"model": "woollama/bogus", "messages": []}))
     assert resp.status_code == 501
+
+
+async def test_reject_anthropic_without_api_key(monkeypatch, tmp_path):
+    """anthropic IS a supported inferencer now, but with no ANTHROPIC_API_KEY it
+    must fail with a clear credential error (400), distinct from unknown-provider
+    (501). The key check fails fast before any network call."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.cloud]\ninferencer="anthropic/claude-sonnet-4-6"\ntools=[]\nsystem="x"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+    resp = await router.chat_completions(
+        FakeRequest({"model": "woollama/cloud", "messages": [{"role": "user", "content": "hi"}]}))
+    assert resp.status_code == 400
+    assert "ANTHROPIC_API_KEY" in json.loads(resp.body)["error"]["message"]
 
 
 async def test_reject_mcp_chat_unknown_recipe(monkeypatch, tmp_path):

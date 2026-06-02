@@ -274,13 +274,13 @@ async def test_chat_recipe_with_tool_calls_loops_to_completion(monkeypatch, tmp_
     assert body["choices"][0]["message"]["content"] == "Counted to 3."
 
 
-async def test_chat_recipe_non_ollama_inferencer_returns_501(monkeypatch, tmp_path):
-    """v0.1 only supports ollama/ inferencers. A recipe with an unsupported
-    inferencer should fail clearly, not silently."""
+async def test_chat_recipe_unknown_inferencer_returns_501(monkeypatch, tmp_path):
+    """A recipe pointing at a provider woollama doesn't know should fail clearly,
+    not silently. (ollama + anthropic are known; this uses a made-up one.)"""
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "recipes.toml").write_text("""
-[recipes.cloudonly]
-inferencer = "anthropic/claude-opus-4-7"
+[recipes.bogus]
+inferencer = "no-such-provider/some-model"
 tools = []
 system = "test"
 """)
@@ -290,10 +290,10 @@ system = "test"
     monkeypatch.setattr(router, "registry", fake_reg)
 
     resp = await router.chat_completions(FakeRequest({
-        "model": "woollama/cloudonly",
+        "model": "woollama/bogus",
         "messages": [{"role": "user", "content": "hi"}],
     }))
     assert resp.status_code == 501
     body = json.loads(resp.body)
     assert body["error"]["type"] == "not_implemented"
-    assert "ollama/" in body["error"]["message"]
+    assert "unsupported inferencer" in body["error"]["message"]

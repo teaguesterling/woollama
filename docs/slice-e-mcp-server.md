@@ -386,3 +386,53 @@ totally different mechanism (subprocess delegation), not that seam.
 - **Verified**: default suite 68 passed / 9 deselected; integration suite 8
   passed + 1 skipped (the claude-code live test — awaiting opt-in). Runtime
   tool-lockdown verification PENDING the opt-in live run.
+
+## Follow-on slice — OpenAI-compat inferencer seam (Anthropic) (2026-06-02)
+
+The cloud-inferencer track architecture.md calls for: woollama routes
+`<provider>/<model>` to any OpenAI-compatible chat-completions backend. New
+`src/woollama/inferencers.py` is the registry; `orchestrate` and the
+pass-through path are now provider-generic instead of ollama-hardcoded.
+
+- **`Inferencer(name, base_url, api_key_env, extra_body)`** + a built-in
+  registry rebuilt per call (so env overrides are live): `ollama` (local, no
+  auth, native `options` body) and `anthropic` (Claude API's OpenAI-compat
+  endpoint, `Authorization: Bearer $ANTHROPIC_API_KEY`, default `max_tokens` +
+  clamped `temperature`). Adding vLLM/Together/Groq/OpenRouter is just more
+  entries; **config-file-driven inferencers** (architecture.md's `inferencers`
+  block) is the natural follow-on.
+- **`orchestrate` dispatch**: `claude-code/` → subprocess backend (prior slice);
+  otherwise resolve the provider in the registry. Unknown provider → 501; known
+  provider with a missing API key → **400** (distinct, fail-fast via
+  `inf.headers()` before any network call). The loop posts to `inf.chat_url()`
+  with `inf.headers()` and merges `inf.extra_body` into the request.
+- **Pass-through** (`<provider>/<model>` with no recipe) generalized the same
+  way (was ollama-only). `claude-code/` is NOT a pass-through provider (recipe-
+  only) → falls through to the 400 unknown-namespace error.
+- **Anthropic compat-endpoint facts (from docs, not memory):** base
+  `https://api.anthropic.com/v1/` + `chat/completions`; Bearer auth; `max_tokens`
+  supported (not required); `temperature` capped to [0,1]; system messages
+  hoisted+concatenated (we send one — fine). **Tools/function-calling ARE fully
+  supported** (`tools[].function`, response `tool_calls`, assistant tool_calls,
+  tool-role messages) — so this is FULL orchestration over Anthropic, not chat-
+  only. Only `strict` schema enforcement is dropped (use the native API for
+  that). `OLLAMA_URL` module const removed; `/v1/models` now derives the ollama
+  URL from the registry.
+- **Tests**: `tests/test_inferencers.py` — registry units + capturing-fake
+  routing (orchestrate→anthropic asserts URL/Bearer/bare-model/max_tokens;
+  ollama-unchanged regression; pass-through→anthropic). The old "non-ollama →
+  501" tests became "unknown-provider → 501" (anthropic is supported now) +
+  "anthropic-without-key → 400". Opt-in `@needs_anthropic` live test
+  (`test_anthropic_inferencer_completes_live`, skips without a key) does a real
+  tool-less round-trip.
+- **Roadmap:** this BUILDS the OpenAI-compat seam → **anthropic-API now done**;
+  vLLM/Together/Groq/OpenRouter are config entries away (pending config-file
+  inferencers). Still open: streaming, Unix socket, the conversations surface,
+  the Rust port. (claude-code remains a separate keyless mechanism, not this seam.)
+- **Verified**: default suite 76 passed / 9 deselected; integration 8 passed +
+  2 skipped (claude-code & anthropic live, both opt-in). Ollama path confirmed
+  unchanged end-to-end (the generalization's regression canary). Caveats: the
+  Anthropic tool-loop is doc-confirmed + unit-tested on the EMIT side (woollama
+  sends the right request); the live round-trip is tool-LESS, and a live
+  tool-using round-trip is unverified (no key). PENDING a run with
+  ANTHROPIC_API_KEY.
