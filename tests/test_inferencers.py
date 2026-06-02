@@ -8,12 +8,17 @@ a real round-trip is the opt-in @needs_anthropic live test in test_integration).
 """
 from __future__ import annotations
 
-import json
-
 import pytest
 
-from woollama import inferencers, recipes, router
+from woollama import config, inferencers, recipes, router
 from woollama.manager import Registry
+
+
+@pytest.fixture(autouse=True)
+def _clean_config_dir(monkeypatch, tmp_path):
+    """Point config at an empty dir so a real user inferencers.toml can't leak
+    into these tests; a test that wants config writes tmp_path/inferencers.toml."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -21,8 +26,58 @@ from woollama.manager import Registry
 # ---------------------------------------------------------------------------
 
 def test_builtins_present():
-    assert {"ollama", "anthropic"} <= set(inferencers.names())
+    # ollama + anthropic + the verified cloud providers.
+    assert {"ollama", "anthropic", "openai", "groq", "together", "openrouter"} \
+        <= set(inferencers.names())
     assert inferencers.get("no-such-provider") is None
+
+
+def test_builtin_cloud_providers(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "gk-123")
+    g = inferencers.get("groq")
+    assert g.chat_url() == "https://api.groq.com/openai/v1/chat/completions"
+    assert g.headers() == {"Authorization": "Bearer gk-123"}
+    # base URLs verified from each vendor's docs (note together is .ai, not .xyz).
+    assert inferencers.get("together").base_url == "https://api.together.ai/v1"
+    assert inferencers.get("openrouter").base_url == "https://openrouter.ai/api/v1"
+    assert inferencers.get("openai").base_url == "https://api.openai.com/v1"
+
+
+# ---------------------------------------------------------------------------
+# Config-file inferencers: merge over built-ins (add / override)
+# ---------------------------------------------------------------------------
+
+def test_config_adds_custom_and_overrides_builtin(tmp_path):
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.vllm]\n'                     # NEW provider, no auth (self-hosted)
+        'base_url = "http://localhost:8000/v1"\n\n'
+        '[inferencers.ollama]\n'                   # OVERRIDE a built-in's base_url
+        'base_url = "http://gpubox:11434/v1"\n')
+
+    vllm = inferencers.get("vllm")
+    assert vllm.chat_url() == "http://localhost:8000/v1/chat/completions"
+    assert vllm.headers() == {}                    # no api_key_env → no auth
+
+    assert inferencers.get("ollama").base_url == "http://gpubox:11434/v1"  # overridden
+    assert inferencers.get("groq") is not None     # built-ins survive (merge, not replace)
+
+
+def test_config_expands_env_in_values(monkeypatch, tmp_path):
+    monkeypatch.setenv("MY_LLM_HOST", "http://10.0.0.5:9000")
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.local]\nbase_url = "${MY_LLM_HOST}/v1"\n')
+    assert inferencers.get("local").chat_url() == "http://10.0.0.5:9000/v1/chat/completions"
+
+
+def test_load_inferencers_requires_base_url(tmp_path):
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.bad]\napi_key_env = "X"\n')   # no base_url
+    with pytest.raises(ValueError, match="base_url"):
+        config.load_inferencers()
+
+
+def test_load_inferencers_absent_is_empty():
+    assert config.load_inferencers() == {}          # no file in the clean dir
 
 
 def test_ollama_url_no_auth(monkeypatch):
@@ -86,7 +141,8 @@ async def test_orchestrate_routes_to_anthropic_with_auth(monkeypatch, tmp_path):
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cloud]\ninferencer="anthropic/claude-sonnet-4-6"\ntools=[]\n'
         'system="be brief"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
 
     seen = _capture_httpx(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
 
@@ -105,7 +161,8 @@ async def test_orchestrate_ollama_unchanged(monkeypatch, tmp_path):
     """Regression: the ollama path still posts to the ollama URL with no auth and
     its native `options` body (the generalization must not change ollama)."""
     monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
     seen = _capture_httpx(monkeypatch, {"choices": [{"message": {"content": "done"}}]})
 
     await router.orchestrate(

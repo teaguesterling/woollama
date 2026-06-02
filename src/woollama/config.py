@@ -28,7 +28,6 @@ from pathlib import Path
 
 from . import recipes as recipes_module
 
-
 log = logging.getLogger("woollama.config")
 
 
@@ -128,4 +127,50 @@ def load_recipes() -> dict[str, recipes_module.Recipe]:
         }
     log.info("loaded %d recipe(s) from %s: %s",
              len(out), source, list(out.keys()))
+    return out
+
+
+# ----- inferencers.toml loading ---------------------------------------------
+
+def load_inferencers() -> dict[str, dict]:
+    """User-defined OpenAI-compat inferencers from `$config/inferencers.toml`
+    (optional). Returns `{name: {base_url, api_key_env, extra_body}}`.
+
+    Unlike recipes/mcp.json, this is MERGED OVER the built-in providers (a same
+    name overrides a built-in) rather than replacing them — inferencers are an
+    infrastructure registry you extend (add vLLM / a self-hosted endpoint /
+    override a base_url), not user content you own wholesale. See
+    `inferencers._registry`. `${VAR}` is expanded in values (e.g.
+    `base_url = "${VLLM_URL}/v1"`); `api_key_env` is the NAME of an env var.
+
+    TOML shape:
+        [inferencers.<name>]
+        base_url   = "https://host/v1"     # required (OpenAI-compatible base)
+        api_key_env = "SOME_API_KEY"       # optional; omit for no-auth (local)
+        extra_body = { temperature = 0 }   # optional; merged into each request
+    """
+    path = config_dir() / "inferencers.toml"
+    if not path.is_file():
+        return {}
+    text = _expand_env(path.read_text())
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"inferencers.toml parse error in {path}: {e}") from e
+    raw = data.get("inferencers") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"inferencers.toml {path}: 'inferencers' must be a table")
+    out: dict[str, dict] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(f"inferencers.toml {path}: '{name}' must be a table")
+        if "base_url" not in entry:
+            raise ValueError(f"inferencers.toml {path}: '{name}' missing 'base_url'")
+        out[name] = {
+            "base_url": entry["base_url"],
+            "api_key_env": entry.get("api_key_env"),
+            "extra_body": entry.get("extra_body") or {},
+        }
+    log.info("loaded %d user inferencer(s) from %s: %s",
+             len(out), path, list(out.keys()))
     return out

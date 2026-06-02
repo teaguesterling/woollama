@@ -23,6 +23,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from . import config
+
 
 class InferencerError(Exception):
     """Configuration/credential problem resolving an inferencer (e.g. a missing
@@ -54,11 +56,26 @@ class Inferencer:
         return {"Authorization": f"Bearer {key}"}
 
 
+# Well-known OpenAI-compatible cloud providers, base URLs verified from each
+# vendor's docs (2026-06-02). They "just work" once the named API key env var is
+# set. Anything not here — self-hosted vLLM/llama.cpp, niche clouds, or an
+# override — is added via $config/inferencers.toml (config.load_inferencers),
+# merged on top by name. temperature=0 for deterministic orchestration.
+_BUILTIN_CLOUDS: tuple[tuple[str, str, str], ...] = (
+    # (name,        base_url,                            api_key_env)
+    ("openai",     "https://api.openai.com/v1",          "OPENAI_API_KEY"),
+    ("groq",       "https://api.groq.com/openai/v1",     "GROQ_API_KEY"),
+    ("together",   "https://api.together.ai/v1",         "TOGETHER_API_KEY"),
+    ("openrouter", "https://openrouter.ai/api/v1",       "OPENROUTER_API_KEY"),
+)
+
+
 def _registry() -> dict[str, Inferencer]:
-    """Built-in inferencers. Rebuilt per call so env overrides (the Ollama URL,
-    API keys) are picked up live — important for tests and reconfiguration."""
+    """All inferencers: built-ins overlaid by user config. Rebuilt per call so
+    env overrides (Ollama URL, API keys) and edits to inferencers.toml are
+    picked up live — important for tests and reconfiguration."""
     ollama_url = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
-    return {
+    reg: dict[str, Inferencer] = {
         "ollama": Inferencer(
             name="ollama",
             base_url=f"{ollama_url}/v1",
@@ -71,6 +88,19 @@ def _registry() -> dict[str, Inferencer]:
             extra_body={"temperature": 0, "max_tokens": 4096},
         ),
     }
+    for name, base_url, key_env in _BUILTIN_CLOUDS:
+        reg[name] = Inferencer(name=name, base_url=base_url,
+                               api_key_env=key_env, extra_body={"temperature": 0})
+
+    # User config merges over built-ins (add new providers / override a base_url).
+    for name, spec in config.load_inferencers().items():
+        reg[name] = Inferencer(
+            name=name,
+            base_url=spec["base_url"],
+            api_key_env=spec.get("api_key_env"),
+            extra_body=spec.get("extra_body") or {},
+        )
+    return reg
 
 
 def get(provider: str) -> Inferencer | None:

@@ -436,3 +436,36 @@ pass-through path are now provider-generic instead of ollama-hardcoded.
   sends the right request); the live round-trip is tool-LESS, and a live
   tool-using round-trip is unverified (no key). PENDING a run with
   ANTHROPIC_API_KEY.
+
+## Follow-on slice — the rest of the providers (config-file + cloud built-ins) (2026-06-02)
+
+Completes the multi-provider story two ways: more verified built-in clouds, and
+a config file so ANY OpenAI-compat backend (self-hosted vLLM/llama.cpp, niche
+clouds, overrides) is a one-entry addition — the durable answer architecture.md
+calls for, since you can't hardcode someone's vLLM host.
+
+- **Built-in clouds** (base URLs verified from each vendor's docs, not memory —
+  verification caught that Together is `api.together.ai`, NOT the `.xyz` I'd have
+  guessed): `openai` (`api.openai.com/v1`), `groq` (`api.groq.com/openai/v1`),
+  `together` (`api.together.ai/v1`), `openrouter` (`openrouter.ai/api/v1`) — each
+  Bearer + `<PROVIDER>_API_KEY`, `temperature=0`. Plus the existing ollama +
+  anthropic.
+- **`config.load_inferencers()`** reads an optional `$config/inferencers.toml`
+  (`[inferencers.<name>]` with `base_url`, optional `api_key_env`, optional
+  `extra_body`; `${VAR}` expanded). **MERGED OVER the built-ins** (same name
+  overrides) — a deliberate departure from recipes/mcp.json *replace* semantics:
+  an inferencer registry is infrastructure you extend, not content you own
+  wholesale, so adding one provider must not wipe the defaults.
+  `inferencers._registry()` builds built-ins then overlays config, rebuilt per
+  call (live env/edits).
+- **Tests** (`tests/test_inferencers.py`, +autouse clean-config fixture for
+  hermeticity): the cloud built-ins resolve with the right URL/Bearer; config
+  adds a custom `vllm` (no auth) and overrides a built-in's base_url while the
+  other built-ins survive; `${VAR}` expansion; missing `base_url` errors.
+- **Roadmap:** the OpenAI-compat cloud-inferencer seam is now **functionally
+  complete** — 6 providers built in, and anything else is a config entry. (Live
+  round-trips for the cloud providers remain unverified without keys, same
+  posture as anthropic.) Lint note: ruff is configured (E/F/W/I/B) but not run
+  by pytest and has drifted (~28 issues tree-wide, mostly the `;` pattern in
+  earlier test files) — a quick `ruff --fix` cleanup is a worthwhile small slice.
+- **Verified**: default suite 81 passed / 10 deselected; changed files lint-clean.

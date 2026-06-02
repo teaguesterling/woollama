@@ -25,7 +25,6 @@ from . import claude_code, config, inferencers, recipes
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
-
 log = logging.getLogger("woollama.router")
 
 
