@@ -144,6 +144,13 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
     inferencer_model = inferencer[len("ollama/"):]
 
     tools = reg.openai_tools_for(recipe["tools"])
+    # The recipe's allow-list is a BOUNDARY, not a hint: only these tools are
+    # offered to the model AND only these may be dispatched. If the model emits
+    # a tool_call for anything else (hallucination, or a name it shouldn't know),
+    # we refuse it below rather than reaching across to a provider the recipe was
+    # never granted. `openai_tools_for` preserves the namespaced name as the
+    # function name, so membership matches the emitted name directly.
+    allowed = set(recipe["tools"])
     log.info("orchestrating: tools=%s inferencer=%s",
              [t["function"]["name"] for t in tools], inferencer_model)
 
@@ -180,13 +187,22 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
             raw_args = fn.get("arguments") or "{}"
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             log.info("  → %s(%s)", namespaced, json.dumps(args)[:120])
-            try:
-                r2 = await reg.dispatch(namespaced, args)
-                parts = [c.text for c in r2.content if hasattr(c, "text")]
-                result = "\n".join(parts) if parts else json.dumps(
-                    [c.model_dump() for c in r2.content], default=str)
-            except Exception as e:
-                result = f"ERROR: {type(e).__name__}: {e}"
+            if namespaced not in allowed:
+                # Refuse and feed the refusal back as the tool result (every
+                # tool_call needs a matching tool message, including denied
+                # ones) so the loop continues and the model can recover.
+                log.warning("recipe denied out-of-list tool '%s' (allow-list: %s)",
+                            namespaced, sorted(allowed))
+                result = (f"ERROR: tool '{namespaced}' is not permitted by this "
+                          f"recipe (allowed: {sorted(allowed)})")
+            else:
+                try:
+                    r2 = await reg.dispatch(namespaced, args)
+                    parts = [c.text for c in r2.content if hasattr(c, "text")]
+                    result = "\n".join(parts) if parts else json.dumps(
+                        [c.model_dump() for c in r2.content], default=str)
+                except Exception as e:
+                    result = f"ERROR: {type(e).__name__}: {e}"
             preview = (result[:80] + "…") if len(result) > 80 else result
             log.info("  ← %s", preview)
             messages.append({

@@ -21,11 +21,14 @@ empty registry is fine.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastmcp import Client
+from mcp.types import TextContent
 
 from woollama import mcp_server, recipes
-from woollama.manager import Registry
+from woollama.manager import Registry, ServerManager
 
 
 # fastmcp's Client is async; mark the whole module.
@@ -132,3 +135,57 @@ async def test_chat_tool_orchestrates_end_to_end(server, monkeypatch):
             "messages": [{"role": "user", "content": "Count to 3."}],
         })
     assert result.data == "Counted to 3."
+
+
+# ---------------------------------------------------------------------------
+# tools/list — re-exports discovered downstream tools (decision #3 / aggregator)
+# ---------------------------------------------------------------------------
+
+async def test_tools_list_reexports_discovered_downstream_tools(monkeypatch, tmp_path):
+    """With a STARTED registry, tools/list is the union of the `chat` verb and
+    every discovered downstream tool, namespaced — and a re-exported tool
+    dispatches through the registry. Registration happens in the lifespan
+    (tools are only known post-start), so this drives it through a real Client
+    connection rather than calling the builder directly.
+
+    The ServerManager is stubbed (start = no-op, call_tool = canned) so no real
+    subprocess spawns; manager-internal mechanics are covered in test_manager.py.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [SimpleNamespace(
+        name="count_to", description="count to n",
+        inputSchema={"type": "object",
+                     "properties": {"n": {"type": "integer"}},
+                     "required": ["n"]},
+    )]
+
+    async def _noop_start() -> None:  # avoid spawning a real subprocess
+        return None
+
+    async def _call(bare: str, args: dict):
+        return SimpleNamespace(
+            content=[TextContent(type="text", text=f"counted {args['n']}")],
+            isError=False,
+        )
+
+    mgr.start = _noop_start          # type: ignore[method-assign]
+    mgr.call_tool = _call            # type: ignore[method-assign]
+    reg.add(mgr)
+
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        names = {t.name for t in await c.list_tools()}
+        assert "chat" in names, "the orchestration verb is still present"
+        assert "hello.count_to" in names, "downstream tool re-exported, namespaced"
+
+        # The re-exported tool's schema is the downstream tool's own schema.
+        tool = next(t for t in await c.list_tools() if t.name == "hello.count_to")
+        assert "n" in (tool.inputSchema or {}).get("properties", {})
+
+        # And it dispatches through the registry end-to-end.
+        result = await c.call_tool("hello.count_to", {"n": 3})
+    assert result.data == "counted 3" or "counted 3" in str(result.content)

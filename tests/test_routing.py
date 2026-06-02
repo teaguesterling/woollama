@@ -1,0 +1,291 @@
+"""Routing topology — executable documentation of how woollama routes a request.
+
+This is the map of "what can come in, and where it goes":
+
+  inbound surface     verb / model        routes to
+  ───────────────     ────────────        ─────────────────────────────────────
+  HTTP /v1/chat       ollama/<model>      passthrough to Ollama (no tools)
+  HTTP /v1/chat       woollama/<recipe>   orchestrate → Registry.dispatch per tool
+  MCP  tools/call     chat                orchestrate (same core, different wire)
+  MCP  tools/call     <server>.<tool>     proxy → Registry.dispatch to that server
+
+The HEADLINE: one chat to a recipe whose allow-list spans TWO providers fans
+its tool calls out to two SEPARATE long-lived MCP sessions (hello + textops),
+routed by namespace prefix. Below that, a rejection matrix for the things that
+must NOT work — including the recipe allow-list boundary.
+
+Everything here is hermetic: the inferencer (Ollama) is mocked with scripted
+turns, and each downstream MCP session is a stubbed ServerManager that records
+what IT received — so we assert the RIGHT call reached the RIGHT session, not
+merely that some calls fired. The live, against-real-Ollama counterpart is
+test_integration.py::test_*two_provider*; the watch-it-happen version is
+examples/routing_demo.py.
+"""
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
+from mcp.types import TextContent
+
+from woollama import mcp_server, recipes, router
+from woollama.manager import Registry, ServerManager
+
+
+# ---------------------------------------------------------------------------
+# Fakes — a scripted inferencer + two recording downstream sessions
+# ---------------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, payload: dict, status: int = 200):
+        self.status_code = status
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def mock_inferencer(monkeypatch, turns: list[dict]):
+    """Monkeypatch httpx.AsyncClient so each POST to Ollama returns the next
+    scripted turn. A turn is a full OpenAI-shaped response dict."""
+    script = list(turns)
+
+    class _Client:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def get(self, *_a, **_kw): return _Resp({})
+        async def post(self, _url, json=None, **_kw):
+            return _Resp(script.pop(0))
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+
+def _assistant_tool_call(name: str, args: dict, call_id: str = "c1") -> dict:
+    return {"choices": [{"message": {
+        "content": "",
+        "tool_calls": [{"id": call_id, "function": {
+            "name": name, "arguments": json.dumps(args)}}],
+    }}]}
+
+
+def _assistant_final(text: str) -> dict:
+    return {"choices": [{"message": {"content": text}}]}
+
+
+def _recording_manager(server: str, tool: str) -> tuple[ServerManager, list]:
+    """A stubbed ServerManager for `server` exposing one `tool`. Its call_tool
+    records (bare_name, args) into the returned list and returns canned content.
+    `start` is a no-op so no real subprocess spawns."""
+    calls: list[tuple[str, dict]] = []
+    mgr = ServerManager(server, "echo", [])
+    mgr.tools = [SimpleNamespace(
+        name=tool, description=f"{server}.{tool}",
+        inputSchema={"type": "object", "properties": {}})]
+
+    async def _start() -> None:
+        return None
+
+    async def _call(bare: str, args: dict):
+        calls.append((bare, args))
+        return SimpleNamespace(
+            content=[TextContent(type="text", text=f"{server}.{bare} ok")],
+            isError=False)
+
+    mgr.start = _start          # type: ignore[method-assign]
+    mgr.call_tool = _call       # type: ignore[method-assign]
+    return mgr, calls
+
+
+def two_provider_registry() -> tuple[Registry, list, list]:
+    """A Registry with two distinct long-lived sessions: `hello` (count_to) and
+    `textops` (word_count). Returns (registry, hello_calls, textops_calls)."""
+    reg = Registry()
+    hello, hello_calls = _recording_manager("hello", "count_to")
+    textops, textops_calls = _recording_manager("textops", "word_count")
+    reg.add(hello)
+    reg.add(textops)
+    return reg, hello_calls, textops_calls
+
+
+class FakeRequest:
+    def __init__(self, body: dict): self._body = body
+    async def json(self) -> dict: return self._body
+
+
+# ===========================================================================
+# HEADLINE — one chat, tools from two different providers, across two sessions
+# ===========================================================================
+
+async def test_http_chat_fans_out_across_two_provider_sessions(monkeypatch, tmp_path):
+    """woollama/textcounter allow-lists textops.word_count AND hello.count_to.
+    The model calls word_count (session A) then count_to (session B); each lands
+    on its OWN session. This is "proxying MCP tools across sessions"."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))  # bundled defaults
+    recipes.reload()
+    assert recipes.get("textcounter")["tools"] == ["textops.word_count", "hello.count_to"]
+
+    reg, hello_calls, textops_calls = two_provider_registry()
+    monkeypatch.setattr(router, "registry", reg)
+    mock_inferencer(monkeypatch, [
+        _assistant_tool_call("textops.word_count", {"text": "a b c d"}, "t1"),
+        _assistant_tool_call("hello.count_to", {"n": 4}, "t2"),
+        _assistant_final("Four words; counted to 4."),
+    ])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/textcounter",
+        "messages": [{"role": "user", "content": "Count words in 'a b c d'."}],
+    }))
+
+    # The RIGHT call reached the RIGHT session — that's the routing proof.
+    assert textops_calls == [("word_count", {"text": "a b c d"})]
+    assert hello_calls == [("count_to", {"n": 4})]
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "Four words; counted to 4."
+
+
+async def test_mcp_chat_fans_out_across_two_provider_sessions(monkeypatch, tmp_path):
+    """Same cross-session fan-out, but driven through the MCP `chat` tool — the
+    other transport reuses the same orchestrate() core."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    reg, hello_calls, textops_calls = two_provider_registry()
+    mock_inferencer(monkeypatch, [
+        _assistant_tool_call("textops.word_count", {"text": "a b c d"}, "t1"),
+        _assistant_tool_call("hello.count_to", {"n": 4}, "t2"),
+        _assistant_final("Four words; counted to 4."),
+    ])
+
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        result = await c.call_tool("chat", {
+            "recipe": "textcounter",
+            "messages": [{"role": "user", "content": "Count words in 'a b c d'."}],
+        })
+    assert textops_calls == [("word_count", {"text": "a b c d"})]
+    assert hello_calls == [("count_to", {"n": 4})]
+    assert result.data == "Four words; counted to 4."
+
+
+# ===========================================================================
+# Direct proxy routing — a re-exported tool goes straight to its own session
+# ===========================================================================
+
+async def test_proxy_tool_routes_to_its_own_session(monkeypatch, tmp_path):
+    """tools/call hello.count_to and textops.word_count each route to the
+    matching session by namespace — no orchestration, raw passthrough."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+    reg, hello_calls, textops_calls = two_provider_registry()
+
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        names = {t.name for t in await c.list_tools()}
+        assert {"hello.count_to", "textops.word_count"} <= names  # both re-exported
+        await c.call_tool("hello.count_to", {"n": 2})
+        await c.call_tool("textops.word_count", {"text": "x y"})
+
+    assert hello_calls == [("count_to", {"n": 2})]
+    assert textops_calls == [("word_count", {"text": "x y"})]
+
+
+# ===========================================================================
+# Passthrough — ollama/<model> bypasses orchestration entirely
+# ===========================================================================
+
+async def test_ollama_passthrough_strips_prefix_no_tools(monkeypatch):
+    captured: dict = {}
+
+    class _Spy:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["url"], captured["body"] = url, json
+            return _Resp({"choices": [{"message": {"content": "pong"}}]})
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Spy)
+    await router.chat_completions(FakeRequest({
+        "model": "ollama/qwen3", "messages": [{"role": "user", "content": "hi"}]}))
+    assert captured["body"]["model"] == "qwen3"      # prefix stripped
+    assert "tools" not in captured["body"]            # no orchestration
+
+
+# ===========================================================================
+# REJECTION MATRIX — things that must NOT work
+# ===========================================================================
+
+async def test_reject_unknown_model_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    resp = await router.chat_completions(FakeRequest({"model": "bogus/x", "messages": []}))
+    assert resp.status_code == 400
+
+
+async def test_reject_unknown_recipe(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    resp = await router.chat_completions(
+        FakeRequest({"model": "woollama/nope", "messages": []}))
+    assert resp.status_code == 404
+
+
+async def test_reject_non_ollama_inferencer(monkeypatch, tmp_path):
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.cloud]\ninferencer="anthropic/claude"\ntools=[]\nsystem="x"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+    resp = await router.chat_completions(
+        FakeRequest({"model": "woollama/cloud", "messages": []}))
+    assert resp.status_code == 501
+
+
+async def test_reject_mcp_chat_unknown_recipe(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+    server = mcp_server.build_server(Registry())
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match="unknown recipe"):
+            await c.call_tool("chat", {"recipe": "nope", "messages": []})
+
+
+async def test_reject_dispatch_to_unknown_provider():
+    """The Registry refuses to route a namespaced name it doesn't own."""
+    reg, _, _ = two_provider_registry()
+    with pytest.raises(KeyError):
+        await reg.dispatch("ghost.tool", {})
+    with pytest.raises(KeyError):
+        await reg.dispatch("hello.does_not_exist", {})  # known server, unknown tool
+
+
+async def test_reject_tool_outside_recipe_allowlist(monkeypatch, tmp_path):
+    """THE boundary test: a recipe scoped to hello.count_to must NOT be able to
+    reach textops.word_count even though that session is connected. The model
+    emits the out-of-list call; orchestrate refuses it WITHOUT dispatching, the
+    refusal is fed back, and the loop still completes."""
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.helloonly]\ninferencer="ollama/qwen3"\n'
+        'tools=["hello.count_to"]\nsystem="hello only"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path)); recipes.reload()
+
+    reg, hello_calls, textops_calls = two_provider_registry()
+    monkeypatch.setattr(router, "registry", reg)
+    mock_inferencer(monkeypatch, [
+        _assistant_tool_call("textops.word_count", {"text": "secret"}, "x1"),  # out of list
+        _assistant_final("I can't use that tool."),
+    ])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/helloonly",
+        "messages": [{"role": "user", "content": "count the words"}]}))
+
+    # The discriminating check: the forbidden session was NEVER invoked.
+    assert textops_calls == [], "out-of-list tool must not be dispatched"
+    assert hello_calls == []
+    # ...and the chat still completed (refusal fed back, model recovered).
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == \
+        "I can't use that tool."

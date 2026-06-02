@@ -22,10 +22,13 @@ Tool dispatch routes through a long-lived `Registry`, started/stopped inside
 the FastMCP lifespan so the connection-owning tasks live on the same event loop
 that serves tool calls (matching `manager.ServerManager`'s loop assumptions).
 
-HTTP/SSE transport and re-exporting discovered downstream tools (textops.*,
-hello.*) onto tools/list are deliberately later slices; the `_chat_tools`
-builder is structured so that re-export is a one-line concat (see decision #3
-in docs/slice-e-mcp-server.md).
+Re-exporting discovered downstream tools (textops.*, hello.*) onto tools/list
+is now ON (decision #3): a connecting client sees the union of every configured
+server's tools (namespaced) plus the `chat` verb — woollama as an MCP
+aggregator. Because a server's tools are only known once its connection is up,
+re-export is a lifespan-time dynamic registration (after `registry.start_all()`)
+via `_register_reexported_tools`, not a build-time concat. HTTP/SSE transport
+remains a later slice.
 """
 from __future__ import annotations
 
@@ -33,8 +36,11 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.prompts import Prompt
 from fastmcp.tools import Tool
+from fastmcp.tools.tool import ToolResult
+from pydantic import PrivateAttr
 
 from . import config, recipes
 from .manager import Registry, ServerManager
@@ -73,12 +79,50 @@ def _recipe_prompts() -> list[Prompt]:
     return prompts
 
 
-def _chat_tools(reg: Registry) -> list[Tool]:
-    """The tools/list builder. Today returns just the `chat` orchestration
-    verb; structured so re-exporting discovered downstream tools is a one-line
-    concat here later (decision #3) — e.g.
-        return [chat] + _reexported_registry_tools(reg)
-    """
+class _ProxyTool(Tool):
+    """Re-exports a discovered downstream MCP tool onto woollama's own
+    tools/list: same namespaced name (`<server>.<tool>`) and input schema,
+    dispatched through the unified `Registry` — the SAME long-lived connection
+    layer the chat orchestration uses, not a second client stack.
+
+    Unlike the chat tool, this is raw passthrough — it does NOT go through
+    `orchestrate`, so it owns its own failure handling (orchestrate's
+    dispatch-error catch isn't reachable from here)."""
+
+    _reg: Registry = PrivateAttr()
+
+    @classmethod
+    def build(cls, namespaced: str, description: str, schema: dict,
+              reg: Registry) -> "_ProxyTool":
+        # Defensive copy: `Registry.openai_tools_for` reads the same spec
+        # object for the HTTP surface; don't risk FastMCP aliasing it.
+        tool = cls(name=namespaced, description=description, parameters=dict(schema))
+        tool._reg = reg
+        return tool
+
+    async def run(self, arguments: dict) -> ToolResult:
+        try:
+            result = await self._reg.dispatch(self.name, arguments)
+        except Exception as e:
+            raise ToolError(f"dispatch failed: {type(e).__name__}: {e}") from e
+        content = list(getattr(result, "content", None) or [])
+        if getattr(result, "isError", False):
+            text = "\n".join(c.text for c in content if hasattr(c, "text"))
+            raise ToolError(text or f"downstream tool '{self.name}' errored")
+        # Pass structured output through when the downstream tool produced it
+        # (e.g. a dict-returning tool) so the client gets the structured payload,
+        # not just its JSON-as-text. We deliberately do NOT mirror the downstream
+        # output_schema onto this tool: that would couple every call to schema
+        # validation, breaking content-only results — a later refinement.
+        return ToolResult(content=content,
+                          structured_content=getattr(result, "structuredContent", None))
+
+
+def _chat_tool(reg: Registry) -> Tool:
+    """The `chat` orchestration verb — a recipe runner that hides the
+    inferencer ↔ tool loop. Distinct from the re-exported passthrough tools
+    (which carry a `<server>.<tool>` dotted name; `chat` has none, so no
+    collision)."""
 
     async def chat(messages: list, recipe: str = "", model: str = "") -> str:
         """Run a woollama recipe end-to-end and return the final assistant
@@ -105,7 +149,33 @@ def _chat_tools(reg: Registry) -> list[Tool]:
             raise ValueError(e.message) from e
         return resp["choices"][0]["message"].get("content") or ""
 
-    return [Tool.from_function(chat, name="chat")]
+    return Tool.from_function(chat, name="chat")
+
+
+def _register_reexported_tools(mcp: FastMCP, reg: Registry) -> None:
+    """Re-export every discovered downstream tool (namespaced) onto tools/list,
+    so an MCP client connecting to woollama sees the union of all configured
+    servers' tools plus the `chat` verb — woollama as an MCP aggregator
+    (decision #3, now realized).
+
+    This MUST run after `reg.start_all()`: a server's tools are only known once
+    its connection is up. That's why it's a lifespan-time *dynamic*
+    registration (FastMCP advertises tools.listChanged, and the tools are in
+    place before the server serves its first tools/list) — NOT a build-time
+    concat, since the registry isn't started when `build_server` runs."""
+    count = 0
+    for mgr in reg.servers.values():
+        for spec in mgr.tools:
+            namespaced = f"{mgr.name}.{spec.name}"
+            mcp.add_tool(_ProxyTool.build(
+                namespaced,
+                spec.description or "",
+                spec.inputSchema or {"type": "object", "properties": {}},
+                reg,
+            ))
+            count += 1
+    log.info("re-exported %d downstream tool(s): %s",
+             count, reg.all_tool_names())
 
 
 def build_server(registry: Registry) -> FastMCP:
@@ -117,11 +187,12 @@ def build_server(registry: Registry) -> FastMCP:
     before building."""
 
     @asynccontextmanager
-    async def lifespan(_server: FastMCP):
+    async def lifespan(server: FastMCP):
         # Started here (not eagerly) so the connection-owning tasks bind to the
         # same event loop that serves tool calls — see manager.ServerManager.
         await registry.start_all()
-        log.info("registry ready: %s", registry.all_tool_names())
+        # Now the downstream tools are known: re-export them onto tools/list.
+        _register_reexported_tools(server, registry)
         try:
             yield
         finally:
@@ -130,8 +201,7 @@ def build_server(registry: Registry) -> FastMCP:
     mcp = FastMCP("woollama", lifespan=lifespan)
     for prompt in _recipe_prompts():
         mcp.add_prompt(prompt)
-    for tool in _chat_tools(registry):
-        mcp.add_tool(tool)
+    mcp.add_tool(_chat_tool(registry))
     return mcp
 
 

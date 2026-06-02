@@ -152,6 +152,30 @@ def test_orchestrated_recipe_hides_tool_loop_from_client(woollama_server):
         "client should not see internal tool_calls"
 
 
+@needs_ollama
+def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
+    """The textcounter recipe allow-lists textops.word_count AND hello.count_to
+    — two different downstream MCP servers. One chat drives the model to use
+    both, proxied across the two long-lived sessions. The deterministic proof
+    that the RIGHT call hits the RIGHT session is the hermetic
+    test_routing.py::*two_provider* matrix; here we just confirm it doesn't
+    blow up end-to-end against real Ollama + real servers (output is
+    non-deterministic, and the client can't see the hidden tool_calls)."""
+    import openai
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; bundled recipe needs it")
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    r = c.chat.completions.create(
+        model="woollama/textcounter",
+        messages=[{"role": "user", "content": "Count the words in: the quick brown fox"}],
+        timeout=180,
+    )
+    assert r.choices[0].message.content
+    assert r.choices[0].message.tool_calls is None, \
+        "client should not see internal tool_calls from either provider"
+
+
 # ---------------------------------------------------------------------------
 # woollama-as-MCP-server over real stdio (slice e)
 # ---------------------------------------------------------------------------
@@ -188,6 +212,20 @@ async def test_mcp_stdio_surface_with_started_registry(tmp_path):
 
         tool_names = {t.name for t in await c.list_tools()}
         assert "chat" in tool_names
+        # Re-export (decision #3): every discovered downstream tool is surfaced
+        # namespaced — woollama as an MCP aggregator. These come from the real
+        # registry, started over stdio, so this also proves the lifespan-time
+        # dynamic registration actually fired.
+        assert "hello.count_to" in tool_names
+        assert "textops.word_count" in tool_names
+
+        # Dispatch a re-exported tool end-to-end through real stdio (no Ollama):
+        # proves content-block fidelity AND structured-output passthrough — the
+        # proxy hands the downstream CallToolResult's content + structuredContent
+        # straight to the client. hello.count_to returns a dict, so .data is the
+        # structured payload, not just JSON-as-text.
+        counted = await c.call_tool("hello.count_to", {"n": 3})
+        assert counted.data == {"count": 3, "total": 3, "done": True}
 
         # Connecting at all already proves the lifespan's registry.start_all()
         # didn't deadlock over stdio (the cross-loop hazard) and the server
