@@ -1,9 +1,17 @@
 # A model, tool, executor router — architecture
 
-Status: **architecture co-designed 2026-05-31**; probe (`/tmp/router_probe/router.py`)
-validates the shape end-to-end. Naming is open — see `naming-brainstorm.md`.
-This doc lives in `cosmic-fabric/` for now but describes a project that has
-outgrown the cosmic-fabric scope.
+Status: **the target design.** Co-designed 2026-05-31 (validated then by a
+throwaway probe, since obsolete); now the implemented project lives in this repo
+as **woollama** (naming settled — see `naming.md`). This document describes the
+full intended shape; much of it is built and some is still aspirational.
+
+> **Implementation status:** for what's actually built vs. still planned, see
+> [`roadmap.md`](roadmap.md); for the slice-by-slice history, see
+> [`build-log.md`](build-log.md). In particular, several specifics below are now
+> realized differently or more concretely than first sketched — e.g. the MCP
+> HTTP surface is **Streamable HTTP mounted at `/mcp`** (not `/mcp/sse`), and
+> the bundled inferencer set + `inferencers.toml` is the current provider
+> mechanism. Treat code + `roadmap.md` as authoritative where they differ.
 
 ## What it is
 
@@ -245,8 +253,7 @@ What survives:
 
 ## What stays open
 
-1. **Naming.** The project has outgrown "cosmic-fabric." See
-   `naming-brainstorm.md` for candidates.
+1. ~~**Naming.**~~ Settled: **woollama** (see `naming.md`).
 2. **Tools as named tables instead of bare names.** Will let tool entries
    carry per-tool metadata (description, version, deprecation) alongside the
    name. Deferred.
@@ -255,7 +262,12 @@ What survives:
 4. **Per-client visibility filters.** Real client filters land when the panel
    and at least one sub-inferencer are named entries in mcp.json.
 
-## What the probe (in `/tmp/router_probe/`) demonstrates
+## What the probe demonstrated (historical)
+
+> The validation probe (once at `/tmp/router_probe/`) is **gone** — its job was
+> to prove the shape, which it did; the real implementation now lives in
+> `src/woollama/` and is far past this. Kept as a record of the original
+> end-to-end validation.
 
 The architecture compiled into ~200 LoC of Python:
 

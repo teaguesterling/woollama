@@ -37,11 +37,25 @@ protocol.
 
 ## Status
 
-**v0.1 — Python prototype.** Works end-to-end as an OpenAI-compatible router
-with hidden chat-loop orchestration. Spawns one MCP tool server (the bundled
-hello example). One hardcoded example recipe. Local-only ephemeral binding
-(random loopback port). Not production-ready; the architecture is validated
-and the shape of v1 is settled.
+**Python prototype — multi-backend router, both surfaces live.** woollama works
+end-to-end as:
+
+- an **OpenAI-compatible server** (`/v1/chat/completions`, `/v1/models`) with
+  pass-through *and* hidden chat-loop orchestration of recipes;
+- an **MCP server** to its own clients — over **stdio** (`woollama mcp`) and
+  over **Streamable HTTP** at `/mcp`, mounted on the *same port* as `/v1/*`. It
+  re-exports every discovered downstream tool (namespaced) plus a `chat` verb,
+  i.e. it's an MCP aggregator.
+
+It routes inference across **multiple backends** by `<provider>/<model>` —
+`ollama` (local), `anthropic`, `openai`, `groq`, `together`, `openrouter`, and
+**any OpenAI-compatible endpoint** you add in `inferencers.toml` (e.g.
+self-hosted vLLM) — plus `claude-code/<model>`, a keyless path to Claude via the
+local CLI. Config is file-driven (`mcp.json`, `recipes.toml`, `inferencers.toml`).
+Long-lived MCP connections; local-only ephemeral binding by default.
+
+Not production-ready. **Current status and what's next live in
+[`docs/roadmap.md`](docs/roadmap.md).**
 
 > **Implementation note: woollama will be a Rust program at v1.0.**
 > The Python in `src/woollama/` is a prototype used to iterate the
@@ -49,7 +63,8 @@ and the shape of v1 is settled.
 > stable. See [`docs/rust-transition.md`](docs/rust-transition.md) for the
 > explicit transition criteria.
 
-See `docs/architecture.md` for the full design.
+See `docs/architecture.md` for the full target design and
+`docs/build-log.md` for the slice-by-slice history.
 
 ## Quick taste
 
@@ -112,28 +127,31 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/woollama.addr"
    (lackpy, filesystem, git). It composes them.
 5. **she talks to llamas.**
 
-## What v0.1 includes
+## What works today
 
-- HTTP server at `/v1/models` and `/v1/chat/completions` (OpenAI-compat)
-- `ollama/X` pass-through to local Ollama at `localhost:11434`
-- One hardcoded example recipe (`woollama/streamer`) that exercises a
-  bundled MCP tool (`count_to` from `examples/mcp-hello/`)
-- Per-request MCP subprocess for tool dispatch (correct but not optimal —
-  long-lived connection pooling is a follow-on)
-- Ephemeral loopback binding + address discovery file
+- OpenAI surface: `/v1/models`, `/v1/chat/completions` (pass-through +
+  recipe orchestration), `/v1/tools` introspection
+- Multi-backend routing by `<provider>/<model>`: ollama, anthropic, openai,
+  groq, together, openrouter, `claude-code`, + any OpenAI-compatible endpoint
+  via `inferencers.toml`
+- MCP server side: stdio (`woollama mcp`) **and** Streamable HTTP at `/mcp` on
+  the same port — recipes as prompts, a `chat` verb, and every downstream tool
+  re-exported (aggregator)
+- File-driven config (`mcp.json`, `recipes.toml`, `inferencers.toml`), multi-
+  MCP-server discovery + unified tool registry, long-lived MCP connections
+- Recipe allow-list enforced as a security boundary; ephemeral loopback binding
+  + address discovery file
 
-## What v0.1 does not include (yet)
+## Not yet (next on the roadmap)
 
-- Streaming on either the OpenAI side or MCP side (call the existing
-  endpoints non-streaming for now)
-- Real configuration file (recipes + MCP servers are hardcoded in v0.1)
-- Multiple MCP server discovery + the unified tool registry
-- Cloud inference backends (Anthropic, OpenAI, etc.) — Ollama only
+- Streaming (OpenAI SSE out + MCP progress events) — biggest open item
 - Unix socket transport alongside HTTP loopback
-- The MCP server side (woollama as an MCP server to its clients)
+- Stateful Conversations/Responses surface (design in
+  `docs/conversations-api-design.md`)
+- The Rust v1.0 port
 
-These are all sized and planned; see `docs/architecture.md` for the full
-target shape.
+Full scorecard, ordering, and pending verifications:
+**[`docs/roadmap.md`](docs/roadmap.md)**.
 
 ## Origin
 

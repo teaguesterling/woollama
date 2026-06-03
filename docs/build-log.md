@@ -1,9 +1,35 @@
+# woollama build log (slice-by-slice)
+
+The running, chronological record of how woollama was built — one section per
+slice, each with the decisions, the load-bearing findings, and what was
+verified. For *current status and what's next*, see
+[`roadmap.md`](roadmap.md); this file is the detailed history behind it.
+
+(Started life as the slice (e) handoff note; it now spans slices e → k. The
+original slice (e) plan is preserved verbatim below, followed by each follow-on.)
+
+## Index
+
+| Slice | What | Commit |
+|---|---|---|
+| (e) | woollama as an MCP server (stdio) — prompts + chat verb | `9a19be0` |
+| (f) | MCP aggregator (tool re-export) + routing demo + allow-list boundary | `dd53122` |
+| (h) | MCP over Streamable HTTP, mounted on one port | `58addb2` |
+| (i) | Claude Code as a (tool-less) inference backend | `1fc0a24` |
+| (j) | OpenAI-compat inferencer seam — Anthropic | `35c2dc0` |
+| (k) | the rest of the providers — cloud built-ins + config-file inferencers | `5b2996e` |
+
+(Slices a–d — the OpenAI router, config files, multi-MCP discovery, test
+backfill — predate this log; see `git log`. There is no slice (g): the
+lettering jumped f→h during the session and we kept it faithful to the commits.)
+
+---
+
 # Slice (e) — woollama as an MCP server (handoff / pickup note)
 
-Status: **DONE (2026-06-01).** Implemented + tested. Default suite 45 passed
-(+5 MCP unit tests), plus 1 opt-in stdio integration test (4 deselected). See
-"What shipped" at the bottom. The rest of this note is the original plan, kept
-for context.
+Status: **DONE (2026-06-01).** Implemented + tested. (Counts below are as-of
+that slice; the suite has grown since — see the per-slice "Verified" lines and
+`roadmap.md` for the current totals.)
 
 ## Where this came from (session recap, 2026-05-31 → 06-01)
 

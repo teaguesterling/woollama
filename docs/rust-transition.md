@@ -14,11 +14,16 @@ The Rust port begins when **all four** of these are true:
    extension vs. cos-fab tool" or "where does substitution live" — the
    answers have settled and the doc captures them.
 
-2. **The Python surface covers the v1.0 feature set.** Concretely:
-   streaming on both sides, real config file (`recipes.toml` + `mcp.json`),
-   multi-MCP-server discovery + unified tool registry, the Anthropic
-   backend, the woollama-as-MCP-server side, Unix socket alongside HTTP
-   loopback, the panel-confirm round-trip equivalent.
+2. **The Python surface covers the v1.0 feature set.** Concretely (progress as
+   of 2026-06-02 — see [`roadmap.md`](roadmap.md)):
+   - [x] real config file (`recipes.toml` + `mcp.json`, plus `inferencers.toml`)
+   - [x] multi-MCP-server discovery + unified tool registry
+   - [x] the Anthropic backend (and the generic OpenAI-compat inferencer seam)
+   - [x] the woollama-as-MCP-server side (stdio + Streamable HTTP)
+   - [ ] streaming on both sides
+   - [ ] Unix socket alongside HTTP loopback
+   - [ ] the panel-confirm round-trip equivalent (the stateful Conversations
+         surface + cosmic-fabric consuming it)
 
 3. **There is a real consumer.** Cosmic-fabric panel (or another real
    client) is actively using woollama through its OpenAI/MCP surfaces. The
