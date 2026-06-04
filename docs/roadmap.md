@@ -87,12 +87,12 @@ Smaller follow-ons (not blocking):
   is unit-tested on the emit side + doc-confirmed (tools supported); the live
   round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:
   `uv run --extra dev pytest tests/test_integration.py -m integration -k anthropic`
-- **Streaming orchestration against real Ollama** (slice streaming-2): the SSE
-  parsing — including FRAGMENTED tool_call delta reassembly — is verified
-  hermetically AND against a real local SSE server over a socket; the real-Ollama
-  run is pending (the dev box's Ollama models symlink points at the pre-move
-  `/srv/physical/...` path and 500s — `sudo ln -sfn /srv/logical/opt/ollama/share/ollama/models /opt/ollama/share/ollama/models`).
-  Once Ollama serves: `uv run --extra dev pytest tests/test_integration.py -m integration -k stream`
+- ~~**Streaming orchestration against real Ollama**~~ (slice streaming-2): ✅
+  VERIFIED 2026-06-04 against real Ollama (`qwen3:14b-iq4xs`) — fragmented
+  tool_call SSE deltas reassemble, the tool loop stays hidden, and the answer
+  streams with one terminator (`test_orchestrated_recipe_streams_final_answer_hiding_tool_loop`,
+  alongside the non-streaming + two-provider + MCP chat live tests). Re-run:
+  `uv run --extra dev pytest tests/test_integration.py -m integration -k "stream or orchestrat or two_provider"`
 
 ## v1.0 (Rust) gate — progress
 
