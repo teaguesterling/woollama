@@ -32,10 +32,11 @@ remains a later slice.
 """
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.prompts import Prompt
 from fastmcp.tools import Tool
@@ -127,10 +128,17 @@ def _chat_tool(reg: Registry) -> Tool:
     (which carry a `<server>.<tool>` dotted name; `chat` has none, so no
     collision)."""
 
-    async def chat(messages: list, recipe: str = "", model: str = "") -> str:
+    async def chat(messages: list, recipe: str = "", model: str = "",
+                   ctx: Context | None = None) -> str:
         """Run a woollama recipe end-to-end and return the final assistant
         message. Mirrors POST /v1/chat/completions: the internal inferencer ↔
         tool loop is hidden — the caller sees only the final answer.
+
+        While the loop runs, each tool dispatch is surfaced as an MCP logging
+        notification (`ctx.info`) — "→ <tool>(<args>)" before, "← <tool>: ok|
+        error" after — so a connected client gets live progress during the
+        otherwise-hidden tool turns (slice streaming-3). The tool CALLS and
+        RESULTS stay out of the returned answer; only their progress is logged.
 
         Args:
             messages: OpenAI-shaped chat messages (the system prompt is
@@ -138,8 +146,11 @@ def _chat_tool(reg: Registry) -> Tool:
             recipe: recipe name to run (e.g. "streamer"). Primary selector.
             model: optional "woollama/<recipe>" form, accepted for symmetry
                 with the OpenAI surface; used only when `recipe` is empty.
+            ctx: injected by FastMCP (excluded from the tool schema); used to
+                emit tool-phase progress. None when called outside a request.
         """
-        from .router import OrchestrationError, orchestrate  # lazy: breaks cycle
+        # lazy import: breaks the router → mcp_server cycle
+        from .router import OrchestrationError, orchestrate_events
 
         name = recipe or (model[len("woollama/"):]
                           if model.startswith("woollama/") else model)
@@ -148,11 +159,22 @@ def _chat_tool(reg: Registry) -> Tool:
         rec = recipes.get(name)
         if rec is None:
             raise ValueError(f"unknown recipe '{name}'")
+
+        final: dict | None = None
         try:
-            resp = await orchestrate(rec, messages, reg)
+            async for ev in orchestrate_events(rec, messages, reg, stream=False):
+                kind = ev["type"]
+                if kind == "final":
+                    final = ev["response"]
+                elif ctx is not None and kind == "tool_call":
+                    args = json.dumps(ev["args"], default=str)
+                    await ctx.info(f"→ {ev['name']}({args[:120]})")
+                elif ctx is not None and kind == "tool_result":
+                    await ctx.info(f"← {ev['name']}: {'ok' if ev['ok'] else 'error'}")
         except OrchestrationError as e:
             raise ValueError(e.message) from e
-        return resp["choices"][0]["message"].get("content") or ""
+        assert final is not None, "orchestrate_events always yields a final or raises"
+        return final["choices"][0]["message"].get("content") or ""
 
     return Tool.from_function(chat, name="chat")
 

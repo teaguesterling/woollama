@@ -372,13 +372,21 @@ def mock_inferencer_stream(monkeypatch, turns: list[list[dict]]):
     scripted SSE turn. A turn is a list of chunk dicts; each becomes a
     `data: {...}` line and a trailing `data: [DONE]` is appended automatically —
     so the per-turn DONE is something the router must SWALLOW, not relay."""
-    script = [list(t) for t in turns]
+    script = list(turns)
 
     class _StreamCM:
-        def __init__(self, chunks):
-            self.status_code = 200
-            self._lines = ([f"data: {json.dumps(c)}" for c in chunks]
-                           + ["", "data: [DONE]", ""])
+        def __init__(self, turn):
+            # A turn is normally a list of chunk dicts; a dict with `_status`
+            # makes that turn return an upstream error (for mid-loop-error tests).
+            if isinstance(turn, dict) and "_status" in turn:
+                self.status_code = turn["_status"]
+                self._lines = []
+                self._body = json.dumps(turn.get("_body", {})).encode()
+            else:
+                self.status_code = 200
+                self._lines = ([f"data: {json.dumps(c)}" for c in turn]
+                               + ["", "data: [DONE]", ""])
+                self._body = b""
 
         async def __aenter__(self):
             return self
@@ -389,6 +397,9 @@ def mock_inferencer_stream(monkeypatch, turns: list[list[dict]]):
         async def aiter_lines(self):
             for ln in self._lines:
                 yield ln
+
+        async def aread(self):
+            return self._body
 
     class _Client:
         def __init__(self, *_a, **_kw):
@@ -556,3 +567,101 @@ async def test_chat_recipe_stream_setup_error_is_json_status_not_stream(monkeypa
     assert resp.status_code == 501                # JSON error, not a stream
     assert resp.media_type != "text/event-stream"
     assert json.loads(resp.body)["error"]["type"] == "not_implemented"
+
+
+async def test_chat_recipe_stream_mid_loop_error_is_sse_frame_not_status(monkeypatch, tmp_path):
+    """Once streaming has begun, the HTTP status can't change. A tool turn
+    succeeds (committing 200), then a later turn's inferencer error surfaces as
+    an SSE error frame + a clean terminator — NOT an HTTP error. (Since slice
+    streaming-3 the first surfaced event is the turn-1 tool_call, so 200 commits
+    before the turn-2 error; pre-streaming-3 this same case mapped to a status.)"""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()                              # bundled streamer (hello.count_to)
+
+    fake_reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [_tool("count_to")]
+
+    async def stub_call_tool(name, args):
+        return SimpleNamespace(content=[SimpleNamespace(text='{"done":true}')])
+    mgr.call_tool = stub_call_tool  # type: ignore[method-assign]
+    fake_reg.add(mgr)
+    monkeypatch.setattr(router, "registry", fake_reg)
+
+    # Turn 1: a tool_call (commits the 200). Turn 2: upstream errors.
+    mock_inferencer_stream(monkeypatch, [
+        [{"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+            "function": {"name": "hello.count_to", "arguments": "{}"}}]}}]}],
+        {"_status": 500, "_body": {"error": {"message": "upstream boom"}}},
+    ])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/streamer", "stream": True,
+        "messages": [{"role": "user", "content": "count to 3"}],
+    }))
+    assert resp.media_type == "text/event-stream"   # a stream, not a status JSON
+    chunks, done, errors = await _collect_sse(resp)
+    assert done                                     # still terminated cleanly
+    assert _finishes(chunks) == ["stop"]            # one terminator
+    assert errors and errors[0]["error"]["message"] == "upstream boom"
+
+
+# ---------------------------------------------------------------------------
+# orchestrate_events — tool-progress events (slice streaming-3)
+# ---------------------------------------------------------------------------
+
+async def test_orchestrate_events_emits_tool_progress_in_order(monkeypatch, tmp_path):
+    """The core loop yields tool_call → tool_result (ok=True) around each
+    dispatch, then a final event — the protocol the MCP chat tool turns into
+    ctx.info notifications. Emitted even in stream=False mode."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()                              # bundled streamer (hello.count_to)
+
+    fake_reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [_tool("count_to")]
+
+    async def stub_call_tool(name, args):
+        return SimpleNamespace(content=[SimpleNamespace(text='{"done":true}')])
+    mgr.call_tool = stub_call_tool  # type: ignore[method-assign]
+    fake_reg.add(mgr)
+
+    mock_httpx(monkeypatch, post_responses=[
+        {"choices": [{"message": {"content": "", "tool_calls": [{"id": "c1",
+            "function": {"name": "hello.count_to", "arguments": '{"n": 3}'}}]}}]},
+        {"choices": [{"message": {"content": "done"}}]},
+    ])
+
+    events = [ev async for ev in router.orchestrate_events(
+        recipes.get("streamer"),
+        [{"role": "user", "content": "count to 3"}], fake_reg, stream=False)]
+
+    assert [e["type"] for e in events] == ["tool_call", "tool_result", "final"]
+    assert events[0] == {"type": "tool_call", "turn": 1,
+                         "name": "hello.count_to", "args": {"n": 3}}
+    assert events[1] == {"type": "tool_result", "turn": 1,
+                         "name": "hello.count_to", "ok": True}
+    assert events[2]["response"]["choices"][0]["message"]["content"] == "done"
+
+
+async def test_orchestrate_events_tool_result_ok_false_when_denied(monkeypatch, tmp_path):
+    """A tool the recipe's allow-list forbids is refused: tool_result.ok is
+    False, and the loop still continues to a final answer."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.locked]\ninferencer="ollama/q"\ntools=[]\nsystem="x"\n')
+    recipes.reload()
+
+    mock_httpx(monkeypatch, post_responses=[
+        {"choices": [{"message": {"content": "", "tool_calls": [{"id": "c1",
+            "function": {"name": "hello.count_to", "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "sorry"}}]},
+    ])
+
+    events = [ev async for ev in router.orchestrate_events(
+        recipes.get("locked"),
+        [{"role": "user", "content": "go"}], Registry(), stream=False)]
+
+    result = next(e for e in events if e["type"] == "tool_result")
+    assert result["ok"] is False                  # denied by the empty allow-list
+    assert events[-1]["type"] == "final"          # loop recovered to a final answer

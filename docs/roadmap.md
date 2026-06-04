@@ -30,6 +30,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Config-file inferencers** (`inferencers.toml`) — any OpenAI-compat backend | `config.py`, `inferencers.py` | k |
 | **Streaming passthrough** — `stream:true` on `<provider>/<model>` relays upstream SSE verbatim | `router.py:_passthrough_stream` | streaming-1 |
 | **Streaming orchestration** — `stream:true` on `woollama/<recipe>` streams the answer as OpenAI SSE; tool turns stay hidden. Core loop is now one async generator (`orchestrate_events`); `orchestrate` is a thin drainer | `router.py` | streaming-2 |
+| **MCP progress events** — the `chat` tool emits a `ctx.info` notification per tool call/result during the hidden loop (live progress; return value unchanged) | `mcp_server.py`, `router.py` | streaming-3 |
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
@@ -40,10 +41,9 @@ socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
 
 ## Open tracks (recommended order)
 
-1. **Streaming** — OpenAI SSE out + MCP progress events. The biggest remaining
-   UX item and the largest change (reshapes `orchestrate` + both surfaces from
-   request/response to streaming). Highest value for the cosmic-fabric panel.
-   Done in slices:
+1. ~~**Streaming**~~ — ✅ DONE (all three slices). OpenAI SSE out + MCP progress
+   events. Reshaped `orchestrate` into one async generator without forking the
+   loop. Highest value for the cosmic-fabric panel. Slices:
    - [x] **streaming-1: passthrough SSE** — `stream:true` on `<provider>/<model>`
      relays the upstream stream verbatim (`router.py:_passthrough_stream`).
    - [x] **streaming-2: orchestration SSE** — `stream:true` on `woollama/<recipe>`
@@ -54,8 +54,11 @@ socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
      streaming mode every turn's *content* is surfaced (continuous assistant
      message), so it can show more prose than the non-streaming path, which
      returns only the final turn — a deliberate, documented divergence.
-   - [ ] **streaming-3: MCP progress events** — progress notifications on the MCP
-     `chat` tool during tool turns.
+   - [x] **streaming-3: MCP progress events** — the `chat` tool emits a
+     `ctx.info` notification per tool call/result during the hidden loop, so a
+     connected MCP client sees live progress through the tool turns. The tool's
+     return value (the final answer) is unchanged. The shared loop now also
+     yields `tool_call`/`tool_result` events; HTTP adapters ignore them.
 2. ~~**Unix socket transport**~~ — ✅ DONE. One uvicorn server binds the app to
    a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600 — a connectable socket can
    spend the router's keys) alongside the loopback TCP port (`binding.py`,
@@ -104,8 +107,8 @@ covers the v1.0 feature set"):
 - [x] the Anthropic backend
 - [x] woollama-as-MCP-server side
 - [x] long-lived MCP connections (was the criterion-#4 latency concern)
-- [ ] streaming on both sides (OpenAI SSE out DONE — passthrough + orchestration;
-      MCP progress events = streaming-3, pending)
+- [x] streaming on both sides (OpenAI SSE out — passthrough + orchestration; MCP
+      progress events on the `chat` tool)
 - [x] Unix socket alongside HTTP loopback
 - [ ] the panel-confirm round-trip equivalent (the conversations surface +
       cosmic-fabric consuming it)

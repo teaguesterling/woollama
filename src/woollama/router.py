@@ -216,6 +216,11 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
 
       * `{"type": "delta", "content": str}` — assistant content to surface to
         the client. Emitted only when `stream=True`.
+      * `{"type": "tool_call", "turn", "name", "args"}` — a tool is about to be
+        dispatched. `{"type": "tool_result", "turn", "name", "ok"}` — it
+        returned (`ok=False` for a denied/errored tool). Emitted in BOTH modes
+        for progress surfacing (the MCP `chat` tool turns these into
+        `ctx.info(...)`); the HTTP adapters ignore them.
       * `{"type": "final", "response": dict}` — the final OpenAI response dict.
 
     What is hidden in BOTH modes (the correctness invariant): the tool-call
@@ -331,12 +336,20 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
             raw_args = fn.get("arguments") or "{}"
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             log.info("  → %s(%s)", namespaced, json.dumps(args)[:120])
+            # Tool-phase progress events (slice streaming-3): surfaced by the MCP
+            # `chat` tool as `ctx.info(...)` notifications. The HTTP adapters and
+            # the non-streaming drainer ignore every non-delta/final event, so
+            # these are free for those paths. Emitted in BOTH modes — the loop is
+            # mode-agnostic here, and the MCP path runs stream=False.
+            yield {"type": "tool_call", "turn": turn,
+                   "name": namespaced, "args": args}
             if namespaced not in allowed:
                 # Refuse and feed the refusal back as the tool result (every
                 # tool_call needs a matching tool message, including denied
                 # ones) so the loop continues and the model can recover.
                 log.warning("recipe denied out-of-list tool '%s' (allow-list: %s)",
                             namespaced, sorted(allowed))
+                ok = False
                 result = (f"ERROR: tool '{namespaced}' is not permitted by this "
                           f"recipe (allowed: {sorted(allowed)})")
             else:
@@ -345,10 +358,14 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
                     parts = [c.text for c in r2.content if hasattr(c, "text")]
                     result = "\n".join(parts) if parts else json.dumps(
                         [c.model_dump() for c in r2.content], default=str)
+                    ok = True
                 except Exception as e:
+                    ok = False
                     result = f"ERROR: {type(e).__name__}: {e}"
             preview = (result[:80] + "…") if len(result) > 80 else result
             log.info("  ← %s", preview)
+            yield {"type": "tool_result", "turn": turn,
+                   "name": namespaced, "ok": ok}
             messages.append({
                 "role": "tool",
                 "content": result,

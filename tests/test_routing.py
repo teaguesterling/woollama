@@ -172,6 +172,43 @@ async def test_mcp_chat_fans_out_across_two_provider_sessions(monkeypatch, tmp_p
     assert result.data == "Four words; counted to 4."
 
 
+async def test_mcp_chat_emits_tool_progress_notifications(monkeypatch, tmp_path):
+    """slice streaming-3: while the hidden tool loop runs, the MCP `chat` tool
+    emits a `ctx.info` notification per tool call/result, so a connected client
+    gets live progress through the otherwise-invisible tool turns. The tool's
+    RETURN value is unchanged — just the final answer, no tool JSON."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    reg, hello_calls, textops_calls = two_provider_registry()
+    mock_inferencer(monkeypatch, [
+        _assistant_tool_call("textops.word_count", {"text": "a b c d"}, "t1"),
+        _assistant_tool_call("hello.count_to", {"n": 4}, "t2"),
+        _assistant_final("Four words; counted to 4."),
+    ])
+
+    logs: list[str] = []
+
+    async def log_handler(params):
+        data = params.data
+        logs.append(data["msg"] if isinstance(data, dict) and "msg" in data else str(data))
+
+    server = mcp_server.build_server(reg)
+    async with Client(server, log_handler=log_handler) as c:
+        result = await c.call_tool("chat", {
+            "recipe": "textcounter",
+            "messages": [{"role": "user", "content": "Count words in 'a b c d'."}],
+        })
+
+    assert result.data == "Four words; counted to 4."      # return value unchanged
+    joined = "\n".join(logs)
+    # a "→" call line and a "← ok" result line for EACH tool, in dispatch order
+    for marker in ("→ textops.word_count", "← textops.word_count: ok",
+                   "→ hello.count_to", "← hello.count_to: ok"):
+        assert marker in joined, f"missing progress line: {marker}\nlogs={logs}"
+    assert joined.index("→ textops.word_count") < joined.index("→ hello.count_to")
+
+
 # ===========================================================================
 # Direct proxy routing — a re-exported tool goes straight to its own session
 # ===========================================================================
