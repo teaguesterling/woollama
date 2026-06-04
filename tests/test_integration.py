@@ -202,6 +202,22 @@ def test_orchestrated_recipe_streams_final_answer_hiding_tool_loop(woollama_serv
 
 
 @needs_ollama
+def test_responses_stateless_via_openai_sdk(woollama_server):
+    """conv-1a live gate: the REAL openai SDK's responses.create round-trips
+    against /v1/responses and exposes the SDK-computed .output_text — proving
+    OpenAI-SDK compatibility, not merely that our own shape asserts pass."""
+    import openai
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; needed for the live turn")
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    r = c.responses.create(model="ollama/qwen3:14b-iq4xs",
+                           input="Reply with exactly: pong", timeout=120)
+    assert r.status == "completed"
+    assert r.output_text.strip(), "expected a non-empty Responses output_text"
+
+
+@needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to
     — two different downstream MCP servers. One chat drives the model to use

@@ -1,7 +1,12 @@
 # Conversations & Responses — design (stateful surface for woollama)
 
-Status: **design only, not started.** Decisions locked 2026-06-02. This is the
-pickup note for the stateful-conversation slice(s); nothing is built yet.
+Status: **in progress.** Decisions locked 2026-06-02. **conv-1a shipped
+2026-06-04**: `POST /v1/responses` stateless subset (`store:false`) — a
+Responses-shaped superset of /v1/chat/completions, routed by `model` identically
+(`router.py:responses_create`, shaping in `responses.py`), verified against the
+real `openai` SDK (`.responses.create` → `.output_text`). Still to do from §8:
+the handle table + claude-resume backend (conv-1b), then the driver/interactive/
+stored slices.
 
 ## The principle
 
@@ -177,6 +182,13 @@ plain terminal before building the claude-tmux backend:
 
 1. **`/v1/responses` subset + `claude-resume` backend** — proves handle-routing +
    the Responses shape against the EASY (non-interactive) backend. No tmux.
+   - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
+     Responses wire shape, SDK-verified. No backend/handle table yet.
+   - [ ] **conv-1b** — in-memory handle table (resp_id is the fork key; one async
+     writer per conversation_id) + `claude-resume` backend + `store:true` /
+     `conversation` / `previous_response_id` routing. Run the §6.1-style spike
+     first (does `claude -p --output-format json` emit `session_id`, and does
+     `claude --resume <sid> -p` continue non-interactively?) in a PLAIN terminal.
 2. **`/v1/conversations` listing + delete** — discovery/attach surface.
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.

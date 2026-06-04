@@ -16,6 +16,7 @@ def test_app_is_fastapi():
     paths = {route.path for route in app.routes}
     assert "/v1/models" in paths
     assert "/v1/chat/completions" in paths
+    assert "/v1/responses" in paths        # stateful surface (conv-1a)
 
 
 def test_recipes_have_streamer(monkeypatch, tmp_path):

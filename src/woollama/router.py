@@ -23,7 +23,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import claude_code, config, inferencers, recipes
+from . import claude_code, config, inferencers, recipes, responses
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -131,6 +131,85 @@ async def chat_completions(request: Request) -> Response:
         f"'<provider>/<model>' for a known inferencer ({', '.join(inferencers.names())}).",
         "invalid_request_error", 400,
     )
+
+
+@app.post("/v1/responses")
+async def responses_create(request: Request) -> Response:
+    """Stateful surface — OpenAI *Responses* shape (docs/conversations-api-design).
+
+    conv-1a covers the STATELESS subset (`store:false`): a superset of
+    /v1/chat/completions that speaks the Responses wire format, routed by `model`
+    identically. Stateful conversations (handle routing + the claude-resume
+    backend) arrive in conv-1b; the server-owned `stored` backend is a later
+    slice. The principle holds throughout: woollama routes conversation handles,
+    backends own the bytes — it never becomes a conversation database."""
+    body = await request.json()
+    model = body.get("model", "")
+
+    if body.get("stream"):
+        return _error("streaming is not yet supported on /v1/responses "
+                      "(use /v1/chat/completions for SSE; a Responses streaming "
+                      "shape is a later slice)", "invalid_request_error", 400)
+
+    # Stateful opt-in — anything needing a backing store is conv-1b onward.
+    if body.get("store") or body.get("conversation") or body.get("previous_response_id"):
+        return _error(
+            "stateful conversations are not available yet: `store`, "
+            "`conversation`, and `previous_response_id` need a stateful backend "
+            "(claude-resume, arriving next — requires a claude-code model; the "
+            "server-owned `stored` backend is a later slice). Use `store:false` "
+            "for now, which behaves as a Responses-shaped /v1/chat/completions.",
+            "not_implemented", 501)
+
+    try:
+        messages = responses.parse_input(body.get("input", ""))
+    except ValueError as e:
+        return _error(str(e), "invalid_request_error", 400)
+
+    try:
+        text = await _complete_stateless(model, messages)
+    except OrchestrationError as e:
+        if e.payload is not None:
+            return JSONResponse(e.payload, status_code=e.status)
+        return _error(e.message, e.kind, e.status)
+
+    return JSONResponse(responses.build_response(
+        responses.new_id("resp"), model, text))
+
+
+async def _complete_stateless(model: str, messages: list[dict]) -> str:
+    """Run one stateless turn, return the assistant text. Routes by `model`
+    exactly like /v1/chat/completions (woollama/<recipe> → orchestrate; a known
+    inferencer → passthrough), raising OrchestrationError for the error cases so
+    the caller maps them onto the response surface."""
+    if model.startswith("woollama/"):
+        name = model[len("woollama/"):]
+        recipe = recipes.get(name)
+        if recipe is None:
+            raise OrchestrationError(f"unknown recipe '{name}'", "not_found", 404)
+        resp = await orchestrate(recipe, messages, registry)
+        return resp["choices"][0]["message"].get("content") or ""
+
+    provider = model.split("/", 1)[0]
+    inf = inferencers.get(provider)
+    if inf is None:
+        raise OrchestrationError(
+            f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
+            f"'<provider>/<model>' for a known inferencer "
+            f"({', '.join(inferencers.names())}).", "invalid_request_error", 400)
+    bare = model.split("/", 1)[1] if "/" in model else ""
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
+    async with httpx.AsyncClient(timeout=180) as c:
+        r = await c.post(inf.chat_url(),
+                         json={"model": bare, "messages": messages, "stream": False},
+                         headers=headers)
+        data = r.json()
+    if "choices" not in data:
+        raise OrchestrationError("inferencer error", "server_error", 502, payload=data)
+    return data["choices"][0]["message"].get("content") or ""
 
 
 async def _passthrough(body: dict) -> Response:

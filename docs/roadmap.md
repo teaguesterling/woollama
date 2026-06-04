@@ -32,12 +32,14 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Streaming orchestration** — `stream:true` on `woollama/<recipe>` streams the answer as OpenAI SSE; tool turns stay hidden. Core loop is now one async generator (`orchestrate_events`); `orchestrate` is a thin drainer | `router.py` | streaming-2 |
 | **MCP progress events** — the `chat` tool emits a `ctx.info` notification per tool call/result during the hidden loop (live progress; return value unchanged) | `mcp_server.py`, `router.py` | streaming-3 |
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
+| **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
-orchestration, both with `stream:true` → OpenAI SSE), `/v1/models`, `/v1/tools`,
-`/mcp` (Streamable HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix
-socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
+orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
+subset — OpenAI Responses shape), `/v1/models`, `/v1/tools`, `/mcp` (Streamable
+HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix socket
+(`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
 
 ## Open tracks (recommended order)
 
@@ -67,6 +69,13 @@ socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
    [`conversations-api-design.md`](conversations-api-design.md). woollama routes
    conversation *handles*; backends own state (incl. a live Claude-in-tmux
    session driven by a separate Rust package). Build order is in that doc.
+   - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
+     OpenAI Responses wire shape, verified live via the `openai` SDK.
+   - [ ] **conv-1b** — handle table + `claude-resume` backend + `store:true` /
+     `conversation` / `previous_response_id` (proves handle routing).
+   - [ ] conv-2+ — `/v1/conversations` listing; the Rust session driver +
+     claude-tmux backend (gated on §6 spikes); interactive `requires_action`;
+     duckdb `stored` backend; cosmic-fabric wiring.
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
 Smaller follow-ons (not blocking):
