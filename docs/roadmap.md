@@ -29,10 +29,13 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | Cloud providers: anthropic, openai, groq, together, openrouter + ollama | `inferencers.py` | j, k |
 | **Config-file inferencers** (`inferencers.toml`) — any OpenAI-compat backend | `config.py`, `inferencers.py` | k |
 | **Streaming passthrough** — `stream:true` on `<provider>/<model>` relays upstream SSE verbatim | `router.py:_passthrough_stream` | streaming-1 |
+| **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
-Surfaces today: `/v1/chat/completions` (+ pass-through), `/v1/models`,
-`/v1/tools`, `/mcp` (Streamable HTTP), and `woollama mcp` (stdio).
+Surfaces today: `/v1/chat/completions` (+ pass-through, with `stream:true`),
+`/v1/models`, `/v1/tools`, `/mcp` (Streamable HTTP), and `woollama mcp` (stdio)
+— served on BOTH a Unix socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the
+loopback TCP port.
 
 ## Open tracks (recommended order)
 
@@ -48,8 +51,10 @@ Surfaces today: `/v1/chat/completions` (+ pass-through), `/v1/models`,
      forked loop); non-streaming `orchestrate` drains it for the final dict.
    - [ ] **streaming-3: MCP progress events** — progress notifications on the MCP
      `chat` tool during tool turns.
-2. **Unix socket transport** — architecture's preferred default for local MCP
-   clients; small/well-scoped (bind uvicorn to a UDS alongside HTTP loopback).
+2. ~~**Unix socket transport**~~ — ✅ DONE. One uvicorn server binds the app to
+   a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600 — a connectable socket can
+   spend the router's keys) alongside the loopback TCP port (`binding.py`,
+   `__main__.py`). Verified live: both surfaces serve; cleanup on shutdown.
 3. **Conversations / Responses** (stateful surface) — scoped in
    [`conversations-api-design.md`](conversations-api-design.md). woollama routes
    conversation *handles*; backends own state (incl. a live Claude-in-tmux
@@ -89,7 +94,7 @@ covers the v1.0 feature set"):
 - [x] woollama-as-MCP-server side
 - [x] long-lived MCP connections (was the criterion-#4 latency concern)
 - [ ] streaming on both sides
-- [ ] Unix socket alongside HTTP loopback
+- [x] Unix socket alongside HTTP loopback
 - [ ] the panel-confirm round-trip equivalent (the conversations surface +
       cosmic-fabric consuming it)
 

@@ -14,8 +14,7 @@ import sys
 
 import uvicorn
 
-from . import __version__
-from .binding import addr_file_path, resolve_bind
+from . import __version__, binding
 from .router import app
 
 
@@ -46,14 +45,27 @@ def main() -> int:
         format="%(asctime)s %(name)s %(levelname)s  %(message)s",
         datefmt="%H:%M:%S",
     )
-    host, port = resolve_bind()
-    print(f"woollama {__version__} — listening on http://{host}:{port}", flush=True)
-    print(f"  address persisted to: {addr_file_path()}", flush=True)
+    listeners = binding.open_sockets()
+    host, port = listeners.tcp_host, listeners.tcp_port
+    print(f"woollama {__version__} — listening", flush=True)
+    if listeners.sock_path:
+        print(f"  unix socket:          {listeners.sock_path} "
+              f"(default for local MCP clients)", flush=True)
+    print(f"  HTTP loopback:        http://{host}:{port}", flush=True)
+    print(f"  address persisted to: {binding.addr_file_path()}", flush=True)
     print(f"  OpenAI base_url:      http://{host}:{port}/v1", flush=True)
     print("  models:               GET /v1/models", flush=True)
     print("  chat:                 POST /v1/chat/completions", flush=True)
     print(f"  MCP (Streamable HTTP): http://{host}:{port}/mcp", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+    # One uvicorn Server bound to BOTH sockets (UDS + TCP) — same app, same
+    # event loop. `Server.run(sockets=[...])` serves pre-bound sockets; we own
+    # the socket-file cleanup it won't do for a `sockets=`-passed UDS.
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    try:
+        server.run(sockets=listeners.sockets)
+    finally:
+        binding.cleanup(listeners)
     return 0
 
 

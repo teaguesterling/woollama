@@ -409,3 +409,53 @@ async def test_anthropic_inferencer_completes_live(tmp_path, monkeypatch):
         [{"role": "user", "content": "Reply with exactly: pong"}],
         router.registry)
     assert resp["choices"][0]["message"]["content"].strip()
+
+
+# ---------------------------------------------------------------------------
+# Unix socket transport (slice unix-socket): a live HTTP request over the bound
+# UDS round-trips. Uses a trivial app — needs no Ollama/MCP — but exercises the
+# real `binding.open_sockets()` sockets through a live uvicorn server.
+# ---------------------------------------------------------------------------
+
+def test_unix_socket_serves_http_end_to_end(tmp_path, monkeypatch):
+    import threading
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    from woollama import binding
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_ADDRESS", raising=False)
+
+    app = FastAPI()
+
+    @app.get("/ping")
+    async def ping():
+        return {"ok": True}
+
+    listeners = binding.open_sockets()
+    assert listeners.sock_path, "expected a Unix socket to be bound"
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
+    t = threading.Thread(target=lambda: server.run(sockets=listeners.sockets),
+                         daemon=True)
+    t.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        assert server.started, "uvicorn did not start"
+
+        # Over the Unix socket
+        with httpx.Client(transport=httpx.HTTPTransport(uds=listeners.sock_path)) as c:
+            r = c.get("http://localhost/ping")
+            assert r.status_code == 200 and r.json() == {"ok": True}
+        # Same app, same server, over the TCP loopback alongside it
+        r2 = httpx.get(f"http://127.0.0.1:{listeners.tcp_port}/ping")
+        assert r2.status_code == 200 and r2.json() == {"ok": True}
+    finally:
+        server.should_exit = True
+        t.join(timeout=5)
+        binding.cleanup(listeners)
+    assert not os.path.exists(listeners.sock_path)   # cleanup removed the file
