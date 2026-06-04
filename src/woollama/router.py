@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import claude_code, config, inferencers, recipes
 from .manager import Registry, ServerManager
@@ -106,7 +106,7 @@ async def list_tools() -> JSONResponse:
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(request: Request) -> Response:
     body = await request.json()
     model = body.get("model", "")
 
@@ -129,22 +129,60 @@ async def chat_completions(request: Request) -> JSONResponse:
     )
 
 
-async def _passthrough(body: dict) -> JSONResponse:
+async def _passthrough(body: dict) -> Response:
     """Forward `<provider>/<model>` straight to that inferencer's OpenAI-compat
     endpoint (no orchestration). The client owns the body; we only swap the
-    namespaced model for the bare name, force non-streaming, and add auth."""
+    namespaced model for the bare name and add auth. `stream:true` is honoured —
+    we relay the upstream SSE verbatim (slice: streaming-1)."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
     body["model"] = bare
-    body["stream"] = False                 # v0.1: non-streaming
     try:
         headers = inf.headers()
     except inferencers.InferencerError as e:
         return _error(str(e), "invalid_request_error", 400)
+    if body.get("stream"):
+        return await _passthrough_stream(inf, body, headers)
+    body["stream"] = False
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(inf.chat_url(), json=body, headers=headers)
         return JSONResponse(r.json(), status_code=r.status_code)
+
+
+async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
+                              headers: dict) -> Response:
+    """Relay the upstream OpenAI SSE stream byte-for-byte (preserves chunk
+    framing and the `data: [DONE]` sentinel for free).
+
+    We open the upstream connection and check its status BEFORE returning a
+    StreamingResponse: once a 200 stream begins its status can't be changed, so
+    an upstream 4xx/5xx must surface as a JSON error (matching the non-streaming
+    path), not an empty 200. That forces manual context management — on success
+    the generator owns closing the stream and client; on error we close here."""
+    client = httpx.AsyncClient(timeout=180)
+    cm = client.stream("POST", inf.chat_url(), json=body, headers=headers)
+    r = await cm.__aenter__()
+    if r.status_code >= 400:
+        raw = await r.aread()
+        await cm.__aexit__(None, None, None)
+        await client.aclose()
+        try:
+            return JSONResponse(json.loads(raw), status_code=r.status_code)
+        except (ValueError, TypeError):
+            return _error(raw.decode("utf-8", "replace") or "upstream error",
+                          "server_error", r.status_code)
+
+    async def relay():
+        try:
+            async for chunk in r.aiter_bytes():
+                yield chunk
+        finally:
+            await cm.__aexit__(None, None, None)
+            await client.aclose()
+
+    return StreamingResponse(relay(), status_code=r.status_code,
+                             media_type="text/event-stream")
 
 
 async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],

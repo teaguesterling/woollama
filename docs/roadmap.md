@@ -1,7 +1,7 @@
 # woollama roadmap & status
 
 Single source of truth for *what's built, what's next, and in what order.*
-Updated 2026-06-02. Detailed history: [`build-log.md`](build-log.md). Target
+Updated 2026-06-03. Detailed history: [`build-log.md`](build-log.md). Target
 design: [`architecture.md`](architecture.md). v1.0 gate:
 [`rust-transition.md`](rust-transition.md).
 
@@ -28,6 +28,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **OpenAI-compat inferencer seam** (multi-backend router) | `inferencers.py` | j |
 | Cloud providers: anthropic, openai, groq, together, openrouter + ollama | `inferencers.py` | j, k |
 | **Config-file inferencers** (`inferencers.toml`) — any OpenAI-compat backend | `config.py`, `inferencers.py` | k |
+| **Streaming passthrough** — `stream:true` on `<provider>/<model>` relays upstream SSE verbatim | `router.py:_passthrough_stream` | streaming-1 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (+ pass-through), `/v1/models`,
@@ -38,6 +39,15 @@ Surfaces today: `/v1/chat/completions` (+ pass-through), `/v1/models`,
 1. **Streaming** — OpenAI SSE out + MCP progress events. The biggest remaining
    UX item and the largest change (reshapes `orchestrate` + both surfaces from
    request/response to streaming). Highest value for the cosmic-fabric panel.
+   Done in slices:
+   - [x] **streaming-1: passthrough SSE** — `stream:true` on `<provider>/<model>`
+     relays the upstream stream verbatim (`router.py:_passthrough_stream`).
+   - [ ] **streaming-2: orchestration SSE** — stream the `woollama/<recipe>` final
+     turn; tool-call turns stay invisible. Make the core loop an async generator
+     so `orchestrate` stays the single source of truth (its docstring forbids a
+     forked loop); non-streaming `orchestrate` drains it for the final dict.
+   - [ ] **streaming-3: MCP progress events** — progress notifications on the MCP
+     `chat` tool during tool turns.
 2. **Unix socket transport** — architecture's preferred default for local MCP
    clients; small/well-scoped (bind uvicorn to a UDS alongside HTTP loopback).
 3. **Conversations / Responses** (stateful surface) — scoped in

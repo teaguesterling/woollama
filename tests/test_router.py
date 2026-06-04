@@ -192,12 +192,79 @@ async def test_chat_ollama_passthrough_strips_prefix_and_forwards(monkeypatch):
     await router.chat_completions(FakeRequest({
         "model": "ollama/qwen3:14b-iq4xs",
         "messages": [{"role": "user", "content": "hi"}],
-        "stream": True,
     }))
     assert "/v1/chat/completions" in captured["url"]
-    # prefix stripped, stream forced to False
+    # prefix stripped; non-streaming request forced to stream=False
     assert captured["body"]["model"] == "qwen3:14b-iq4xs"
     assert captured["body"]["stream"] is False
+
+
+async def test_chat_passthrough_streams_upstream_sse_verbatim(monkeypatch):
+    """stream:true on a passthrough model relays the upstream SSE byte-for-byte
+    (chunk framing + `[DONE]` sentinel preserved) and keeps stream=true on the
+    forwarded body so the upstream actually streams."""
+    captured: dict = {}
+    chunks = [b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+              b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+              b"data: [DONE]\n\n"]
+
+    class _StreamCM:
+        def __init__(self, body):
+            captured["body"] = body
+            self.status_code = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def aiter_bytes(self):
+            for c in chunks:
+                yield c
+
+    class _StreamClient:
+        def __init__(self, *_a, **_kw): pass
+        async def aclose(self): captured["closed"] = True
+        def stream(self, _method, url, json=None, **_kw):
+            captured["url"] = url
+            return _StreamCM(json)
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _StreamClient)
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "ollama/qwen3:14b-iq4xs",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }))
+    assert resp.media_type == "text/event-stream"
+    body = b"".join([c async for c in resp.body_iterator])
+    assert body == b"".join(chunks)
+    assert captured["body"]["model"] == "qwen3:14b-iq4xs"
+    assert captured["body"]["stream"] is True   # NOT forced off — upstream streams
+    assert captured["closed"] is True           # client closed after relay
+
+
+async def test_chat_passthrough_stream_upstream_error_is_json_not_empty_stream(monkeypatch):
+    """An upstream 4xx during a streaming request surfaces as a JSON error with
+    the upstream status — never an empty 200 stream (status can't change once a
+    StreamingResponse starts)."""
+    class _StreamCM:
+        def __init__(self): self.status_code = 401
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def aread(self):
+            return b'{"error":{"message":"bad key","type":"auth"}}'
+
+    class _StreamClient:
+        def __init__(self, *_a, **_kw): pass
+        async def aclose(self): pass
+        def stream(self, *_a, **_kw): return _StreamCM()
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _StreamClient)
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "ollama/qwen3:14b-iq4xs",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }))
+    assert resp.status_code == 401
+    assert json.loads(bytes(resp.body))["error"]["message"] == "bad key"
 
 
 # ---------------------------------------------------------------------------

@@ -185,9 +185,9 @@ async def test_passthrough_routes_to_anthropic(monkeypatch):
 
     await router.chat_completions(FakeRequest({
         "model": "anthropic/claude-haiku-4-5",
-        "messages": [{"role": "user", "content": "hi"}], "stream": True}))
+        "messages": [{"role": "user", "content": "hi"}]}))
 
     assert seen["url"] == "https://api.anthropic.com/v1/chat/completions"
     assert seen["headers"]["Authorization"] == "Bearer sk-ant-pt"
     assert seen["json"]["model"] == "claude-haiku-4-5"
-    assert seen["json"]["stream"] is False
+    assert seen["json"]["stream"] is False   # non-streaming request forced off
