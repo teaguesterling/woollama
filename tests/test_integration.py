@@ -170,6 +170,38 @@ def test_orchestrated_recipe_hides_tool_loop_from_client(woollama_server):
 
 
 @needs_ollama
+def test_orchestrated_recipe_streams_final_answer_hiding_tool_loop(woollama_server):
+    """STREAMING counterpart (slice streaming-2): the streamer recipe runs a
+    tool loop internally, but with stream:true the OpenAI client receives the
+    final answer as SSE deltas — and never sees a tool_call or more than one
+    finish_reason. This is the live gate the hermetic mocks can't cover: real
+    Ollama emits tool_call deltas FRAGMENTED across chunks, so it proves the SSE
+    parsing/reassembly, not just the loop logic."""
+    import openai
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; bundled recipe needs it")
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    stream = c.chat.completions.create(
+        model="woollama/streamer",
+        messages=[{"role": "user", "content": "Count to 3."}],
+        stream=True,
+        timeout=180,
+    )
+    text, finishes, saw_tool_calls = "", [], False
+    for chunk in stream:
+        choice = chunk.choices[0]
+        text += choice.delta.content or ""
+        if choice.delta.tool_calls:
+            saw_tool_calls = True
+        if choice.finish_reason is not None:
+            finishes.append(choice.finish_reason)
+    assert text.strip(), "expected a streamed final answer"
+    assert not saw_tool_calls, "client must not see internal tool_calls"
+    assert finishes == ["stop"], f"expected exactly one terminator, got {finishes}"
+
+
+@needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to
     — two different downstream MCP servers. One chat drives the model to use

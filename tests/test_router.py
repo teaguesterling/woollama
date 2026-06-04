@@ -361,3 +361,198 @@ system = "test"
     body = json.loads(resp.body)
     assert body["error"]["type"] == "not_implemented"
     assert "unsupported inferencer" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# /v1/chat/completions — recipe orchestration, STREAMING (slice streaming-2)
+# ---------------------------------------------------------------------------
+
+def mock_inferencer_stream(monkeypatch, turns: list[list[dict]]):
+    """Monkeypatch httpx.AsyncClient so each `.stream(POST)` plays the next
+    scripted SSE turn. A turn is a list of chunk dicts; each becomes a
+    `data: {...}` line and a trailing `data: [DONE]` is appended automatically —
+    so the per-turn DONE is something the router must SWALLOW, not relay."""
+    script = [list(t) for t in turns]
+
+    class _StreamCM:
+        def __init__(self, chunks):
+            self.status_code = 200
+            self._lines = ([f"data: {json.dumps(c)}" for c in chunks]
+                           + ["", "data: [DONE]", ""])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def aiter_lines(self):
+            for ln in self._lines:
+                yield ln
+
+    class _Client:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def aclose(self):
+            pass
+
+        def stream(self, _method, _url, json=None, **_kw):
+            return _StreamCM(script.pop(0))
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+
+async def _collect_sse(resp) -> tuple[list[dict], bool, list[dict]]:
+    """Drain a StreamingResponse into (chat.completion.chunk dicts, saw_done,
+    non-chunk frames e.g. errors)."""
+    raw = b""
+    async for piece in resp.body_iterator:
+        raw += piece if isinstance(piece, bytes) else piece.encode()
+    chunks, errors, done = [], [], False
+    for frame in raw.decode().split("\n\n"):
+        frame = frame.strip()
+        if not frame.startswith("data:"):
+            continue
+        data = frame[len("data:"):].strip()
+        if data == "[DONE]":
+            done = True
+            continue
+        obj = json.loads(data)
+        (chunks if obj.get("object") == "chat.completion.chunk" else errors).append(obj)
+    return chunks, done, errors
+
+
+def _deltas(chunks: list[dict]) -> str:
+    return "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+
+
+def _finishes(chunks: list[dict]) -> list[str]:
+    return [c["choices"][0]["finish_reason"] for c in chunks
+            if c["choices"][0]["finish_reason"] is not None]
+
+
+def _delta(text: str, **extra) -> dict:
+    return {"choices": [{"delta": {"content": text, **extra}}]}
+
+
+async def test_chat_recipe_stream_tool_less_streams_content(monkeypatch, tmp_path):
+    """A tool-less recipe streams its single final turn as content chunks: one
+    role chunk, the deltas verbatim, exactly one finish_reason, then [DONE]."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.chat]\ninferencer="ollama/qwen3"\ntools=[]\nsystem="be brief"\n')
+    recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+
+    mock_inferencer_stream(monkeypatch, [[_delta("Hel"), _delta("lo!")]])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/chat", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    assert resp.media_type == "text/event-stream"
+    chunks, done, errors = await _collect_sse(resp)
+    assert not errors and done
+    assert _deltas(chunks) == "Hello!"            # streamed once, in order
+    assert _finishes(chunks) == ["stop"]          # exactly one terminator
+    # role announced exactly once, before any content
+    roles = [c["choices"][0]["delta"].get("role") for c in chunks]
+    assert roles.count("assistant") == 1 and roles[0] == "assistant"
+
+
+async def test_chat_recipe_stream_tool_turn_is_invisible(monkeypatch, tmp_path):
+    """The tool turn must not leak: the model emits a tool_call (fragmented
+    across chunks, no content) on turn 1, woollama dispatches it, turn 2 streams
+    the answer. The client sees ONLY the final answer and ONE finish_reason —
+    no tool JSON, and the per-turn `tool_calls` finish/[DONE] are swallowed."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()                              # bundled `streamer` (hello.count_to)
+
+    dispatched: dict = {}
+    fake_reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [_tool("count_to")]
+
+    async def stub_call_tool(name, args):
+        dispatched["name"], dispatched["args"] = name, args
+        return SimpleNamespace(content=[SimpleNamespace(text='{"done":true}')])
+    mgr.call_tool = stub_call_tool  # type: ignore[method-assign]
+    fake_reg.add(mgr)
+    monkeypatch.setattr(router, "registry", fake_reg)
+
+    # Turn 1: a tool_call split across chunks (id+name first, arguments in
+    # pieces) and NO content. Turn 2: the streamed final answer.
+    mock_inferencer_stream(monkeypatch, [
+        [
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1",
+                 "function": {"name": "hello.count_to"}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '{"n":'}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": " 3}"}}]}}]},
+        ],
+        [_delta("Counted "), _delta("to 3.")],
+    ])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/streamer", "stream": True,
+        "messages": [{"role": "user", "content": "count to 3"}],
+    }))
+    chunks, done, errors = await _collect_sse(resp)
+    assert not errors and done
+    # dispatched with the REASSEMBLED fragmented arguments (Registry routes by
+    # the `hello.` prefix and hands the manager the bare tool name).
+    assert dispatched == {"name": "count_to", "args": {"n": 3}}
+    # client saw only the final answer — no tool JSON leaked
+    out = _deltas(chunks)
+    assert out == "Counted to 3."
+    assert "tool_call" not in out and "count_to" not in out
+    assert _finishes(chunks) == ["stop"]          # ONE terminator across 2 turns
+
+
+async def test_chat_recipe_stream_empty_final_is_valid_stream(monkeypatch, tmp_path):
+    """A final turn with empty content still yields a well-formed stream: a role
+    chunk, one finish_reason:stop, and [DONE] — no content chunks."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.chat]\ninferencer="ollama/qwen3"\ntools=[]\nsystem="x"\n')
+    recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+
+    mock_inferencer_stream(monkeypatch, [[{"choices": [{"delta": {}}]}]])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/chat", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    chunks, done, errors = await _collect_sse(resp)
+    assert not errors and done
+    assert _deltas(chunks) == ""
+    assert _finishes(chunks) == ["stop"]
+
+
+async def test_chat_recipe_stream_setup_error_is_json_status_not_stream(monkeypatch, tmp_path):
+    """An error BEFORE any output (unsupported inferencer) must come back as a
+    proper HTTP status JSON, never an empty 200 event-stream."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.bogus]\ninferencer="no-such-provider/m"\ntools=[]\nsystem="x"\n')
+    recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/bogus", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    assert resp.status_code == 501                # JSON error, not a stream
+    assert resp.media_type != "text/event-stream"
+    assert json.loads(resp.body)["error"]["type"] == "not_implemented"

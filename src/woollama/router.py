@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 import httpx
@@ -115,6 +117,8 @@ async def chat_completions(request: Request) -> Response:
         recipe = recipes.get(name)
         if recipe is None:
             return _error(f"unknown recipe '{name}'", "not_found", 404)
+        if body.get("stream"):
+            return await _orchestrate_recipe_stream(recipe, body)
         return await _orchestrate_recipe(recipe, body)
 
     # `<provider>/<model>` against a known OpenAI-compat inferencer → pass-through.
@@ -187,21 +191,55 @@ async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
 
 async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
                       reg: Registry) -> dict:
-    """Transport-agnostic recipe chat-loop. Prepends the recipe's system
-    prompt, runs the inferencer ↔ tool-dispatch loop (≤8 turns), and returns
-    the final OpenAI-shaped response dict (the one with `choices`).
+    """Run a recipe end-to-end and return the final OpenAI-shaped response dict.
 
-    Both the HTTP `/v1/chat/completions` handler and the MCP `chat` tool call
-    this — do NOT reimplement the loop. Tool dispatch routes through `reg`
-    (the caller's `Registry`), so each transport owns its own registry
-    lifecycle. Raises `OrchestrationError` for the unsupported-inferencer,
-    inferencer-error, and max-turns-exceeded cases.
+    A thin drainer over `orchestrate_events` (the single source of truth): it
+    ignores the streamed content deltas and keeps the terminal `final` event.
+    The contract is unchanged from before streaming-2 — the MCP `chat` tool and
+    the HTTP non-streaming handler both call this and must keep working as-is.
+    Raises `OrchestrationError` (unsupported inferencer / inferencer error /
+    max turns) exactly as the underlying loop does."""
+    final: dict | None = None
+    async for ev in orchestrate_events(recipe, user_msgs, reg, stream=False):
+        if ev["type"] == "final":
+            final = ev["response"]
+    assert final is not None, "orchestrate_events always yields a final or raises"
+    return final
 
-    Inferencer dispatch by `<provider>/`:
-      * `claude-code/<model>` → delegate a TOOL-LESS completion to the local
-        Claude Code CLI (keyless, uses the user's Claude auth). Recipes with a
-        non-empty tools list are rejected — tool delegation is a later slice.
-      * `ollama/<model>`      → the woollama-owned inferencer ↔ tool loop below.
+
+async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
+                             reg: Registry, *, stream: bool = False):
+    """The recipe chat-loop as an async generator — the SINGLE source of truth
+    for orchestration (do NOT reimplement the loop elsewhere). Prepends the
+    recipe's system prompt and runs the inferencer ↔ tool-dispatch loop (≤8
+    turns). Yields:
+
+      * `{"type": "delta", "content": str}` — assistant content to surface to
+        the client. Emitted only when `stream=True`.
+      * `{"type": "final", "response": dict}` — the final OpenAI response dict.
+
+    What is hidden in BOTH modes (the correctness invariant): the tool-call
+    JSON and the tool results never appear in the surfaced stream, and the
+    upstream per-turn `finish_reason`/`[DONE]` are consumed, never relayed —
+    the transport synthesizes exactly one terminator.
+
+    Deliberate divergence (a product choice, not a bug): when streaming, the
+    content of *every* turn is surfaced as one continuous assistant message, so
+    a tool-using recipe streams any pre-tool narration. Non-streaming returns
+    only the final turn's response dict (intermediate content is dropped), so
+    the same recipe can show more text when streamed. Truly-invisible
+    intermediate content is incompatible with live-streaming the final turn (we
+    can't know a turn is final until its `finish_reason` arrives), and tool
+    turns usually carry no content anyway — so this is the right trade.
+
+    Only the per-turn inferencer fetch differs by mode (`stream:false` POST vs.
+    SSE accumulation in `_stream_turn`); the system-prompt prepend, allow-list
+    boundary, tool dispatch, and max-turns guard are shared below.
+
+    Dispatch by `<provider>/`:
+      * `claude-code/<model>` → TOOL-LESS completion via the local Claude Code
+        CLI (keyless). Recipes with a non-empty tools list are rejected.
+      * a known inferencer    → the inferencer ↔ tool loop below.
       * anything else         → unsupported (501)."""
     inferencer = recipe["inferencer"]
     provider = inferencer.split("/", 1)[0]
@@ -214,11 +252,18 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
                 "tool-less claude-code recipe)", "not_implemented", 501)
         model = inferencer.split("/", 1)[1] if "/" in inferencer else ""
         try:
-            return await claude_code.run_completion(
+            resp = await claude_code.run_completion(
                 recipe["system"], user_msgs, model)
         except claude_code.ClaudeCodeError as e:
             raise OrchestrationError(
                 f"claude-code backend: {e}", "server_error", 502) from e
+        # claude-code is non-streaming: surface its whole answer as one delta.
+        if stream:
+            content = resp["choices"][0]["message"].get("content") or ""
+            if content:
+                yield {"type": "delta", "content": content}
+        yield {"type": "final", "response": resp}
+        return
 
     inf = inferencers.get(provider)
     if inf is None:
@@ -241,33 +286,42 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
     # never granted. `openai_tools_for` preserves the namespaced name as the
     # function name, so membership matches the emitted name directly.
     allowed = set(recipe["tools"])
-    log.info("orchestrating: tools=%s inferencer=%s",
-             [t["function"]["name"] for t in tools], inferencer)
+    log.info("orchestrating: tools=%s inferencer=%s stream=%s",
+             [t["function"]["name"] for t in tools], inferencer, stream)
 
     for turn in range(1, 9):
         req = {
             "model": inferencer_model,
             "messages": messages,
             "tools": tools,
-            "stream": False,
+            "stream": bool(stream),
             **inf.extra_body,             # provider-specific (Ollama options / Anthropic max_tokens)
         }
-        async with httpx.AsyncClient(timeout=180) as c:
-            r = await c.post(inf.chat_url(), json=req, headers=headers)
-            resp = r.json()
-        if "choices" not in resp:
-            log.warning("inferencer error: %s", resp)
-            raise OrchestrationError("inferencer error", "server_error", 502,
-                                     payload=resp)
+        if stream:
+            # Surface content deltas live; `acc` is filled with the turn's full
+            # message once the upstream stream ends.
+            acc: dict = {}
+            async for piece in _stream_turn(inf, req, headers, acc):
+                yield {"type": "delta", "content": piece}
+            content, calls, resp = acc["content"], acc["calls"], acc["response"]
+        else:
+            async with httpx.AsyncClient(timeout=180) as c:
+                r = await c.post(inf.chat_url(), json=req, headers=headers)
+                resp = r.json()
+            if "choices" not in resp:
+                log.warning("inferencer error: %s", resp)
+                raise OrchestrationError("inferencer error", "server_error", 502,
+                                         payload=resp)
+            msg = resp["choices"][0]["message"]
+            calls = msg.get("tool_calls") or []
+            content = msg.get("content") or ""
 
-        msg = resp["choices"][0]["message"]
-        calls = msg.get("tool_calls") or []
-        content = msg.get("content") or ""
         log.info("turn %d: content[%d] tool_calls=%d",
                  turn, len(content), len(calls))
 
         if not calls:
-            return resp
+            yield {"type": "final", "response": resp}
+            return
 
         messages.append({"role": "assistant", "content": content,
                          "tool_calls": calls})
@@ -304,8 +358,79 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
     raise OrchestrationError("max turns (8) exceeded", "server_error", 500)
 
 
+async def _stream_turn(inf: inferencers.Inferencer, req: dict, headers: dict,
+                       acc: dict):
+    """Stream ONE inferencer turn over SSE. Yields assistant content delta
+    strings as they arrive; on completion fills `acc` with the turn's
+    accumulated `{content, calls, response}`.
+
+    Two things this owns: (1) the upstream per-turn `finish_reason` and `[DONE]`
+    are CONSUMED here and never surfaced — the orchestration stream is closed by
+    exactly one synthesized terminator regardless of turn count. (2) tool_call
+    deltas arrive FRAGMENTED across chunks (the `id` in one, `arguments`
+    piecemeal), so they're reassembled by `index`."""
+    content_parts: list[str] = []
+    calls_by_index: dict[int, dict] = {}
+    async with httpx.AsyncClient(timeout=180) as c:
+        async with c.stream("POST", inf.chat_url(), json=req, headers=headers) as r:
+            if r.status_code >= 400:
+                raw = await r.aread()
+                try:
+                    payload = json.loads(raw)
+                except (ValueError, TypeError):
+                    payload = {"error": {"message": raw.decode("utf-8", "replace")
+                                         or "inferencer error", "type": "server_error"}}
+                raise OrchestrationError("inferencer error", "server_error", 502,
+                                         payload=payload)
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    content_parts.append(piece)
+                    yield piece
+                for tc in delta.get("tool_calls") or []:
+                    slot = calls_by_index.setdefault(
+                        tc.get("index", 0), {"id": None, "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+
+    content = "".join(content_parts)
+    calls = [
+        {"id": s["id"] or f"call_{idx}", "type": "function",
+         "function": {"name": s["name"], "arguments": s["arguments"]}}
+        for idx, s in sorted(calls_by_index.items())
+    ]
+    acc["content"] = content
+    acc["calls"] = calls
+    acc["response"] = {
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content,
+                        "tool_calls": calls or None},
+            "finish_reason": "tool_calls" if calls else "stop",
+        }],
+    }
+
+
 async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONResponse:
-    """HTTP adapter: run the shared loop, map results/errors onto JSON."""
+    """HTTP adapter (non-streaming): run the shared loop, map results/errors
+    onto JSON."""
     try:
         resp = await orchestrate(recipe, body.get("messages", []), registry)
     except OrchestrationError as e:
@@ -313,6 +438,58 @@ async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONRespons
             return JSONResponse(e.payload, status_code=e.status)
         return _error(e.message, e.kind, e.status)
     return JSONResponse(resp)
+
+
+async def _orchestrate_recipe_stream(recipe: recipes.Recipe, body: dict) -> Response:
+    """HTTP adapter (streaming): drive `orchestrate_events(stream=True)` and emit
+    OpenAI `chat.completion.chunk` SSE frames — a canonical role chunk, the
+    content deltas, then exactly ONE `finish_reason:"stop"` chunk + `[DONE]`,
+    no matter how many tool turns ran.
+
+    Like the passthrough streamer, we PRIME the generator before returning a
+    StreamingResponse: any error before the first surfaced output (missing key,
+    unsupported inferencer, a first-turn inferencer error) maps to a proper HTTP
+    status rather than an empty 200 stream. Errors after streaming has begun can
+    no longer change the status, so they go out as a best-effort error frame."""
+    model = body.get("model", "")
+    agen = orchestrate_events(recipe, body.get("messages", []), registry, stream=True)
+    try:
+        first = await agen.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except OrchestrationError as e:
+        await agen.aclose()
+        if e.payload is not None:
+            return JSONResponse(e.payload, status_code=e.status)
+        return _error(e.message, e.kind, e.status)
+
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    def frame(delta: dict, finish: str | None = None) -> str:
+        return "data: " + json.dumps({
+            "id": cid, "object": "chat.completion.chunk", "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }) + "\n\n"
+
+    async def sse():
+        yield frame({"role": "assistant"})        # canonical first chunk
+        try:
+            for ev in ([first] if first is not None else []):
+                if ev["type"] == "delta":
+                    yield frame({"content": ev["content"]})
+            async for ev in agen:                 # 'final' events terminate below
+                if ev["type"] == "delta":
+                    yield frame({"content": ev["content"]})
+        except OrchestrationError as e:
+            payload = e.payload if e.payload is not None else {
+                "error": {"message": e.message, "type": e.kind}}
+            yield "data: " + json.dumps(payload) + "\n\n"
+        yield frame({}, finish="stop")            # the one and only terminator
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
 
 
 def _error(message: str, kind: str, status: int) -> JSONResponse:

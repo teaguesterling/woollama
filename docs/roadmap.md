@@ -29,13 +29,14 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | Cloud providers: anthropic, openai, groq, together, openrouter + ollama | `inferencers.py` | j, k |
 | **Config-file inferencers** (`inferencers.toml`) — any OpenAI-compat backend | `config.py`, `inferencers.py` | k |
 | **Streaming passthrough** — `stream:true` on `<provider>/<model>` relays upstream SSE verbatim | `router.py:_passthrough_stream` | streaming-1 |
+| **Streaming orchestration** — `stream:true` on `woollama/<recipe>` streams the answer as OpenAI SSE; tool turns stay hidden. Core loop is now one async generator (`orchestrate_events`); `orchestrate` is a thin drainer | `router.py` | streaming-2 |
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
-Surfaces today: `/v1/chat/completions` (+ pass-through, with `stream:true`),
-`/v1/models`, `/v1/tools`, `/mcp` (Streamable HTTP), and `woollama mcp` (stdio)
-— served on BOTH a Unix socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the
-loopback TCP port.
+Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
+orchestration, both with `stream:true` → OpenAI SSE), `/v1/models`, `/v1/tools`,
+`/mcp` (Streamable HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix
+socket (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
 
 ## Open tracks (recommended order)
 
@@ -45,10 +46,14 @@ loopback TCP port.
    Done in slices:
    - [x] **streaming-1: passthrough SSE** — `stream:true` on `<provider>/<model>`
      relays the upstream stream verbatim (`router.py:_passthrough_stream`).
-   - [ ] **streaming-2: orchestration SSE** — stream the `woollama/<recipe>` final
-     turn; tool-call turns stay invisible. Make the core loop an async generator
-     so `orchestrate` stays the single source of truth (its docstring forbids a
-     forked loop); non-streaming `orchestrate` drains it for the final dict.
+   - [x] **streaming-2: orchestration SSE** — `stream:true` on `woollama/<recipe>`
+     streams the answer as OpenAI SSE; tool-call JSON/results stay hidden and the
+     per-turn `finish_reason`/`[DONE]` are swallowed (one synthesized terminator).
+     The core loop is now the async generator `orchestrate_events`; `orchestrate`
+     is a thin drainer (single source of truth preserved). Product note: in
+     streaming mode every turn's *content* is surfaced (continuous assistant
+     message), so it can show more prose than the non-streaming path, which
+     returns only the final turn — a deliberate, documented divergence.
    - [ ] **streaming-3: MCP progress events** — progress notifications on the MCP
      `chat` tool during tool turns.
 2. ~~**Unix socket transport**~~ — ✅ DONE. One uvicorn server binds the app to
@@ -82,6 +87,12 @@ Smaller follow-ons (not blocking):
   is unit-tested on the emit side + doc-confirmed (tools supported); the live
   round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:
   `uv run --extra dev pytest tests/test_integration.py -m integration -k anthropic`
+- **Streaming orchestration against real Ollama** (slice streaming-2): the SSE
+  parsing — including FRAGMENTED tool_call delta reassembly — is verified
+  hermetically AND against a real local SSE server over a socket; the real-Ollama
+  run is pending (the dev box's Ollama models symlink points at the pre-move
+  `/srv/physical/...` path and 500s — `sudo ln -sfn /srv/logical/opt/ollama/share/ollama/models /opt/ollama/share/ollama/models`).
+  Once Ollama serves: `uv run --extra dev pytest tests/test_integration.py -m integration -k stream`
 
 ## v1.0 (Rust) gate — progress
 
@@ -93,7 +104,8 @@ covers the v1.0 feature set"):
 - [x] the Anthropic backend
 - [x] woollama-as-MCP-server side
 - [x] long-lived MCP connections (was the criterion-#4 latency concern)
-- [ ] streaming on both sides
+- [ ] streaming on both sides (OpenAI SSE out DONE — passthrough + orchestration;
+      MCP progress events = streaming-3, pending)
 - [x] Unix socket alongside HTTP loopback
 - [ ] the panel-confirm round-trip equivalent (the conversations surface +
       cosmic-fabric consuming it)
