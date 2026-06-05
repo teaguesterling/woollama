@@ -1,0 +1,14 @@
+# Opt-in LOCAL lint gate, mirroring CI (.github/workflows/ci.yml). Enable with:
+#
+#     uv tool install pre-commit
+#     pre-commit install
+#
+# Lint only: the project deliberately does NOT use ruff-format (E501 is ignored
+# and lines are hand-wrapped), so there is no ruff-format hook here — adding one
+# would try to reformat the whole tree against a convention the code doesn't use.
+# Keep `rev` in step with the ruff in pyproject's dev extra.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff-check

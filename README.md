@@ -109,6 +109,23 @@ cat "${XDG_RUNTIME_DIR:-/tmp}/woollama.addr"
 # Then point an OpenAI client at it (see Quick taste above).
 ```
 
+### Tests & lint
+
+```sh
+uv run --extra dev pytest        # hermetic suite (live tests are opt-in: -m integration)
+uv run ruff check .              # lint — the CI gate
+```
+
+CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every PR.
+For the same lint gate locally on commit, opt into the pre-commit hook:
+
+```sh
+uv tool install pre-commit && pre-commit install
+```
+
+Lint only — the project does not use `ruff format` (lines are hand-wrapped,
+`E501` is ignored), so there is no formatter step in either gate.
+
 ## Design principles
 
 1. **Two standards, neither extended.** MCP for tool/prompt/resource

@@ -1,0 +1,46 @@
+name: CI
+
+# The gate that ruff was missing. `ruff check` is configured in pyproject but
+# nothing enforced it, so it drifted once (cleaned in 7da4b52). This runs it —
+# plus the hermetic test suite — on every push to main and every PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync (dev extras)
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      # The lint gate. Lint only — the project deliberately does NOT use
+      # ruff-format (E501 is ignored; lines are hand-wrapped), so `ruff format
+      # --check` is intentionally not run.
+      - name: Ruff lint
+        run: uv run --extra dev ruff check .
+
+      # Hermetic tests only: pyproject's addopts already excludes the
+      # `integration` marker, so CI needs no Ollama / Claude / API keys.
+      - name: Hermetic tests
+        run: uv run --extra dev pytest

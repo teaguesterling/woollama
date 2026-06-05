@@ -98,8 +98,11 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
 Smaller follow-ons (not blocking):
 - Config-file-driven inferencers shipped; could add more built-in clouds
   (deepseek/xai/mistral) — but config already covers them.
-- A pre-commit / CI hook so `ruff` actually gates (it's configured but not run
-  by pytest; it drifted once and was cleaned in `7da4b52`).
+- ~~A pre-commit / CI hook so `ruff` actually gates~~ — ✅ DONE. GitHub Actions
+  CI (`.github/workflows/ci.yml`) runs `ruff check .` + the hermetic suite on
+  push/PR (3.11 + 3.12); an opt-in `.pre-commit-config.yaml` mirrors the lint
+  gate locally. Lint only (no `ruff format` — the tree is hand-wrapped, `E501`
+  ignored).
 - `output_schema` pass-through on re-exported proxy tools (currently content +
   structuredContent only).
 - Tool DELEGATION to Claude Code (Claude owns the loop, runs a recipe's MCP
