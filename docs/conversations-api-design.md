@@ -4,9 +4,13 @@ Status: **in progress.** Decisions locked 2026-06-02. **conv-1a shipped
 2026-06-04**: `POST /v1/responses` stateless subset (`store:false`) — a
 Responses-shaped superset of /v1/chat/completions, routed by `model` identically
 (`router.py:responses_create`, shaping in `responses.py`), verified against the
-real `openai` SDK (`.responses.create` → `.output_text`). Still to do from §8:
-the handle table + claude-resume backend (conv-1b), then the driver/interactive/
-stored slices.
+real `openai` SDK (`.responses.create` → `.output_text`). **conv-1b shipped
+2026-06-04**: in-memory handle table + the `claude-resume` backend + `store:true`
+/ `conversation` / `previous_response_id` routing (`conversations.py`,
+`router._responses_stateful`), live-verified via the `openai` SDK. Still to do
+from §8: `/v1/conversations` listing (conv-2), the Rust driver + claude-tmux
+backend (gated on §6 spikes), the interactive `requires_action` path, the duckdb
+`stored` backend, and cosmic-fabric wiring.
 
 ## The principle
 
@@ -184,11 +188,22 @@ plain terminal before building the claude-tmux backend:
    the Responses shape against the EASY (non-interactive) backend. No tmux.
    - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
      Responses wire shape, SDK-verified. No backend/handle table yet.
-   - [ ] **conv-1b** — in-memory handle table (resp_id is the fork key; one async
-     writer per conversation_id) + `claude-resume` backend + `store:true` /
-     `conversation` / `previous_response_id` routing. Run the §6.1-style spike
-     first (does `claude -p --output-format json` emit `session_id`, and does
-     `claude --resume <sid> -p` continue non-interactively?) in a PLAIN terminal.
+   - [x] **conv-1b SHIPPED 2026-06-04** — in-memory handle table
+     (`conversations.py`: `conv_id → {backend, native_id, workdir}`; resp_id is
+     the chain key; one `asyncio.Lock` writer per conversation) + `claude-resume`
+     backend + `store:true` / `conversation` / `previous_response_id` routing in
+     `router._responses_stateful`. Verified live via the `openai` SDK (create →
+     continue → recalled the codeword).
+     Resume facts (claude 2.1.163, headless — no hang; the §6 hang is the
+     INTERACTIVE TUI, not `-p`): `claude -p --output-format json` → the `result`
+     event carries `session_id`; `claude --resume <sid> -p` continues, recalls
+     context, returns the SAME `session_id`. **Load-bearing gotcha the live test
+     caught:** Claude scopes sessions BY PROJECT (cwd), so all turns of a
+     conversation MUST run in the same dir — each conversation pins a stable
+     `workdir` (a fresh empty temp dir, cleaned on delete in a later slice).
+     `--resume` continues from the session TIP (no fork-from-earlier-turn
+     primitive), so `previous_response_id` CHAINS off the conversation; true
+     forking is later. Handle table is in-memory → a restart loses sid mappings.
 2. **`/v1/conversations` listing + delete** — discovery/attach surface.
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.

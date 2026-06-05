@@ -33,6 +33,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **MCP progress events** — the `chat` tool emits a `ctx.info` notification per tool call/result during the hidden loop (live progress; return value unchanged) | `mcp_server.py`, `router.py` | streaming-3 |
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
+| **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
@@ -71,8 +72,10 @@ HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix socket
    session driven by a separate Rust package). Build order is in that doc.
    - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
      OpenAI Responses wire shape, verified live via the `openai` SDK.
-   - [ ] **conv-1b** — handle table + `claude-resume` backend + `store:true` /
-     `conversation` / `previous_response_id` (proves handle routing).
+   - [x] **conv-1b** — in-memory handle table (`conversation_id` → backend +
+     claude `session_id` + stable workdir; one writer per conversation) +
+     `claude-resume` backend + `store:true` / `conversation` /
+     `previous_response_id` routing. Live-verified (create → resume → recall).
    - [ ] conv-2+ — `/v1/conversations` listing; the Rust session driver +
      claude-tmux backend (gated on §6 spikes); interactive `requires_action`;
      duckdb `stored` backend; cosmic-fabric wiring.

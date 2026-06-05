@@ -23,7 +23,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import claude_code, config, inferencers, recipes, responses
+from . import claude_code, config, conversations, inferencers, recipes, responses
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -50,6 +50,10 @@ class OrchestrationError(Exception):
 # path (below) and the mounted MCP server. Populated + started once by the
 # lifespan, so there is a single connection layer to the downstream MCP servers.
 registry = Registry()
+
+# In-memory conversation handle table for the stateful /v1/responses surface
+# (conv-1b). woollama routes handles → backends; it does not store transcripts.
+conversation_store = conversations.ConversationStore()
 
 # The MCP server, mounted onto this same FastAPI app so woollama exposes BOTH
 # surfaces on one port: /v1/* (OpenAI-compatible) and /mcp (MCP over Streamable
@@ -151,30 +155,75 @@ async def responses_create(request: Request) -> Response:
                       "(use /v1/chat/completions for SSE; a Responses streaming "
                       "shape is a later slice)", "invalid_request_error", 400)
 
-    # Stateful opt-in — anything needing a backing store is conv-1b onward.
-    if body.get("store") or body.get("conversation") or body.get("previous_response_id"):
-        return _error(
-            "stateful conversations are not available yet: `store`, "
-            "`conversation`, and `previous_response_id` need a stateful backend "
-            "(claude-resume, arriving next — requires a claude-code model; the "
-            "server-owned `stored` backend is a later slice). Use `store:false` "
-            "for now, which behaves as a Responses-shaped /v1/chat/completions.",
-            "not_implemented", 501)
-
     try:
         messages = responses.parse_input(body.get("input", ""))
     except ValueError as e:
         return _error(str(e), "invalid_request_error", 400)
 
+    # Stateful opt-in (conv-1b): a backing conversation is involved.
+    if body.get("store") or body.get("conversation") or body.get("previous_response_id"):
+        return await _responses_stateful(body, model, messages)
+
+    # Stateless (conv-1a): a Responses-shaped /v1/chat/completions.
     try:
         text = await _complete_stateless(model, messages)
     except OrchestrationError as e:
         if e.payload is not None:
             return JSONResponse(e.payload, status_code=e.status)
         return _error(e.message, e.kind, e.status)
-
     return JSONResponse(responses.build_response(
         responses.new_id("resp"), model, text))
+
+
+async def _responses_stateful(body: dict, model: str,
+                              messages: list[dict]) -> Response:
+    """Route a stateful turn: resolve/attach the conversation handle, run the
+    turn on its backend under a per-conversation write lock, and return the
+    Responses object carrying the conversation id.
+
+    Attach precedence: an explicit `conversation` wins; else `previous_response_id`
+    resolves to its conversation (chaining off a prior turn); else a NEW
+    conversation is created, its backend chosen by `model`."""
+    conv_id = body.get("conversation")
+    prev = body.get("previous_response_id")
+
+    if conv_id:
+        conv = conversation_store.get(conv_id)
+        if conv is None:
+            return _error(f"unknown conversation '{conv_id}'", "not_found", 404)
+        if prev and conversation_store.by_response(prev) is not conv:
+            return _error(
+                f"previous_response_id '{prev}' does not belong to conversation "
+                f"'{conv_id}'", "invalid_request_error", 400)
+    elif prev:
+        conv = conversation_store.by_response(prev)
+        if conv is None:
+            return _error(f"unknown previous_response_id '{prev}'", "not_found", 404)
+    else:
+        backend = conversations.backend_for_model(model)
+        if backend is None:
+            return _error(
+                f"no stateful backend for model '{model}': stateful conversations "
+                "need a claude-code model in this build (the claude-resume "
+                "backend). Server-owned `stored` conversations for "
+                "ollama/recipe models are a later slice. Use `store:false` for a "
+                "stateless turn.", "not_implemented", 501)
+        conv = conversation_store.create(backend, model)
+
+    backend_impl = conversations.BACKENDS[conv.backend]
+    async with conv.lock:                       # one writer per conversation
+        conv.status = "busy"
+        try:
+            text = await backend_impl.send_turn(conv, messages)
+        except claude_code.ClaudeCodeError as e:
+            conv.status = "idle"
+            return _error(f"{conv.backend} backend: {e}", "server_error", 502)
+        conv.status = "idle"
+
+    resp_id = responses.new_id("resp")
+    conversation_store.record_response(conv, resp_id)
+    return JSONResponse(responses.build_response(
+        resp_id, conv.model, text, conversation=conv.id))
 
 
 async def _complete_stateless(model: str, messages: list[dict]) -> str:

@@ -217,6 +217,29 @@ def test_responses_stateless_via_openai_sdk(woollama_server):
     assert r.output_text.strip(), "expected a non-empty Responses output_text"
 
 
+@needs_claude_code
+def test_responses_stateful_claude_resume_recalls_context_live(woollama_server):
+    """conv-1b live gate: via the openai SDK, create a stateful conversation on
+    the claude-resume backend, then CONTINUE it by conversation id — the second
+    turn must recall the first, proving woollama's handle → claude session_id
+    routing resumes the right session end-to-end. Costs real money (gated)."""
+    import openai
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    r1 = c.responses.create(
+        model="claude-code/haiku",
+        input="Remember this codeword: banana. Reply with only: ok",
+        store=True, timeout=180)
+    assert r1.conversation is not None, "stateful response must carry a conversation"
+    conv_id = r1.conversation.id
+    r2 = c.responses.create(
+        model="claude-code/haiku",
+        input="What codeword did I ask you to remember? Reply with only that word.",
+        conversation=conv_id, timeout=180)
+    assert r2.conversation.id == conv_id
+    assert "banana" in r2.output_text.lower(), \
+        f"resumed session should recall the codeword; got {r2.output_text!r}"
+
+
 @needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to

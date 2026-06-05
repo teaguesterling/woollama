@@ -121,16 +121,17 @@ async def test_responses_store_true_is_501_with_guidance():
     assert "stateful" in body["error"]["message"]
 
 
-async def test_responses_conversation_attach_is_501():
+async def test_responses_attach_unknown_conversation_is_404():
+    # conv-1b: attach is implemented; an unknown handle is a 404, not a 501.
     resp = await router.responses_create(FakeRequest({
-        "model": "ollama/x", "input": "hi", "conversation": "conv_abc"}))
-    assert resp.status_code == 501
+        "model": "claude-code/haiku", "input": "hi", "conversation": "conv_nope"}))
+    assert resp.status_code == 404
 
 
-async def test_responses_previous_response_id_is_501():
+async def test_responses_unknown_previous_response_id_is_404():
     resp = await router.responses_create(FakeRequest({
-        "model": "ollama/x", "input": "hi", "previous_response_id": "resp_x"}))
-    assert resp.status_code == 501
+        "model": "claude-code/haiku", "input": "hi", "previous_response_id": "resp_nope"}))
+    assert resp.status_code == 404
 
 
 async def test_responses_stream_true_is_400():

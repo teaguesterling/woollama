@@ -64,7 +64,9 @@ def build_response(resp_id: str, model: str, text: str, *,
         "created_at": int(created_at if created_at is not None else time.time()),
         "model": model,
         "status": status,
-        "conversation": conversation,
+        # A Response carries a conversation OBJECT (`{id}`) or null — requests
+        # still attach by bare string id (see router). None for stateless turns.
+        "conversation": ({"id": conversation} if conversation else None),
         "output": [{
             "type": "message",
             "id": new_id("msg"),
