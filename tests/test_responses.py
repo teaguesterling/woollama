@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from woollama import recipes, responses, router
+from woollama import conversations, recipes, responses, router
 from woollama.manager import Registry
 
 # ---------------------------------------------------------------------------
@@ -109,16 +109,26 @@ async def test_responses_stateless_passthrough_provider(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Stateful opt-in is deferred cleanly (not half-implemented)
+# Stateful opt-in routes to a backend (claude-resume or stored) — conv-1b/conv-5
 # ---------------------------------------------------------------------------
 
-async def test_responses_store_true_is_501_with_guidance():
+async def test_responses_store_true_routes_to_stored(monkeypatch, tmp_path):
+    """store:true on a non-claude model now creates a server-owned `stored`
+    conversation (conv-5) — no longer a 501."""
+    monkeypatch.setattr(router, "conversation_store", conversations.ConversationStore())
+    monkeypatch.setattr(conversations, "_stored",
+                        conversations.StoredStore(str(tmp_path / "c.duckdb")))
+
+    async def fake_complete(model, messages):
+        return "hi back"
+    monkeypatch.setattr(router, "complete_stateless", fake_complete)
+
     resp = await router.responses_create(FakeRequest({
         "model": "ollama/x", "input": "hi", "store": True}))
-    assert resp.status_code == 501
+    assert resp.status_code == 200
     body = json.loads(resp.body)
-    assert body["error"]["type"] == "not_implemented"
-    assert "stateful" in body["error"]["message"]
+    assert body["conversation"]["id"].startswith("conv_")
+    assert body["output"][0]["content"][0]["text"] == "hi back"
 
 
 async def test_responses_attach_unknown_conversation_is_404():

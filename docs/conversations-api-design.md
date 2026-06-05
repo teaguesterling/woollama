@@ -7,10 +7,14 @@ Responses-shaped superset of /v1/chat/completions, routed by `model` identically
 real `openai` SDK (`.responses.create` → `.output_text`). **conv-1b shipped
 2026-06-04**: in-memory handle table + the `claude-resume` backend + `store:true`
 / `conversation` / `previous_response_id` routing (`conversations.py`,
-`router._responses_stateful`), live-verified via the `openai` SDK. Still to do
-from §8: `/v1/conversations` listing (conv-2), the Rust driver + claude-tmux
-backend (gated on §6 spikes), the interactive `requires_action` path, the duckdb
-`stored` backend, and cosmic-fabric wiring.
+`router._responses_stateful`), live-verified via the `openai` SDK. **conv-2
+shipped 2026-06-04**: `/v1/conversations` create/list/get/delete. **conv-5
+shipped 2026-06-05**: the duckdb `stored` backend — server-owned conversations
+for models with no native session (ollama/recipes/cloud), via transcript replay;
+`GET /v1/conversations/{id}/items` now serves the stored transcript; handles
+rehydrate from duckdb at startup. Still to do from §8: the Rust driver +
+claude-tmux backend (gated on §6 spikes), the interactive `requires_action`
+path, and cosmic-fabric wiring.
 
 ## The principle
 
@@ -214,7 +218,25 @@ plain terminal before building the claude-tmux backend:
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.
 4. **`requires_action` / interactive answer path** — §5; the interaction driver.
-5. **duckdb `stored` backend** — server-owned conversations (no backend owns).
+5. **duckdb `stored` backend** — **SHIPPED 2026-06-05** (conv-5). Server-owned
+   conversations for models with no native session (ollama/recipes/cloud):
+   `StoredStore` (a single duckdb connection serialized by an `asyncio.Lock` —
+   duckdb isn't thread-safe) persists `conversations` + `messages`; `StoredBackend.
+   send_turn` loads the stored history, replays it through `router.complete_stateless
+   (model, history + new)`, then persists the new user turns + the assistant
+   answer (visible turns only — recipe tool internals stay hidden, as
+   `complete_stateless` returns only the final text). `backend_for_model` now maps
+   every non-claude model here (the old 501 is gone). `GET /v1/conversations/{id}/
+   items` serves the stored transcript (`responses.item_object`; the list parses
+   as the SDK's `ConversationItemList`, holding items to the same SDK bar as the
+   rest of conv-*); claude-resume still 501s (no `history`). Handles rehydrate
+   from duckdb at startup via `conversations.rehydrate_stored` (extracted from the
+   lifespan and unit-tested — the restart path is the slice's point);
+   `response_ids` aren't persisted, so
+   `previous_response_id` is within-process only — attach-by-`conversation` is the
+   durable path. DB path: `$WOOLLAMA_DB` or `$XDG_DATA_HOME/woollama/
+   conversations.duckdb`. Live-verified on ollama (codeword recalled across turns
+   purely by replay; items endpoint returns the 4-turn transcript).
 6. **cosmic-fabric wiring** — when that UX returns.
 
 ## 9. Risk flags

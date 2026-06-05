@@ -82,6 +82,28 @@ def build_response(resp_id: str, model: str, text: str, *,
     }
 
 
+def item_object(msg: dict) -> dict:
+    """Shape one stored transcript message as an OpenAI conversation *item*
+    (`GET /v1/conversations/{id}/items`). A user turn carries an `input_text`
+    part; an assistant turn an `output_text` part — the same content-part vocab
+    `parse_input`/`build_response` use. The field set (`status` included) is
+    exactly what the SDK's `conversations.Message` requires, so a list of these
+    validates as a `ConversationItemList` (the SDK parses each item)."""
+    role = msg.get("role", "user")
+    text = msg.get("content", "") or ""
+    if role == "assistant":
+        content = [{"type": "output_text", "text": text, "annotations": []}]
+    else:
+        content = [{"type": "input_text", "text": text}]
+    return {
+        "id": new_id("msg"),
+        "type": "message",
+        "status": "completed",
+        "role": role,
+        "content": content,
+    }
+
+
 def conversation_object(conv) -> dict:
     """Shape a Conversation handle for the /v1/conversations discovery surface.
     Emits the OpenAI Conversation base fields (so it parses in the `openai` SDK's

@@ -78,6 +78,7 @@ def woollama_server(tmp_path):
         "WOOLLAMA_ADDRESS": f"127.0.0.1:{port}",
         "WOOLLAMA_CONFIG_DIR": str(tmp_path),  # forces bundled defaults
         "XDG_RUNTIME_DIR": str(tmp_path),       # don't clobber the user's real addr-file
+        "WOOLLAMA_DB": str(tmp_path / "conv.duckdb"),  # stored backend → tmp, not ~/.local
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "woollama"],
@@ -238,6 +239,37 @@ def test_responses_stateful_claude_resume_recalls_context_live(woollama_server):
     assert r2.conversation.id == conv_id
     assert "banana" in r2.output_text.lower(), \
         f"resumed session should recall the codeword; got {r2.output_text!r}"
+
+
+@needs_ollama
+def test_responses_stateful_stored_recalls_via_transcript_replay(woollama_server):
+    """conv-5 live gate (free, on ollama): a server-owned `stored` conversation
+    recalls a codeword across turns — not because the model has a session, but
+    because woollama persists the transcript and REPLAYS it as context. Then the
+    /v1/conversations/{id}/items endpoint serves that stored transcript."""
+    import openai
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; needed for the live turn")
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    r1 = c.responses.create(
+        model="ollama/qwen3:14b-iq4xs",
+        input="Remember this codeword: banana. Reply with only: ok",
+        store=True, timeout=180)
+    assert r1.conversation is not None, "stored response must carry a conversation"
+    conv_id = r1.conversation.id
+    r2 = c.responses.create(
+        model="ollama/qwen3:14b-iq4xs",
+        input="What codeword did I ask you to remember? Reply with only that word.",
+        conversation=conv_id, timeout=180)
+    assert r2.conversation.id == conv_id
+    assert "banana" in r2.output_text.lower(), \
+        f"stored replay should recall the codeword; got {r2.output_text!r}"
+    # the transcript endpoint now serves the stored turns (4: 2 user + 2 assistant)
+    items = httpx.get(f"{woollama_server}/v1/conversations/{conv_id}/items",
+                      timeout=10).json()["data"]
+    assert len(items) == 4
+    assert items[0]["role"] == "user" and items[1]["role"] == "assistant"
 
 
 @needs_ollama

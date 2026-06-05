@@ -34,13 +34,16 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
 | **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
-| **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras); items → 501 (driver slice) | `router.py`, `conversations.py` | conv-2 |
+| **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras) | `router.py`, `conversations.py` | conv-2 |
+| **`stored` backend (duckdb)** — server-owned conversations for non-claude models (ollama/recipes/cloud) via transcript replay; `/v1/conversations/{id}/items` serves the stored transcript; handles rehydrate at startup | `conversations.py`, `router.py` | conv-5 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
 orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
-subset + stateful via claude-resume — OpenAI Responses shape), `/v1/conversations`
-(create/list/get/delete), `/v1/models`, `/v1/tools`, `/mcp` (Streamable HTTP),
+subset + stateful via claude-resume AND the server-owned `stored` backend —
+OpenAI Responses shape), `/v1/conversations`
+(create/list/get/delete + `items` transcript for `stored`), `/v1/models`,
+`/v1/tools`, `/mcp` (Streamable HTTP),
 and `woollama mcp` (stdio) — served on BOTH a Unix socket
 (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
 
@@ -79,11 +82,17 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      `claude-resume` backend + `store:true` / `conversation` /
      `previous_response_id` routing. Live-verified (create → resume → recall).
    - [x] **conv-2** — `/v1/conversations` create / list / get / delete (the
-     discovery + attach + teardown surface; transcript `items` deferred to the
-     driver slice). Live CRUD verified.
+     discovery + attach + teardown surface). Live CRUD verified.
+   - [x] **conv-5** — duckdb `stored` backend: server-owned conversations for
+     models with no native session (ollama/recipes/cloud) via transcript replay
+     (`StoredStore` + `StoredBackend`; `complete_stateless` made public for it);
+     `backend_for_model` routes every non-claude model here (old 501 gone);
+     `/v1/conversations/{id}/items` serves the stored transcript (claude-resume
+     still 501s); handles rehydrate from duckdb at startup. Live-verified on
+     ollama (codeword recalled across turns by replay alone).
    - [ ] conv-3+ — the Rust session driver + claude-tmux backend (gated on the
      §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`);
-     interactive `requires_action`; duckdb `stored` backend; cosmic-fabric wiring.
+     interactive `requires_action`; cosmic-fabric wiring.
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
 Smaller follow-ons (not blocking):
