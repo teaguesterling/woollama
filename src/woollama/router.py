@@ -226,6 +226,77 @@ async def _responses_stateful(body: dict, model: str,
         resp_id, conv.model, text, conversation=conv.id))
 
 
+# --- /v1/conversations — discovery + attach + teardown (conv-2) --------------
+
+@app.post("/v1/conversations")
+async def conversations_create(request: Request) -> Response:
+    """Create a conversation handle. The backend is taken explicitly or derived
+    from `model`; the backing session itself is created lazily on the first turn
+    (woollama routes the handle, the backend owns the bytes)."""
+    body = await request.json()
+    model = body.get("model", "")
+    if not model:
+        return _error("`model` is required to create a conversation "
+                      "(e.g. 'claude-code/haiku')", "invalid_request_error", 400)
+    backend = body.get("backend") or conversations.backend_for_model(model)
+    if backend is None or backend not in conversations.BACKENDS:
+        return _error(
+            f"no stateful backend for model '{model}': claude-code models use the "
+            "claude-resume backend; ollama/recipe conversations need the "
+            "server-owned `stored` backend (a later slice).", "not_implemented", 501)
+    conv = conversation_store.create(backend, model,
+                                     metadata=body.get("metadata") or {},
+                                     title=body.get("title"))
+    return JSONResponse(responses.conversation_object(conv), status_code=201)
+
+
+@app.get("/v1/conversations")
+async def conversations_list() -> JSONResponse:
+    """List known conversation handles — the discovery surface cosmic-fabric
+    binds to."""
+    return JSONResponse({"object": "list",
+                         "data": [responses.conversation_object(c)
+                                  for c in conversation_store.list()]})
+
+
+@app.get("/v1/conversations/{conv_id}")
+async def conversations_get(conv_id: str) -> Response:
+    conv = conversation_store.get(conv_id)
+    if conv is None:
+        return _error(f"unknown conversation '{conv_id}'", "not_found", 404)
+    return JSONResponse(responses.conversation_object(conv))
+
+
+@app.get("/v1/conversations/{conv_id}/items")
+async def conversations_items(conv_id: str) -> Response:
+    """The transcript. Deferred: reading a backend's transcript (parsing a Claude
+    session jsonl) is the session driver's job — a later slice. woollama routes
+    handles; it does not store turns."""
+    conv = conversation_store.get(conv_id)
+    if conv is None:
+        return _error(f"unknown conversation '{conv_id}'", "not_found", 404)
+    return _error(
+        "conversation transcript items are not available yet — reading a "
+        "backend's transcript is the session driver's job (a later slice).",
+        "not_implemented", 501)
+
+
+@app.delete("/v1/conversations/{conv_id}")
+async def conversations_delete(conv_id: str) -> Response:
+    """End woollama's hold on the conversation: tear down the backend's local
+    state (best-effort) and forget the handle."""
+    conv = conversation_store.get(conv_id)
+    if conv is None:
+        return _error(f"unknown conversation '{conv_id}'", "not_found", 404)
+    try:
+        await conversations.BACKENDS[conv.backend].delete(conv)
+    except Exception as e:               # teardown is best-effort; still forget it
+        log.warning("backend delete for '%s' failed: %s", conv_id, e)
+    conversation_store.remove(conv_id)
+    return JSONResponse({"id": conv_id, "object": "conversation.deleted",
+                         "deleted": True})
+
+
 async def _complete_stateless(model: str, messages: list[dict]) -> str:
     """Run one stateless turn, return the assistant text. Routes by `model`
     exactly like /v1/chat/completions (woollama/<recipe> → orchestrate; a known

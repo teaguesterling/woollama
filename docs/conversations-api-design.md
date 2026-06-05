@@ -205,6 +205,12 @@ plain terminal before building the claude-tmux backend:
      primitive), so `previous_response_id` CHAINS off the conversation; true
      forking is later. Handle table is in-memory → a restart loses sid mappings.
 2. **`/v1/conversations` listing + delete** — discovery/attach surface.
+   **conv-2 SHIPPED 2026-06-04**: `POST` (create handle; backend derived from
+   `model`), `GET` (list), `GET /{id}`, `DELETE /{id}` (backend teardown +
+   forget handle), all over the in-memory handle table; objects parse as OpenAI
+   Conversation + woollama routing extras (`backend`/`status`/`title`). Live
+   CRUD verified. `GET /{id}/items` (transcript) is a deliberate 501 — reading a
+   backend's transcript is the session-driver's job (slice 3+).
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.
 4. **`requires_action` / interactive answer path** — §5; the interaction driver.

@@ -163,3 +163,88 @@ async def test_stateful_backend_error_is_502(monkeypatch):
         "model": "claude-code/haiku", "input": "hi", "store": True}))
     assert r.status_code == 502
     assert "claude-resume backend" in json.loads(r.body)["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# /v1/conversations — discovery / attach / teardown (conv-2)
+# ---------------------------------------------------------------------------
+
+async def test_conversations_create_lists_and_retrieves(monkeypatch):
+    from openai.types.conversations import Conversation
+    fresh_store(monkeypatch)
+
+    r = await router.conversations_create(FakeRequest({
+        "model": "claude-code/haiku", "title": "demo", "metadata": {"k": "v"}}))
+    assert r.status_code == 201
+    obj = json.loads(r.body)
+    assert obj["backend"] == "claude-resume" and obj["status"] == "idle"
+    assert obj["title"] == "demo" and obj["metadata"] == {"k": "v"}
+    Conversation.model_validate(obj)        # parses as an OpenAI Conversation
+    cid = obj["id"]
+
+    listing = json.loads((await router.conversations_list()).body)
+    assert listing["object"] == "list"
+    assert cid in [c["id"] for c in listing["data"]]
+
+    got = await router.conversations_get(cid)
+    assert json.loads(got.body)["id"] == cid
+
+
+async def test_conversations_create_requires_model(monkeypatch):
+    fresh_store(monkeypatch)
+    r = await router.conversations_create(FakeRequest({"title": "no model"}))
+    assert r.status_code == 400
+
+
+async def test_conversations_create_non_stateful_model_is_501(monkeypatch):
+    fresh_store(monkeypatch)
+    r = await router.conversations_create(FakeRequest({"model": "ollama/qwen3"}))
+    assert r.status_code == 501
+
+
+async def test_conversations_get_unknown_is_404(monkeypatch):
+    fresh_store(monkeypatch)
+    r = await router.conversations_get("conv_nope")
+    assert r.status_code == 404
+
+
+async def test_conversations_items_is_501_for_known_conversation(monkeypatch):
+    fresh_store(monkeypatch)
+    created = json.loads((await router.conversations_create(
+        FakeRequest({"model": "claude-code/haiku"}))).body)
+    r = await router.conversations_items(created["id"])
+    assert r.status_code == 501            # transcript = driver slice
+    assert (await router.conversations_items("conv_nope")).status_code == 404
+
+
+async def test_conversations_delete_removes_handle_and_workdir(monkeypatch, tmp_path):
+    store = fresh_store(monkeypatch)
+    conv = store.create("claude-resume", "claude-code/haiku")
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    conv.workdir = str(workdir)
+
+    r = await router.conversations_delete(conv.id)
+    body = json.loads(r.body)
+    assert body["deleted"] is True and body["object"] == "conversation.deleted"
+    assert store.get(conv.id) is None              # handle forgotten
+    assert not workdir.exists()                     # backend tore down its workdir
+    assert (await router.conversations_delete(conv.id)).status_code == 404
+
+
+async def test_create_via_endpoint_then_continue_via_responses(monkeypatch):
+    """End-to-end handle reuse: a conversation created on /v1/conversations is
+    driven by /v1/responses attaching to it."""
+    calls = patch_claude(monkeypatch, sid="sid-c2")
+    fresh_store(monkeypatch)
+    created = json.loads((await router.conversations_create(
+        FakeRequest({"model": "claude-code/haiku"}))).body)
+    cid = created["id"]
+
+    r = await router.responses_create(FakeRequest({
+        "model": "claude-code/haiku", "input": "hi", "conversation": cid}))
+    assert json.loads(r.body)["conversation"]["id"] == cid
+    assert len(calls) == 1 and "--resume" not in calls[0]   # first turn starts it
+    # the listed conversation now reflects the turn (updated_at advanced/recorded)
+    got = json.loads((await router.conversations_get(cid)).body)
+    assert got["status"] == "idle"

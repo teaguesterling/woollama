@@ -24,10 +24,16 @@ Limitations (documented, not hidden):
 from __future__ import annotations
 
 import asyncio
+import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 
 from . import claude_code, responses
+
+
+def _now() -> int:
+    return int(time.time())
 
 
 @dataclass
@@ -40,7 +46,11 @@ class Conversation:
     native_id: str | None = None      # backend's own id (e.g. a claude session_id)
     workdir: str | None = None        # stable cwd for the backing session (resume scoping)
     response_ids: list[str] = field(default_factory=list)
-    status: str = "idle"
+    status: str = "idle"              # idle | busy | awaiting_input | dead
+    title: str | None = None
+    metadata: dict = field(default_factory=dict)
+    created_at: int = field(default_factory=_now)
+    updated_at: int = field(default_factory=_now)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -52,13 +62,18 @@ class ConversationStore:
         self._convs: dict[str, Conversation] = {}
         self._resp_to_conv: dict[str, str] = {}
 
-    def create(self, backend: str, model: str) -> Conversation:
-        conv = Conversation(id=responses.new_id("conv"), backend=backend, model=model)
+    def create(self, backend: str, model: str, *, metadata: dict | None = None,
+               title: str | None = None) -> Conversation:
+        conv = Conversation(id=responses.new_id("conv"), backend=backend,
+                            model=model, metadata=metadata or {}, title=title)
         self._convs[conv.id] = conv
         return conv
 
     def get(self, conv_id: str) -> Conversation | None:
         return self._convs.get(conv_id)
+
+    def list(self) -> list[Conversation]:
+        return list(self._convs.values())
 
     def by_response(self, response_id: str) -> Conversation | None:
         cid = self._resp_to_conv.get(response_id)
@@ -66,7 +81,17 @@ class ConversationStore:
 
     def record_response(self, conv: Conversation, response_id: str) -> None:
         conv.response_ids.append(response_id)
+        conv.updated_at = _now()
         self._resp_to_conv[response_id] = conv.id
+
+    def remove(self, conv_id: str) -> Conversation | None:
+        """Drop the handle (and its response_id back-references). The backing's
+        own teardown is the backend's `delete`; this only forgets the handle."""
+        conv = self._convs.pop(conv_id, None)
+        if conv is not None:
+            for rid in conv.response_ids:
+                self._resp_to_conv.pop(rid, None)
+        return conv
 
 
 class ClaudeResumeBackend:
@@ -91,6 +116,15 @@ class ClaudeResumeBackend:
         if sid:
             conv.native_id = sid     # first turn sets it; resume returns the same
         return resp["choices"][0]["message"].get("content") or ""
+
+    async def delete(self, conv: Conversation) -> None:
+        """End woollama's hold on the conversation: remove the per-conversation
+        workdir. The Claude session transcript on disk (~/.claude) is the user's
+        data and is left intact — woollama only drops what it created."""
+        if conv.workdir:
+            shutil.rmtree(conv.workdir, ignore_errors=True)
+            conv.workdir = None
+        conv.status = "dead"
 
 
 # Backend registry, keyed by the name stored on a Conversation.

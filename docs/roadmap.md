@@ -34,12 +34,14 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
 | **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
+| **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras); items → 501 (driver slice) | `router.py`, `conversations.py` | conv-2 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
 orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
-subset — OpenAI Responses shape), `/v1/models`, `/v1/tools`, `/mcp` (Streamable
-HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix socket
+subset + stateful via claude-resume — OpenAI Responses shape), `/v1/conversations`
+(create/list/get/delete), `/v1/models`, `/v1/tools`, `/mcp` (Streamable HTTP),
+and `woollama mcp` (stdio) — served on BOTH a Unix socket
 (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
 
 ## Open tracks (recommended order)
@@ -76,9 +78,12 @@ HTTP), and `woollama mcp` (stdio) — served on BOTH a Unix socket
      claude `session_id` + stable workdir; one writer per conversation) +
      `claude-resume` backend + `store:true` / `conversation` /
      `previous_response_id` routing. Live-verified (create → resume → recall).
-   - [ ] conv-2+ — `/v1/conversations` listing; the Rust session driver +
-     claude-tmux backend (gated on §6 spikes); interactive `requires_action`;
-     duckdb `stored` backend; cosmic-fabric wiring.
+   - [x] **conv-2** — `/v1/conversations` create / list / get / delete (the
+     discovery + attach + teardown surface; transcript `items` deferred to the
+     driver slice). Live CRUD verified.
+   - [ ] conv-3+ — the Rust session driver + claude-tmux backend (gated on the
+     §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`);
+     interactive `requires_action`; duckdb `stored` backend; cosmic-fabric wiring.
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
 Smaller follow-ons (not blocking):

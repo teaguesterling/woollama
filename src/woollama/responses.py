@@ -80,3 +80,24 @@ def build_response(resp_id: str, model: str, text: str, *,
         "tool_choice": "auto",
         "tools": [],
     }
+
+
+def conversation_object(conv) -> dict:
+    """Shape a Conversation handle for the /v1/conversations discovery surface.
+    Emits the OpenAI Conversation base fields (so it parses in the `openai` SDK's
+    Conversation model) PLUS woollama's routing extras (`backend`, `model`,
+    `status`, `title`, `updated_at`) — the discovery info cosmic-fabric needs to
+    list and attach. `conv` is a conversations.Conversation (untyped here to keep
+    this module free of the router/conversations import cycle)."""
+    return {
+        "id": conv.id,
+        "object": "conversation",
+        "created_at": conv.created_at,
+        "metadata": conv.metadata or {},
+        # woollama routing extras (a superset of OpenAI's conversation object):
+        "backend": conv.backend,
+        "model": conv.model,
+        "status": conv.status,
+        "title": conv.title,
+        "updated_at": conv.updated_at,
+    }
