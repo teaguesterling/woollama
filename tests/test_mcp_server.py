@@ -184,10 +184,14 @@ async def test_tools_list_reexports_discovered_downstream_tools(monkeypatch, tmp
         # The re-exported tool's schema is the downstream tool's own schema.
         tool = next(t for t in await c.list_tools() if t.name == "hello.count_to")
         assert "n" in (tool.inputSchema or {}).get("properties", {})
+        # The downstream tool declares NO output schema → the proxy must not
+        # fabricate one (the negative half of output_schema mirroring).
+        assert tool.outputSchema is None
 
         # And it dispatches through the registry end-to-end.
         result = await c.call_tool("hello.count_to", {"n": 3})
-    assert result.data == "counted 3" or "counted 3" in str(result.content)
+    # Exact content fidelity — not a substring-in-repr that passes on mangled output.
+    assert result.content[0].text == "counted 3"
 
 
 # ---------------------------------------------------------------------------
@@ -265,3 +269,53 @@ async def test_reexport_nonconforming_output_surfaces_clear_error(monkeypatch, t
     async with Client(server) as c:
         with pytest.raises(ToolError, match=r"[Oo]utput"):
             await c.call_tool("svc.op", {"n": 1})
+
+
+async def test_reexport_proxy_surfaces_dispatch_exception_as_toolerror(monkeypatch, tmp_path):
+    """If the downstream dispatch RAISES, the proxy surfaces a clear ToolError
+    ('dispatch failed') rather than leaking the raw exception."""
+    from fastmcp.exceptions import ToolError
+
+    def call(args):
+        raise RuntimeError("connection reset")
+
+    reg = _stub_registry(monkeypatch, tmp_path, out_schema=None, call=call)
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match="dispatch failed"):
+            await c.call_tool("svc.op", {"n": 1})
+
+
+async def test_reexport_proxy_surfaces_downstream_iserror_as_toolerror(monkeypatch, tmp_path):
+    """A downstream result with isError=True becomes a ToolError carrying the
+    downstream's error text — not a silent success."""
+    from fastmcp.exceptions import ToolError
+
+    def call(args):
+        return SimpleNamespace(
+            content=[TextContent(type="text", text="downstream said no")],
+            isError=True)
+
+    reg = _stub_registry(monkeypatch, tmp_path, out_schema=None, call=call)
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match="downstream said no"):
+            await c.call_tool("svc.op", {"n": 1})
+
+
+async def test_chat_tool_unknown_recipe_raises(server):
+    """The chat verb's negative path: an unknown recipe selector surfaces as a
+    ToolError, not a silent empty/crash (mcp_server `_chat_tool`)."""
+    from fastmcp.exceptions import ToolError
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match="unknown recipe"):
+            await c.call_tool("chat", {"recipe": "_no_such_recipe_",
+                                       "messages": [{"role": "user", "content": "hi"}]})
+
+
+async def test_chat_tool_requires_a_recipe_selector(server):
+    """No recipe and no model → a clear ToolError, not a crash."""
+    from fastmcp.exceptions import ToolError
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match="requires a 'recipe'"):
+            await c.call_tool("chat", {"messages": [{"role": "user", "content": "hi"}]})

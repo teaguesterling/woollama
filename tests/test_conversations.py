@@ -284,18 +284,22 @@ async def test_create_via_endpoint_then_continue_via_responses(monkeypatch):
     """End-to-end handle reuse: a conversation created on /v1/conversations is
     driven by /v1/responses attaching to it."""
     calls = patch_claude(monkeypatch, sid="sid-c2")
-    fresh_store(monkeypatch)
+    store = fresh_store(monkeypatch)
     created = json.loads((await router.conversations_create(
         FakeRequest({"model": "claude-code/haiku"}))).body)
     cid = created["id"]
 
     r = await router.responses_create(FakeRequest({
         "model": "claude-code/haiku", "input": "hi", "conversation": cid}))
+    resp_id = json.loads(r.body)["id"]
     assert json.loads(r.body)["conversation"]["id"] == cid
     assert len(calls) == 1 and "--resume" not in calls[0]   # first turn starts it
-    # the listed conversation now reflects the turn (updated_at advanced/recorded)
-    got = json.loads((await router.conversations_get(cid)).body)
-    assert got["status"] == "idle"
+    # The turn was actually RECORDED against the conversation (not just status
+    # left idle): the response id is in the handle and back-resolves to it.
+    conv = store.get(cid)
+    assert conv.response_ids == [resp_id]
+    assert store.by_response(resp_id) is conv
+    assert json.loads((await router.conversations_get(cid)).body)["status"] == "idle"
 
 
 # ---------------------------------------------------------------------------

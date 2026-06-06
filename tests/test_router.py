@@ -338,6 +338,119 @@ async def test_chat_recipe_with_tool_calls_loops_to_completion(monkeypatch, tmp_
     assert body["choices"][0]["message"]["content"] == "Counted to 3."
 
 
+async def test_orchestrate_sends_system_prompt_and_feeds_tool_result(monkeypatch, tmp_path):
+    """The two halves of a recipe the scripted-mock tests never check, because the
+    inferencer mock discards the outgoing `json=`: (1) the recipe's SYSTEM PROMPT
+    is sent on turn 1, and (2) a tool's RESULT is fed back into the next turn's
+    messages. Capture the posted payloads and assert on them — deleting the
+    system prepend or dropping the tool result would otherwise leave the suite
+    green."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    fake_reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [_tool("count_to")]
+
+    async def stub_call_tool(name, args):
+        return SimpleNamespace(content=[SimpleNamespace(text="COUNTED_TO_THREE_RESULT")])
+    mgr.call_tool = stub_call_tool  # type: ignore[method-assign]
+    fake_reg.add(mgr)
+    monkeypatch.setattr(router, "registry", fake_reg)
+
+    posted: list[dict] = []
+    script = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "hello.count_to",
+                                      "arguments": '{"n": 3}'}}]}}]},
+        {"choices": [{"message": {"content": "done"}}]},
+    ]
+
+    class _Capture:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, _url, json=None, **_kw):
+            posted.append(json)
+            return HttpxResponseStub(200, script.pop(0))
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Capture)
+
+    await router.chat_completions(FakeRequest({
+        "model": "woollama/streamer",
+        "messages": [{"role": "user", "content": "count to 3"}]}))
+
+    # (1) turn 1 carries the recipe's system prompt as the leading system message.
+    turn1 = posted[0]["messages"]
+    assert turn1[0]["role"] == "system"
+    assert turn1[0]["content"] == recipes.get("streamer")["system"]
+    # (2) turn 2 feeds the tool's RESULT back to the model as a tool message.
+    turn2 = posted[1]["messages"]
+    assert any(m.get("role") == "tool" and "COUNTED_TO_THREE_RESULT" in (m.get("content") or "")
+               for m in turn2), turn2
+
+
+async def test_chat_recipe_inferencer_error_passes_payload_through_502(monkeypatch, tmp_path):
+    """A choice-less upstream response (an inferencer error) surfaces as a 502
+    that passes the raw upstream payload through — not a generic 200/500. Covers
+    the OrchestrationError payload branch the no-payload error tests miss."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+    monkeypatch.setattr(router, "registry", Registry())
+    # No "choices" key → orchestrate raises an inferencer error carrying payload.
+    mock_httpx(monkeypatch, post_responses=[{"error": {"message": "model overloaded"}}])
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/streamer",
+        "messages": [{"role": "user", "content": "hi"}]}))
+    assert resp.status_code == 502
+    assert json.loads(resp.body)["error"]["message"] == "model overloaded"
+
+
+async def test_orchestrate_continues_when_a_tool_dispatch_raises(monkeypatch, tmp_path):
+    """A tool that throws during dispatch doesn't abort the loop: the failure is
+    fed back as an ERROR tool result (ok=False) and the model still produces a
+    final answer. Distinct from the allow-list-deny path (which never dispatches)."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    fake_reg = Registry()
+    mgr = ServerManager("hello", "echo", [])
+    mgr.tools = [_tool("count_to")]
+
+    async def boom(name, args):
+        raise RuntimeError("downstream blew up")
+    mgr.call_tool = boom  # type: ignore[method-assign]
+    fake_reg.add(mgr)
+    monkeypatch.setattr(router, "registry", fake_reg)
+
+    posted: list[dict] = []
+    script = [
+        {"choices": [{"message": {"content": "", "tool_calls": [
+            {"id": "c1", "function": {"name": "hello.count_to",
+                                      "arguments": "{}"}}]}}]},
+        {"choices": [{"message": {"content": "recovered"}}]},
+    ]
+
+    class _Capture:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, _url, json=None, **_kw):
+            posted.append(json)
+            return HttpxResponseStub(200, script.pop(0))
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _Capture)
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/streamer",
+        "messages": [{"role": "user", "content": "count"}]}))
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "recovered"
+    # the dispatch failure was fed back as an ERROR tool result, not raised.
+    tool_msgs = [m for m in posted[1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs and tool_msgs[0]["content"].startswith("ERROR: RuntimeError")
+
+
 async def test_chat_recipe_unknown_inferencer_returns_501(monkeypatch, tmp_path):
     """A recipe pointing at a provider woollama doesn't know should fail clearly,
     not silently. (ollama + anthropic are known; this uses a made-up one.)"""

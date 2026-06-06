@@ -121,6 +121,27 @@ async def test_missing_result_event_raises(monkeypatch):
         await claude_code.run_completion("s", [{"role": "user", "content": "x"}], "haiku")
 
 
+async def test_invoke_timeout_raises_claudecode_error(monkeypatch):
+    """A subprocess timeout (the wait_for path) surfaces as a clean
+    ClaudeCodeError, not a raw asyncio.TimeoutError."""
+    import asyncio
+
+    async def slow_invoke(args, env, cwd, timeout):
+        raise asyncio.TimeoutError()
+    monkeypatch.setattr(claude_code, "_invoke", slow_invoke)
+    with pytest.raises(claude_code.ClaudeCodeError, match="timed out"):
+        await claude_code.run_completion("s", [{"role": "user", "content": "x"}], "haiku")
+
+
+async def test_invoke_missing_binary_raises_claudecode_error(monkeypatch):
+    """`claude` not on PATH surfaces as a clear ClaudeCodeError naming the binary."""
+    async def no_binary(args, env, cwd, timeout):
+        raise FileNotFoundError(claude_code.CLAUDE_BIN)
+    monkeypatch.setattr(claude_code, "_invoke", no_binary)
+    with pytest.raises(claude_code.ClaudeCodeError, match="not found on PATH"):
+        await claude_code.run_completion("s", [{"role": "user", "content": "x"}], "haiku")
+
+
 # ---------------------------------------------------------------------------
 # Delegation (executor) — command construction + the hard allow-list boundary
 # ---------------------------------------------------------------------------

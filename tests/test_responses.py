@@ -151,6 +151,15 @@ async def test_responses_stream_true_is_400():
     assert json.loads(resp.body)["error"]["type"] == "invalid_request_error"
 
 
+async def test_responses_bad_input_type_is_400():
+    """`input` that is neither a string nor a list → parse_input raises, mapped
+    to a 400 (the negative half of the well-tested positive parse cases)."""
+    resp = await router.responses_create(FakeRequest({
+        "model": "ollama/x", "input": 123}))
+    assert resp.status_code == 400
+    assert json.loads(resp.body)["error"]["type"] == "invalid_request_error"
+
+
 async def test_responses_unknown_recipe_404(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     recipes.reload()

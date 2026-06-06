@@ -106,6 +106,81 @@ def test_server_missing_command_raises(monkeypatch, tmp_path):
         config.load_mcp_servers()
 
 
+# --- type guards: each malformed-shape contract has its own clear error ------
+
+def test_mcp_servers_not_object_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({"mcpServers": ["x"]}))
+    from woollama import config
+    with pytest.raises(ValueError, match="'mcpServers' must be an object"):
+        config.load_mcp_servers()
+
+
+def test_mcp_server_entry_not_object_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({"mcpServers": {"bad": "echo"}}))
+    from woollama import config
+    with pytest.raises(ValueError, match="server 'bad' must be an object"):
+        config.load_mcp_servers()
+
+
+def test_malformed_recipes_toml_raises_with_source(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text("[recipes.x\nbroken = ")
+    from woollama import config
+    with pytest.raises(ValueError, match="parse error"):
+        config.load_recipes()
+
+
+def test_recipes_not_table_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text("recipes = 5\n")
+    from woollama import config
+    with pytest.raises(ValueError, match="'recipes' must be a table"):
+        config.load_recipes()
+
+
+def test_recipe_entry_not_table_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text("[recipes]\nx = 'not a table'\n")
+    from woollama import config
+    with pytest.raises(ValueError, match="recipe 'x' must be a table"):
+        config.load_recipes()
+
+
+def test_recipe_tools_not_list_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "recipes.toml").write_text(
+        "[recipes.x]\ninferencer='ollama/m'\ntools='nope'\nsystem='s'\n")
+    from woollama import config
+    with pytest.raises(ValueError, match="'tools' must be a list"):
+        config.load_recipes()
+
+
+def test_malformed_inferencers_toml_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text("[inferencers.x\nbroken")
+    from woollama import config
+    with pytest.raises(ValueError, match="parse error"):
+        config.load_inferencers()
+
+
+def test_inferencers_not_table_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text("inferencers = 1\n")
+    from woollama import config
+    with pytest.raises(ValueError, match="'inferencers' must be a table"):
+        config.load_inferencers()
+
+
+def test_inferencer_entry_not_table_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text("[inferencers]\nx = 'str'\n")
+    from woollama import config
+    with pytest.raises(ValueError, match="'x' must be a table"):
+        config.load_inferencers()
+
+
 # --- config_dir resolution --------------------------------------------------
 
 def test_config_dir_explicit_override(monkeypatch, tmp_path):
