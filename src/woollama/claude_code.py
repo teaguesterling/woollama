@@ -1,4 +1,4 @@
-"""Claude Code as a (tool-less) inference backend.
+"""Claude Code as an inference backend — tool-less completions AND delegation.
 
 woollama routes a recipe whose inferencer is ``claude-code/<model>`` to the
 local ``claude`` CLI in headless print mode, using the user's EXISTING Claude
@@ -6,25 +6,35 @@ Code auth (subscription/OAuth) — no ``ANTHROPIC_API_KEY`` required. It's a
 keyless path to Claude, distinct from the OpenAI-compat HTTP inferencer seam
 (vLLM/Together/Groq/anthropic-api), which is still unbuilt.
 
-Scope: TOOL-LESS completions only. The recipe's system prompt shapes Claude,
-the messages are the prompt, Claude returns one final answer. Letting Claude
-Code run a recipe's MCP tools via its own agent loop (delegation) is a separate,
-larger concept — an *executor*, not an inferencer — and a later slice; recipes
-with a non-empty ``tools`` list routed here are rejected upstream in
-``router.orchestrate``.
+Two modes:
+
+* **Tool-less completion** (``run_completion`` / ``run_resumable``): the recipe's
+  system prompt shapes Claude, the messages are the prompt, Claude returns one
+  final answer. Recipes with an empty ``tools`` list.
+* **Delegation / executor** (``run_delegated``): Claude OWNS the agentic loop and
+  calls the recipe's allow-listed MCP tools itself; woollama returns only the
+  final answer. Recipes with a non-empty ``tools`` list. This is an *executor*,
+  not an inferencer.
 
 Why subprocess, not the Agent SDK: the SDK requires the ``claude`` CLI on PATH
 anyway, so shelling out is fewer deps and trivially mockable (tests patch
 ``_invoke``).
 
-Safety — keeping it genuinely tool-less (verified empirically against
-v2.1.160): ``--permission-mode dontAsk`` auto-DENIES tools that would otherwise
-prompt, but it still auto-RUNS read-only Bash (a live test showed ``echo``
-executing). So we ALSO ``--disallowedTools`` the exec/file/network/subagent
-vectors — Bash above all — and ``--strict-mcp-config`` to load zero MCP servers,
-and run in a neutral temp cwd so we don't inherit the host's CLAUDE.md /
-settings / plugins. The opt-in live test (tests/test_integration.py,
-``@needs_claude_code``) verifies a Bash attempt is refused.
+Safety. ``--permission-mode dontAsk`` auto-DENIES any tool not pre-approved (a
+HARD deny, recorded in the result's ``permission_denials`` — verified live), but
+it still auto-RUNS read-only Bash, so we ALSO ``--disallowedTools`` the exec/
+file/network/subagent vectors (Bash above all). We run in a neutral temp cwd and
+strip the child env (see ``_child_env``) so we don't inherit the host's
+CLAUDE.md / settings / plugins / nested-harness. For tool-less mode
+``--strict-mcp-config`` loads ZERO MCP servers. For delegation we write a
+per-recipe ``--mcp-config`` with ONLY the servers the allow-list references and
+pass ``--allowedTools`` listing ONLY those tools — so the recipe allow-list stays
+a hard boundary even though Claude drives the loop (defense-in-depth: config
+containment AND allow-list AND the built-in lockdown). Delegation only ADDS the
+recipe's MCP tools; it removes none of the above. Opt-in live tests
+(tests/test_integration.py, ``@needs_claude_code``, run in a PLAIN terminal — a
+nested child inherits the parent harness) verify both a Bash refusal and that an
+out-of-list tool is denied in delegation mode.
 """
 from __future__ import annotations
 
@@ -50,6 +60,31 @@ _DENY_TOOLS = ("Bash,Read,Write,Edit,NotebookEdit,WebFetch,WebSearch,"
 class ClaudeCodeError(RuntimeError):
     """The Claude Code backend failed: spawn error, non-zero exit, an error
     result, a timeout, or unparseable output."""
+
+
+def _child_env() -> dict:
+    """Environment for the ``claude`` child process. Strips:
+
+    * ``ANTHROPIC_API_KEY`` — force subscription/OAuth auth (the keyless point);
+      a key in the child would silently switch Claude Code to API billing.
+    * ``CLAUDECODE`` / ``CLAUDE_CODE_*`` — the parent harness vars. When woollama
+      itself runs INSIDE a Claude Code session, leaving these set leaks the
+      parent harness into the child (its meta-tools / nested deferred-tool mode —
+      observed contaminating the delegation spike). Stripping them gives a clean
+      child regardless of where woollama runs.
+    """
+    return {k: v for k, v in os.environ.items()
+            if k != "ANTHROPIC_API_KEY"
+            and k != "CLAUDECODE"
+            and not k.startswith("CLAUDE_CODE")}
+
+
+def _mcp_tool_name(namespaced: str) -> str:
+    """Map a recipe's ``<server>.<tool>`` to the id Claude Code exposes for a
+    tool from a ``--mcp-config`` server: ``mcp__<server>__<tool>`` (the clean,
+    no-dot naming verified in the delegation spike)."""
+    server, _, tool = namespaced.partition(".")
+    return f"mcp__{server}__{tool}"
 
 
 def _render_prompt(user_msgs: list[dict]) -> str:
@@ -148,9 +183,7 @@ async def _run(prompt: str, system: str, model: str, timeout: float,
     one-shot completion (`cwd=None`) gets a throwaway temp dir; a resumable
     conversation passes its own stable workdir."""
     args = _build_args(prompt, system, model, resume)
-    # Force subscription auth (the keyless point): an ANTHROPIC_API_KEY in the
-    # child env would silently switch Claude Code to API billing.
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env = _child_env()
     if cwd is not None:
         return await _invoke_and_parse(args, env, cwd, timeout)
     with tempfile.TemporaryDirectory() as tmp:
@@ -190,3 +223,59 @@ async def run_resumable(system: str, user_msgs: list[dict], model: str,
     text, sid = await _run(_render_prompt(user_msgs), system, model, timeout,
                            resume=session_id, cwd=cwd)
     return _as_openai(text), sid
+
+
+def _build_delegate_args(prompt: str, system: str, model: str,
+                         mcp_config_path: str, allowed: list[str],
+                         max_turns: int) -> list[str]:
+    """argv for a delegated (executor) turn. Reuses the slice-i lockdown verbatim
+    (``dontAsk`` + ``_DENY_TOOLS`` + ``--strict-mcp-config``) and ADDS the
+    per-recipe ``--mcp-config`` plus ``--allowedTools`` (only the recipe's tools).
+    No ``--max-turns 1``: delegation is a multi-turn agentic loop, capped at
+    ``max_turns`` (a cost + safety bound)."""
+    args = [CLAUDE_BIN, "-p", prompt,
+            "--output-format", "json",
+            "--max-turns", str(max_turns),
+            "--mcp-config", mcp_config_path,
+            "--strict-mcp-config",                 # ONLY the config we write loads
+            "--permission-mode", "dontAsk",        # hard-denies anything not allow-listed
+            "--disallowedTools", _DENY_TOOLS,      # built-in exec/file/net lockdown
+            "--allowedTools", ",".join(allowed)]   # ONLY the recipe's MCP tools
+    if system:
+        args += ["--system-prompt", system]
+    if model:
+        args += ["--model", model]
+    return args
+
+
+async def run_delegated(system: str, user_msgs: list[dict], model: str, *,
+                        allowed_tools: list[str], mcp_servers: dict[str, dict],
+                        max_turns: int = 8, timeout: float = 300.0) -> dict:
+    """Delegated EXECUTOR turn: hand Claude Code the recipe's system prompt and
+    its allow-listed MCP tools and let Claude run the agentic loop itself,
+    returning an OpenAI-shaped chat-completions dict with the final answer.
+
+    The recipe allow-list stays a HARD boundary even though Claude drives:
+    ``--permission-mode dontAsk`` denies any tool not in ``--allowedTools``
+    (verified via spike), the ``--mcp-config`` we write contains ONLY the servers
+    ``allowed_tools`` references (config containment), and the built-in lockdown
+    is kept. Defense-in-depth across three independent layers.
+
+    ``allowed_tools``: the recipe's ``<server>.<tool>`` names.
+    ``mcp_servers``: ``{server_name: {"command", "args"}}`` for the referenced
+    servers only (the caller filters config down to what the allow-list needs).
+
+    Raises ``ClaudeCodeError`` on any failure."""
+    allowed = [_mcp_tool_name(t) for t in allowed_tools]
+    env = _child_env()
+    # Neutral temp cwd (no inherited CLAUDE.md/settings); the mcp config lives
+    # inside it under a non-".mcp.json" name so it isn't auto-discovered —
+    # --strict-mcp-config means only the file we pass loads anyway.
+    with tempfile.TemporaryDirectory() as cwd:
+        cfg_path = os.path.join(cwd, "delegate-mcp.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"mcpServers": mcp_servers}, f)
+        args = _build_delegate_args(_render_prompt(user_msgs), system, model,
+                                    cfg_path, allowed, max_turns)
+        text, _ = await _invoke_and_parse(args, env, cwd, timeout)
+    return _as_openai(text)

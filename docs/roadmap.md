@@ -110,8 +110,17 @@ Smaller follow-ons (not blocking):
   output before woollama forwards it — confirmed live via `hello.count_to`). A
   non-conforming downstream surfaces a clear output-validation error (the
   faithful-proxy choice), covered by a hermetic test.
-- Tool DELEGATION to Claude Code (Claude owns the loop, runs a recipe's MCP
-  tools) — a separate "executor" concept; needs its own adversarial safety pass.
+- ~~Tool DELEGATION to Claude Code (Claude owns the loop, runs a recipe's MCP
+  tools)~~ — ✅ DONE. A `claude-code/<model>` recipe WITH a non-empty `tools`
+  list now delegates: Claude Code owns the agentic loop and calls the recipe's
+  allow-listed tools itself (`claude_code.run_delegated`), woollama returns the
+  final answer. Option B (config containment): woollama writes a per-recipe
+  `--mcp-config` with ONLY the servers the allow-list references + `--allowedTools`
+  with ONLY those tools — a HARD boundary (spike-verified: `dontAsk` denies
+  anything unlisted), on top of the slice-i built-in lockdown. The child env now
+  also strips `CLAUDE_CODE*`/`CLAUDECODE` (nested-harness contamination, found via
+  the spike). Hermetic unit + routing tests cover the construction/boundary; the
+  positive + adversarial *live* gate is plain-terminal-only (see below).
 
 ## Pending verifications (need a real terminal + creds; can't run nested)
 
@@ -120,6 +129,15 @@ Smaller follow-ons (not blocking):
   `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k claude_code`
   (checks a real completion works AND neither a shell-exec nor a file-read
   prompt-injection succeeds).
+- **Tool delegation** (executor): the per-recipe `--mcp-config` + `--allowedTools`
+  containment is verified by construction + unit tests, and the `claude` flag
+  behaviour (allow-listed tool runs; out-of-list tool HARD-denied) by the spike.
+  The positive path is verified at the event level through woollama's GENERATED
+  config: the hello server launched and Claude invoked `mcp__hello__count_to`
+  (`result.is_error=False`, no denials). The adversarial half (a shell-exec
+  attempt refused in delegation mode) must run in a PLAIN terminal — a nested
+  `claude` child inherits the parent harness and contaminates the run. Run there:
+  `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k delegation`
 - **Anthropic (and other cloud) live round-trips** (slices j/k): routing/auth
   is unit-tested on the emit side + doc-confirmed (tools supported); the live
   round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:

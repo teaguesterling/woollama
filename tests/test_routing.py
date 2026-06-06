@@ -345,23 +345,54 @@ async def test_claude_code_inferencer_delegates_to_backend(monkeypatch, tmp_path
     assert seen == {"system": "You are concise.", "model": "haiku"}
 
 
-async def test_claude_code_recipe_with_tools_is_rejected(monkeypatch, tmp_path):
-    """Tool delegation to claude-code isn't built yet, so a claude-code recipe
-    that declares tools must fail clearly (501) rather than silently dropping
-    them — the honest seam between this slice and the delegation slice."""
+async def test_claude_code_recipe_with_tools_delegates(monkeypatch, tmp_path):
+    """A claude-code recipe WITH tools now DELEGATES (executor): woollama hands
+    Claude the recipe's allow-listed tools (and ONLY the servers they reference)
+    and returns Claude's answer — no more 501. The backend is mocked; the real
+    multi-turn invocation is the opt-in plain-terminal live test."""
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cctools]\ninferencer="claude-code/haiku"\n'
-        'tools=["hello.count_to"]\nsystem="x"\n')
-    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+        'tools=["hello.count_to"]\nsystem="count please"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))   # mcp falls back to bundled (has hello)
     recipes.reload()
-    monkeypatch.setattr(router, "registry", Registry())
+
+    seen = {}
+
+    async def fake_delegated(system, user_msgs, model, *, allowed_tools,
+                             mcp_servers, **kw):
+        seen["system"], seen["model"] = system, model
+        seen["allowed_tools"] = allowed_tools
+        seen["mcp_servers"] = mcp_servers
+        return {"choices": [{"message": {"role": "assistant", "content": "counted to 3"}}]}
+
+    monkeypatch.setattr(claude_code, "run_delegated", fake_delegated)
 
     resp = await router.chat_completions(FakeRequest({
-        "model": "woollama/cctools", "messages": [{"role": "user", "content": "x"}]}))
-    assert resp.status_code == 501
-    body = json.loads(resp.body)
-    assert body["error"]["type"] == "not_implemented"
-    assert "tool delegation" in body["error"]["message"]
+        "model": "woollama/cctools", "messages": [{"role": "user", "content": "count to 3"}]}))
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["choices"][0]["message"]["content"] == "counted to 3"
+    # Routed with the recipe's allow-list and ONLY the hello server's launch spec.
+    assert seen["allowed_tools"] == ["hello.count_to"]
+    assert set(seen["mcp_servers"]) == {"hello"}
+    assert "command" in seen["mcp_servers"]["hello"]
+    assert seen["model"] == "haiku"
+
+
+async def test_claude_code_delegation_missing_server_is_400(monkeypatch, tmp_path):
+    """A delegated recipe referencing a tool whose MCP server isn't configured
+    fails clearly (400) — woollama never hands Claude a partial toolset."""
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.bad]\ninferencer="claude-code/haiku"\n'
+        'tools=["ghost.do_thing"]\nsystem="x"\n')
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"hello": {"command": "python", "args": ["h.py"]}}}')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/bad", "messages": [{"role": "user", "content": "x"}]}))
+    assert resp.status_code == 400
+    assert "not configured" in json.loads(resp.body)["error"]["message"]
 
 
 async def test_reject_tool_outside_recipe_allowlist(monkeypatch, tmp_path):

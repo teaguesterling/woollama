@@ -495,3 +495,47 @@ calls for, since you can't hardcode someone's vLLM host.
   by pytest and has drifted (~28 issues tree-wide, mostly the `;` pattern in
   earlier test files) — a quick `ruff --fix` cleanup is a worthwhile small slice.
 - **Verified**: default suite 81 passed / 10 deselected; changed files lint-clean.
+
+## Follow-on slice — tool delegation to Claude Code (executor) (2026-06-06)
+
+The "executor" concept the slice-i note deferred: a `claude-code/<model>` recipe
+WITH a non-empty `tools` list (previously a 501) now **delegates** — Claude Code
+owns the agentic loop and calls the recipe's allow-listed MCP tools itself;
+woollama returns only the final answer. Distinct from the tool-less inferencer
+(`run_completion`) and from the ollama recipes where woollama runs the tool loop.
+
+- **Design fork settled by a spike, not by argument.** The open question was how
+  Claude reaches the tools and whether the allow-list stays a hard boundary. A
+  headless `claude -p` spike (haiku, vs. the bundled `hello` server) established:
+  `--allowedTools X` + `--permission-mode dontAsk` is a **hard deny-all-else**
+  (an out-of-list MCP tool was denied and recorded in `permission_denials`; the
+  allowed one ran and the loop terminated); a direct-server `--mcp-config` exposes
+  tools as the clean `mcp__<server>__<tool>` (no dot). → **Option B (config
+  containment)**: hand Claude a per-recipe `--mcp-config` with ONLY the servers
+  the allow-list references + `--allowedTools` with ONLY those tools. Defense-in-
+  depth (config containment AND allow-list AND the slice-i built-in lockdown),
+  clean naming, smallest blast radius, no loopback re-entrancy. Option A (point
+  Claude at woollama's own `/mcp` aggregator) + per-session filtering is deferred.
+- **`claude_code.run_delegated`**: writes a temp `--mcp-config`, maps
+  `<server>.<tool>` → `mcp__<server>__<tool>` for `--allowedTools`, keeps
+  `--strict-mcp-config` + `_DENY_TOOLS` + neutral cwd, caps `--max-turns`.
+- **Nested-contamination fix.** The spike's child inherited THIS session's
+  harness (its meta-tools) via `CLAUDECODE`/`CLAUDE_CODE_*`. New `_child_env()`
+  strips that family (plus `ANTHROPIC_API_KEY`), used by the tool-less path too.
+  A residual leak from global `~/.claude` is not env-fixable, so the **live gate
+  is plain-terminal-only** (like slice-i).
+- **Routing**: `router.orchestrate_events` claude-code branch delegates when
+  `recipe["tools"]` is non-empty; `_delegate_mcp_servers` resolves the referenced
+  servers from `config.load_mcp_servers()` (400 if one is missing — never a
+  partial toolset). Works through every surface (HTTP chat, `/v1/responses`, MCP
+  `chat`) for free. Bundled `cc-counter` recipe added.
+- **Tests**: hermetic unit (argv/config containment, the exact allow-list
+  boundary, env strip) + routing (delegates not 501; missing-server 400). Live
+  gate (`@needs_claude_code`, plain terminal): delegated count + a shell-exec
+  attempt refused in delegation mode. Positive path verified at the EVENT level
+  through woollama's GENERATED config (resolving `${WOOLLAMA_EXAMPLES_DIR}`): the
+  hello server launched and Claude invoked `mcp__hello__count_to`
+  (`result.is_error=False`, no permission denials) — not merely a final-text
+  claim. (The adversarial Bash-in-delegation refusal stays plain-terminal-only;
+  it rests on construction + the shared `_DENY_TOOLS`, not yet observed.)
+- **Verified**: default suite 132 passed / 16 deselected; ruff clean.

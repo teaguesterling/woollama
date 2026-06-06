@@ -410,6 +410,27 @@ async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
                              media_type="text/event-stream")
 
 
+def _delegate_mcp_servers(tools: list[str]) -> dict[str, dict]:
+    """Build the per-recipe MCP config for delegation: the launch spec of EACH
+    downstream server referenced by the recipe's ``<server>.<tool>`` tools, taken
+    from the active mcp config. Only ``command``/``args`` are forwarded (a
+    minimal, clean config for the child). Raises ``OrchestrationError`` (400) if a
+    referenced server isn't configured — woollama never hands Claude a partial
+    toolset."""
+    available = config.load_mcp_servers()
+    servers: dict[str, dict] = {}
+    for t in tools:
+        server = t.split(".", 1)[0]
+        if server not in available:
+            raise OrchestrationError(
+                f"recipe references tool '{t}' but its MCP server '{server}' is "
+                f"not configured (known: {sorted(available)})",
+                "invalid_request_error", 400)
+        cfg = available[server]
+        servers[server] = {"command": cfg["command"], "args": cfg.get("args", [])}
+    return servers
+
+
 async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict],
                       reg: Registry) -> dict:
     """Run a recipe end-to-end and return the final OpenAI-shaped response dict.
@@ -471,15 +492,20 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
     provider = inferencer.split("/", 1)[0]
 
     if provider == "claude-code":
-        if recipe["tools"]:
-            raise OrchestrationError(
-                "tool delegation to claude-code is not yet supported "
-                "(route tool-using recipes to an ollama/ inferencer, or use a "
-                "tool-less claude-code recipe)", "not_implemented", 501)
         model = inferencer.split("/", 1)[1] if "/" in inferencer else ""
         try:
-            resp = await claude_code.run_completion(
-                recipe["system"], user_msgs, model)
+            if recipe["tools"]:
+                # DELEGATION (executor): Claude owns the agentic loop and calls
+                # the recipe's allow-listed MCP tools itself. Hand it ONLY the
+                # downstream servers those tools reference; the allow-list stays
+                # a hard boundary via --allowedTools (see claude_code).
+                mcp_servers = _delegate_mcp_servers(recipe["tools"])
+                resp = await claude_code.run_delegated(
+                    recipe["system"], user_msgs, model,
+                    allowed_tools=recipe["tools"], mcp_servers=mcp_servers)
+            else:
+                resp = await claude_code.run_completion(
+                    recipe["system"], user_msgs, model)
         except claude_code.ClaudeCodeError as e:
             raise OrchestrationError(
                 f"claude-code backend: {e}", "server_error", 502) from e

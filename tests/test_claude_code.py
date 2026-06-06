@@ -122,6 +122,97 @@ async def test_missing_result_event_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Delegation (executor) — command construction + the hard allow-list boundary
+# ---------------------------------------------------------------------------
+
+def _patch_invoke_deleg(monkeypatch, *, out=None):
+    """Patch _invoke for delegation: also reads the --mcp-config file WHILE it
+    still exists (inside run_delegated's temp dir) so tests can assert it."""
+    out = out if out is not None else _result_array("counted")
+    captured: dict = {}
+
+    async def fake_invoke(args, env, cwd, timeout):
+        captured["args"], captured["env"], captured["cwd"] = args, env, cwd
+        with open(args[args.index("--mcp-config") + 1]) as f:
+            captured["mcp_config"] = json.load(f)
+        return 0, out, b""
+
+    monkeypatch.setattr(claude_code, "_invoke", fake_invoke)
+    return captured
+
+
+def test_mcp_tool_name_maps_dotted_to_double_underscore():
+    assert claude_code._mcp_tool_name("hello.count_to") == "mcp__hello__count_to"
+
+
+async def test_delegation_builds_contained_command(monkeypatch):
+    captured = _patch_invoke_deleg(monkeypatch)
+    resp = await claude_code.run_delegated(
+        "You are a counter.", [{"role": "user", "content": "count to 3"}], "haiku",
+        allowed_tools=["hello.count_to"],
+        mcp_servers={"hello": {"command": "python", "args": ["hello.py"]}})
+
+    assert resp["choices"][0]["message"]["content"] == "counted"
+    args = captured["args"]
+    # allow-list maps to EXACTLY the recipe's mcp tool id, nothing else.
+    assert args[args.index("--allowedTools") + 1] == "mcp__hello__count_to"
+    # the slice-i built-in lockdown is kept verbatim.
+    assert "--strict-mcp-config" in args
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert "Bash" in args[args.index("--disallowedTools") + 1]
+    # the --mcp-config contains ONLY the referenced server.
+    assert captured["mcp_config"] == {
+        "mcpServers": {"hello": {"command": "python", "args": ["hello.py"]}}}
+    # delegation is multi-turn (NOT capped at 1 like the tool-less path).
+    assert int(args[args.index("--max-turns") + 1]) > 1
+    # system + model wired through.
+    assert args[args.index("--system-prompt") + 1] == "You are a counter."
+    assert args[args.index("--model") + 1] == "haiku"
+
+
+async def test_delegation_allowlist_is_exact_boundary(monkeypatch):
+    """The adversarial unit gate: woollama cannot widen Claude's grant beyond the
+    recipe allow-list — N tools across M servers map to EXACTLY those ids, and the
+    mcp-config has EXACTLY those servers."""
+    captured = _patch_invoke_deleg(monkeypatch)
+    await claude_code.run_delegated(
+        "sys", [{"role": "user", "content": "go"}], "haiku",
+        allowed_tools=["hello.count_to", "textops.word_count"],
+        mcp_servers={"hello": {"command": "h", "args": []},
+                     "textops": {"command": "t", "args": []}})
+    allowed = captured["args"][captured["args"].index("--allowedTools") + 1].split(",")
+    assert set(allowed) == {"mcp__hello__count_to", "mcp__textops__word_count"}
+    assert set(captured["mcp_config"]["mcpServers"]) == {"hello", "textops"}
+
+
+async def test_delegation_strips_harness_and_key_env(monkeypatch):
+    """The child env is clean: subscription auth (no ANTHROPIC_API_KEY) AND no
+    parent-harness leak (CLAUDECODE / CLAUDE_CODE_*) — the nested-contamination
+    fix the spike surfaced."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-sess")
+    captured = _patch_invoke_deleg(monkeypatch)
+    await claude_code.run_delegated(
+        "s", [{"role": "user", "content": "x"}], "haiku",
+        allowed_tools=["hello.count_to"],
+        mcp_servers={"hello": {"command": "h", "args": []}})
+    env = captured["env"]
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CLAUDECODE" not in env and "CLAUDE_CODE_SESSION_ID" not in env
+
+
+async def test_tool_less_path_also_strips_harness_env(monkeypatch):
+    """The env hardening covers the tool-less path too (same _child_env)."""
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+    captured = _patch_invoke(monkeypatch, out=_result_array())
+    await claude_code.run_completion("s", [{"role": "user", "content": "x"}], "haiku")
+    assert "CLAUDECODE" not in captured["env"]
+    assert "CLAUDE_CODE_ENTRYPOINT" not in captured["env"]
+
+
+# ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
 
