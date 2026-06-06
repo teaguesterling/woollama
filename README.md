@@ -40,19 +40,31 @@ protocol.
 **Python prototype — multi-backend router, both surfaces live.** woollama works
 end-to-end as:
 
-- an **OpenAI-compatible server** (`/v1/chat/completions`, `/v1/models`) with
-  pass-through *and* hidden chat-loop orchestration of recipes;
+- an **OpenAI-compatible server**: `/v1/chat/completions` (pass-through *and*
+  hidden chat-loop orchestration of recipes, both with `stream:true` → OpenAI
+  SSE), `/v1/models`, `/v1/tools`, and a **stateful surface** —
+  `/v1/responses` + `/v1/conversations` (OpenAI Responses/Conversations shape;
+  see below);
 - an **MCP server** to its own clients — over **stdio** (`woollama mcp`) and
   over **Streamable HTTP** at `/mcp`, mounted on the *same port* as `/v1/*`. It
-  re-exports every discovered downstream tool (namespaced) plus a `chat` verb,
-  i.e. it's an MCP aggregator.
+  re-exports every discovered downstream tool (namespaced, with `output_schema`)
+  plus a `chat` verb that emits live tool-progress notifications — i.e. it's an
+  MCP aggregator.
 
 It routes inference across **multiple backends** by `<provider>/<model>` —
 `ollama` (local), `anthropic`, `openai`, `groq`, `together`, `openrouter`, and
 **any OpenAI-compatible endpoint** you add in `inferencers.toml` (e.g.
 self-hosted vLLM) — plus `claude-code/<model>`, a keyless path to Claude via the
-local CLI. Config is file-driven (`mcp.json`, `recipes.toml`, `inferencers.toml`).
-Long-lived MCP connections; local-only ephemeral binding by default.
+local CLI (tool-less, or as an **executor** that runs a recipe's allow-listed
+MCP tools itself — tool delegation). Config is file-driven (`mcp.json`,
+`recipes.toml`, `inferencers.toml`).
+
+**Stateful conversations** route *handles*; backends own the *state*:
+`claude-resume` (`claude --resume`) for `claude-code` models, and a server-owned
+duckdb `stored` backend (transcript replay) for everything else. Long-lived MCP
+connections. Served on **both a Unix socket** (`$XDG_RUNTIME_DIR/woollama.sock`,
+mode 0600 — the default for local MCP clients) and an ephemeral loopback TCP
+port; never `0.0.0.0` without explicit opt-in.
 
 Not production-ready. **Current status and what's next live in
 [`docs/roadmap.md`](docs/roadmap.md).**
@@ -80,17 +92,20 @@ r = c.chat.completions.create(
     messages=[{"role": "user", "content": "Hi"}],
 )
 
-# Orchestrated: pattern + tools + model, transparent to the client.
-# The chat-loop happens inside woollama; client sees only the final answer.
+# Orchestrated: a recipe (system prompt + tools + model), transparent to the
+# client. The chat-loop happens inside woollama; client sees only the final answer.
 r = c.chat.completions.create(
     model="woollama/streamer",
     messages=[{"role": "user", "content": "Please count to 4."}],
 )
 ```
 
-The `<port>` is ephemeral by default — woollama binds to a free loopback
-port at startup and writes it to `$XDG_RUNTIME_DIR/woollama.addr` for clients
-to discover. Same pattern as a local `fabric --serve` instance.
+woollama serves on **two transports at once**: a Unix socket at
+`$XDG_RUNTIME_DIR/woollama.sock` (mode 0600 — the default for local MCP clients,
+since a connectable socket can spend the router's API keys) and an ephemeral
+loopback TCP port written to `$XDG_RUNTIME_DIR/woollama.addr` for clients to
+discover. The `<port>` above is that ephemeral port. Same pattern as a local
+`fabric --serve` instance.
 
 ## Install (development)
 
@@ -136,35 +151,46 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
    router holds API keys and routes to local resources — it should not be
    LAN-reachable.
 3. **The model namespace is the universal addressing scheme.** Raw inferencers
-   (`ollama/X`), patterns (`fabric/X`), variants (`woollama/X`), and full
-   recipes (`woollama/X`) are all addressable through OpenAI's standard
-   `model` field. No new wire format.
+   (`<provider>/<model>`, e.g. `ollama/X`, `anthropic/X`, `claude-code/X`) and
+   full recipes (`woollama/<recipe>`) are all addressable through OpenAI's
+   standard `model` field. No new wire format.
 4. **woollama owns routing, not inference or tools.** It uses other people's
-   inference engines (Ollama, Anthropic) and other people's tool servers
-   (lackpy, filesystem, git). It composes them.
+   inference engines (Ollama, Anthropic, …) and other people's tool servers
+   (any MCP server — filesystem, git, lackpy, …). It composes them.
 5. **she talks to llamas.**
 
 ## What works today
 
 - OpenAI surface: `/v1/models`, `/v1/chat/completions` (pass-through +
-  recipe orchestration), `/v1/tools` introspection
+  recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
+  introspection
+- **Stateful surface**: `/v1/responses` (stateless subset + stateful) and
+  `/v1/conversations` (create/list/get/delete + transcript `items`). woollama
+  routes conversation *handles*; backends own state — `claude-resume` for
+  `claude-code` models, a server-owned duckdb `stored` backend (transcript
+  replay) for the rest; handles rehydrate at startup
 - Multi-backend routing by `<provider>/<model>`: ollama, anthropic, openai,
   groq, together, openrouter, `claude-code`, + any OpenAI-compatible endpoint
   via `inferencers.toml`
+- **Tool delegation**: a `claude-code` recipe with tools runs as an *executor* —
+  Claude owns the agentic loop and calls the recipe's allow-listed MCP tools
+  itself (per-recipe `--mcp-config` + `--allowedTools` containment)
 - MCP server side: stdio (`woollama mcp`) **and** Streamable HTTP at `/mcp` on
-  the same port — recipes as prompts, a `chat` verb, and every downstream tool
-  re-exported (aggregator)
+  the same port — recipes as prompts, a `chat` verb (with live tool-progress
+  notifications), and every downstream tool re-exported with its `output_schema`
+  (aggregator)
 - File-driven config (`mcp.json`, `recipes.toml`, `inferencers.toml`), multi-
   MCP-server discovery + unified tool registry, long-lived MCP connections
-- Recipe allow-list enforced as a security boundary; ephemeral loopback binding
-  + address discovery file
+- Recipe allow-list enforced as a security boundary (in-loop AND in delegation);
+  served on a **Unix socket + loopback TCP**, address discovery file; CI
+  (ruff + hermetic suite, 3.11/3.12)
 
 ## Not yet (next on the roadmap)
 
-- Streaming (OpenAI SSE out + MCP progress events) — biggest open item
-- Unix socket transport alongside HTTP loopback
-- Stateful Conversations/Responses surface (design in
-  `docs/conversations-api-design.md`)
+- The live, interactive Claude-in-tmux session backend (a separate Rust session
+  driver) and the interactive `requires_action` path — gated on spikes that need
+  a real terminal
+- cosmic-fabric actually consuming the conversations surface (the last v1.0 gate)
 - The Rust v1.0 port
 
 Full scorecard, ordering, and pending verifications:

@@ -1,5 +1,11 @@
 # Naming brainstorm — graduating "cosmic-fabric" to a general-purpose router
 
+> **Superseded — historical.** This brainstorm is kept for the reasoning, but the
+> decision was made *outside* its candidate list: the project shipped as
+> **woollama** ("Web Over Ollama (and Llamas)" — she talks to llamas). The
+> `bosun`/`conduit`/`loom` candidates below were not chosen. Also note
+> `router-architecture.md` is now [`architecture.md`](architecture.md).
+
 The architecture (`router-architecture.md`) has grown beyond cosmic-fabric's
 original scope ("a COSMIC-native frontend for fabric"). It's now a model + tool
 + executor router that uses fabric as one possible pattern source. The COSMIC

@@ -7,11 +7,26 @@ full intended shape; much of it is built and some is still aspirational.
 
 > **Implementation status:** for what's actually built vs. still planned, see
 > [`roadmap.md`](roadmap.md); for the slice-by-slice history, see
-> [`build-log.md`](build-log.md). In particular, several specifics below are now
-> realized differently or more concretely than first sketched — e.g. the MCP
-> HTTP surface is **Streamable HTTP mounted at `/mcp`** (not `/mcp/sse`), and
-> the bundled inferencer set + `inferencers.toml` is the current provider
-> mechanism. Treat code + `roadmap.md` as authoritative where they differ.
+> [`build-log.md`](build-log.md). Treat code + `roadmap.md` as authoritative
+> where they differ. Specifics that the prototype realized **differently** from
+> the sketch below:
+> - The recipe namespace shipped as **`woollama/<recipe>`** (the doc's `cosmic/`
+>   examples are pre-naming). Of the "four model kinds," only **raw passthrough
+>   (`<provider>/<model>`)** and **recipes (`woollama/<recipe>`)** exist; the
+>   `fabric/<pattern>` and `cosmic/variant` kinds are aspirational, not built.
+> - Config is **three files** — `mcp.json` (servers only: `command`/`args`/`env`),
+>   `recipes.toml`, and `inferencers.toml` — not the single-file layout / `policy.toml`
+>   sketched in §Configuration. There is no `roles`/`features`/`[server] bind` handling.
+> - The bind override env var is **`WOOLLAMA_ADDRESS`**; the MCP HTTP surface is
+>   **Streamable HTTP at `/mcp`** (not `/mcp/sse`+`/mcp/messages`).
+> - The bundled MCP servers are the **`hello` + `textops` examples**, not
+>   fabric-mcp/lackpy.
+> - The **built-in tool set** (§Tools, "the current set") and **bidirectional MCP
+>   `roles`** are aspirational — woollama has no in-process tools today; all tools
+>   come from downstream MCP servers.
+> - The **executor axis** now includes **tool delegation to Claude Code** (a
+>   `claude-code` recipe with tools → Claude runs the loop), in addition to the
+>   provider-prefix inferencer choice described below.
 
 ## What it is
 
@@ -53,9 +68,10 @@ Surfaces:
 - **LAN bind** (`0.0.0.0:<port>`): only when explicitly configured AND with
   required `api_key`, mirroring how fabric upstream forces auth on LAN.
 
-Override hierarchy:
-1. `$ROUTER_ADDRESS=host:port` env (explicit, highest precedence)
-2. `[server] bind = "0.0.0.0:8889"` in config (explicit)
+Override hierarchy (as built: env var, else default — the config-file `bind`
+level is part of the target design, not implemented):
+1. `$WOOLLAMA_ADDRESS=host:port` env (explicit, highest precedence)
+2. *(planned)* `[server] bind = "0.0.0.0:8889"` in config
 3. Random free loopback port (default)
 
 The persisted address file is the discovery mechanism — clients read it the
@@ -68,7 +84,7 @@ GET  /v1/models                — OpenAI-compat list of all addressable models
 POST /v1/chat/completions      — OpenAI-compat chat (the inference primitive)
 POST /v1/embeddings            — OpenAI-compat embeddings (when needed)
 
-POST /mcp/sse, /mcp/messages   — MCP over HTTP+SSE for network clients
+POST /mcp                      — MCP over Streamable HTTP for network clients
 stdio (subprocess)             — MCP over stdio for local clients
 ```
 

@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — prototype progress since v0.1.0
+
+Still the Python prototype (version not yet bumped); these are committed,
+slice-by-slice (see `docs/build-log.md`). This resolves essentially every
+"queued for v0.2" limitation listed under v0.1.0 below. Authoritative live
+status is `docs/roadmap.md`.
+
+### Surfaces
+
+- **Streaming on both sides.** `stream:true` on `<provider>/<model>` relays the
+  upstream SSE verbatim; on `woollama/<recipe>` it streams the answer as OpenAI
+  SSE with the tool loop hidden (one async generator, `orchestrate_events`). The
+  MCP `chat` tool emits a progress notification per tool call/result.
+- **Stateful surface** (`docs/conversations-api-design.md`): `/v1/responses`
+  (stateless subset + stateful) and `/v1/conversations` (create/list/get/delete
+  + transcript `items`), in the OpenAI Responses/Conversations shape. woollama
+  routes conversation *handles*; backends own the state.
+- **MCP over Streamable HTTP** at `/mcp`, mounted on the same port as `/v1/*`,
+  plus the stdio `woollama mcp` server. **Aggregator**: every downstream tool is
+  re-exported namespaced, now carrying its `output_schema`; recipes become MCP
+  prompts; a `chat` verb runs orchestration.
+- **Unix socket** at `$XDG_RUNTIME_DIR/woollama.sock` (mode 0600) served
+  alongside the loopback TCP port — the default for local MCP clients.
+- `/v1/tools` introspection endpoint.
+
+### Backends & routing
+
+- **Multi-backend inferencer seam**: anthropic, openai, groq, together,
+  openrouter built in, plus any OpenAI-compatible endpoint via `inferencers.toml`
+  (e.g. self-hosted vLLM).
+- **Claude Code** as a keyless inference backend (subscription auth), tool-less
+  AND as an **executor** (tool delegation): a `claude-code` recipe with tools
+  lets Claude own the agentic loop and call the recipe's allow-listed MCP tools
+  itself, contained by a per-recipe `--mcp-config` + `--allowedTools`.
+- **Conversation backends**: `claude-resume` (`claude --resume`) and a
+  server-owned duckdb `stored` backend (transcript replay) for models with no
+  native session; stored handles rehydrate from duckdb at startup.
+
+### Platform
+
+- **Multi-MCP-server discovery + unified tool registry** with long-lived
+  connections (replaces per-request subprocess spawning).
+- **File-driven config**: `mcp.json`, `recipes.toml`, `inferencers.toml`
+  (`${VAR}` expansion; inferencers merge over built-ins).
+- **Recipe allow-list** enforced as a security boundary (in the orchestration
+  loop AND in delegation).
+- **CI**: GitHub Actions runs `ruff check` + the hermetic suite on Python
+  3.11/3.12; opt-in pre-commit hook mirrors the lint gate.
+
 ## v0.1.0 — 2026-05-31
 
 First public version. **Working router; Python prototype, not production.**

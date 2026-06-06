@@ -15,15 +15,20 @@ The Rust port begins when **all four** of these are true:
    answers have settled and the doc captures them.
 
 2. **The Python surface covers the v1.0 feature set.** Concretely (progress as
-   of 2026-06-02 — see [`roadmap.md`](roadmap.md)):
+   of 2026-06-06 — kept in sync with [`roadmap.md`](roadmap.md)'s gate
+   checklist; the two MUST agree):
    - [x] real config file (`recipes.toml` + `mcp.json`, plus `inferencers.toml`)
    - [x] multi-MCP-server discovery + unified tool registry
+   - [x] long-lived MCP connections (was the criterion-#4 latency concern)
    - [x] the Anthropic backend (and the generic OpenAI-compat inferencer seam)
    - [x] the woollama-as-MCP-server side (stdio + Streamable HTTP)
-   - [ ] streaming on both sides
-   - [ ] Unix socket alongside HTTP loopback
-   - [ ] the panel-confirm round-trip equivalent (the stateful Conversations
-         surface + cosmic-fabric consuming it)
+   - [x] streaming on both sides (OpenAI SSE out — passthrough + orchestration;
+         MCP progress events on the `chat` tool)
+   - [x] Unix socket alongside HTTP loopback
+   - [ ] the panel-confirm round-trip equivalent. The stateful Conversations
+         surface itself IS shipped (`/v1/responses` + `/v1/conversations`,
+         claude-resume + duckdb `stored` backends); this stays open on the other
+         half — **cosmic-fabric actually consuming it**.
 
 3. **There is a real consumer.** Cosmic-fabric panel (or another real
    client) is actively using woollama through its OpenAI/MCP surfaces. The
@@ -42,11 +47,11 @@ Python a while longer."
 ## What the Rust port preserves
 
 - **The public surface** is identical. OpenAI endpoints at `/v1/...`, MCP at
-  `/mcp/...` and stdio, same model namespace, same recipe + variant + pattern
+  `/mcp` (Streamable HTTP) and stdio, same model namespace and recipe
   resolution. Existing clients see no behavior change.
 - **The architectural decisions** in `docs/architecture.md` carry over
   verbatim — they were the point.
-- **The bundled MCP servers** (forked fabric-mcp, etc.) are external and
+- **The downstream MCP servers** are external (their own processes) and
   don't change.
 - **The `examples/` and `docs/`** stay as-is.
 
