@@ -347,6 +347,23 @@ async def test_mcp_stdio_surface_with_started_registry(tmp_path):
         counted = await c.call_tool("hello.count_to", {"n": 3})
         assert counted.data == {"count": 3, "total": 3, "done": True}
 
+        # Re-export also MIRRORS the downstream's output_schema onto tools/list
+        # (the output_schema slice): hello.count_to returns a dict, so FastMCP
+        # gives it an object output schema downstream, and the proxy now carries
+        # it through — so a client sees (and can validate) the structured shape.
+        ct = next(t for t in await c.list_tools() if t.name == "hello.count_to")
+        assert ct.outputSchema is not None and ct.outputSchema.get("type") == "object"
+
+        # The COMMON case: a scalar-returning tool. textops.word_count is `-> int`,
+        # so FastMCP gives it a WRAPPED output schema (x-fastmcp-wrap-result) and
+        # emits structuredContent={"result": N}. The proxy mirrors that wrap schema
+        # and forwards the wrapped payload; woollama re-validates it (no double-wrap
+        # — the proxy overrides run()), and the client unwraps .data back to the int.
+        wc = next(t for t in await c.list_tools() if t.name == "textops.word_count")
+        assert wc.outputSchema is not None
+        words = await c.call_tool("textops.word_count", {"text": "one two three"})
+        assert words.data == 3
+
         # Connecting at all already proves the lifespan's registry.start_all()
         # didn't deadlock over stdio (the cross-loop hazard) and the server
         # came up clean (no banner corrupting the JSON-RPC stream). Calling the

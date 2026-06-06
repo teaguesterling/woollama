@@ -97,10 +97,11 @@ class _ProxyTool(Tool):
 
     @classmethod
     def build(cls, namespaced: str, description: str, schema: dict,
-              reg: Registry) -> "_ProxyTool":
+              reg: Registry, *, output_schema: dict | None = None) -> "_ProxyTool":
         # Defensive copy: `Registry.openai_tools_for` reads the same spec
         # object for the HTTP surface; don't risk FastMCP aliasing it.
-        tool = cls(name=namespaced, description=description, parameters=dict(schema))
+        tool = cls(name=namespaced, description=description, parameters=dict(schema),
+                   output_schema=dict(output_schema) if output_schema else None)
         tool._reg = reg
         return tool
 
@@ -115,9 +116,16 @@ class _ProxyTool(Tool):
             raise ToolError(text or f"downstream tool '{self.name}' errored")
         # Pass structured output through when the downstream tool produced it
         # (e.g. a dict-returning tool) so the client gets the structured payload,
-        # not just its JSON-as-text. We deliberately do NOT mirror the downstream
-        # output_schema onto this tool: that would couple every call to schema
-        # validation, breaking content-only results — a later refinement.
+        # not just its JSON-as-text. The proxy ALSO mirrors the downstream's
+        # output_schema (see build()), so the MCP server advertises it on
+        # tools/list AND enforces it on the result here. That enforcement is
+        # safe, not the regression an earlier note feared: a downstream that
+        # declares an output_schema has ALREADY validated its own output against
+        # that same schema before returning it to us (the MCP lowlevel server
+        # does this), so `structuredContent` is present and conforming by the
+        # time we forward it. A non-conforming downstream (declares a schema but
+        # violates it) surfaces a clear output-validation error rather than a
+        # silently-dropped contract — the faithful-proxy behaviour.
         return ToolResult(content=content,
                           structured_content=getattr(result, "structuredContent", None))
 
@@ -201,6 +209,7 @@ def register_reexported_tools(mcp: FastMCP, reg: Registry) -> None:
                 spec.description or "",
                 spec.inputSchema or {"type": "object", "properties": {}},
                 reg,
+                output_schema=getattr(spec, "outputSchema", None),
             ))
             count += 1
     log.info("re-exported %d downstream tool(s): %s",

@@ -188,3 +188,80 @@ async def test_tools_list_reexports_discovered_downstream_tools(monkeypatch, tmp
         # And it dispatches through the registry end-to-end.
         result = await c.call_tool("hello.count_to", {"n": 3})
     assert result.data == "counted 3" or "counted 3" in str(result.content)
+
+
+# ---------------------------------------------------------------------------
+# tools/list — re-export mirrors the downstream output_schema (output_schema slice)
+# ---------------------------------------------------------------------------
+
+def _stub_registry(monkeypatch, tmp_path, *, out_schema, call):
+    """A started registry with one stubbed downstream tool that declares
+    `out_schema` and whose dispatch returns `call(args)`. No subprocess."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+    reg = Registry()
+    mgr = ServerManager("svc", "echo", [])
+    mgr.tools = [SimpleNamespace(
+        name="op", description="an op",
+        inputSchema={"type": "object", "properties": {"n": {"type": "integer"}}},
+        outputSchema=out_schema,
+    )]
+
+    async def _noop_start() -> None:
+        return None
+
+    async def _call(bare: str, args: dict):
+        return call(args)
+
+    mgr.start = _noop_start          # type: ignore[method-assign]
+    mgr.call_tool = _call            # type: ignore[method-assign]
+    reg.add(mgr)
+    return reg
+
+
+async def test_reexport_mirrors_output_schema_and_forwards_structured(monkeypatch, tmp_path):
+    """A downstream tool that declares an output_schema has it MIRRORED onto the
+    re-exported proxy (advertised on tools/list), and a conforming structured
+    result is forwarded — validating cleanly against that advertised schema. This
+    is safe because the downstream already validated its own output before we got
+    it (proven live against hello.count_to in the stdio integration test)."""
+    out_schema = {"type": "object",
+                  "properties": {"count": {"type": "integer"}, "done": {"type": "boolean"}},
+                  "required": ["count", "done"]}
+
+    def call(args):
+        return SimpleNamespace(
+            content=[TextContent(type="text", text="{...}")],
+            structuredContent={"count": args["n"], "done": True},
+            isError=False)
+
+    reg = _stub_registry(monkeypatch, tmp_path, out_schema=out_schema, call=call)
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        tool = next(t for t in await c.list_tools() if t.name == "svc.op")
+        assert tool.outputSchema == out_schema          # mirrored onto tools/list
+        result = await c.call_tool("svc.op", {"n": 3})
+        # structured payload forwarded + validated against the advertised schema
+        # (the client deserializes .data into a model now that a schema exists,
+        # so assert on the raw structured_content).
+        assert result.structured_content == {"count": 3, "done": True}
+
+
+async def test_reexport_nonconforming_output_surfaces_clear_error(monkeypatch, tmp_path):
+    """Deliberate, documented behaviour: a downstream that DECLARES an
+    output_schema but returns content-only (violating its own contract) surfaces
+    a clear output-validation error through the proxy, rather than the proxy
+    silently dropping the declared schema. The faithful-proxy choice."""
+    from fastmcp.exceptions import ToolError
+    out_schema = {"type": "object", "properties": {"x": {"type": "integer"}},
+                  "required": ["x"]}
+
+    def call(args):   # declares a schema above but returns NO structured content
+        return SimpleNamespace(content=[TextContent(type="text", text="oops")],
+                               structuredContent=None, isError=False)
+
+    reg = _stub_registry(monkeypatch, tmp_path, out_schema=out_schema, call=call)
+    server = mcp_server.build_server(reg)
+    async with Client(server) as c:
+        with pytest.raises(ToolError, match=r"[Oo]utput"):
+            await c.call_tool("svc.op", {"n": 1})

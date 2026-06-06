@@ -103,8 +103,13 @@ Smaller follow-ons (not blocking):
   push/PR (3.11 + 3.12); an opt-in `.pre-commit-config.yaml` mirrors the lint
   gate locally. Lint only (no `ruff format` — the tree is hand-wrapped, `E501`
   ignored).
-- `output_schema` pass-through on re-exported proxy tools (currently content +
-  structuredContent only).
+- ~~`output_schema` pass-through on re-exported proxy tools~~ — ✅ DONE. The
+  aggregator now mirrors each downstream tool's `output_schema` onto its
+  re-exported proxy, so it's advertised on `tools/list` and enforced on results
+  (safe: a downstream that declares a schema has already validated its own
+  output before woollama forwards it — confirmed live via `hello.count_to`). A
+  non-conforming downstream surfaces a clear output-validation error (the
+  faithful-proxy choice), covered by a hermetic test.
 - Tool DELEGATION to Claude Code (Claude owns the loop, runs a recipe's MCP
   tools) — a separate "executor" concept; needs its own adversarial safety pass.
 
