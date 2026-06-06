@@ -20,21 +20,28 @@ Why subprocess, not the Agent SDK: the SDK requires the ``claude`` CLI on PATH
 anyway, so shelling out is fewer deps and trivially mockable (tests patch
 ``_invoke``).
 
-Safety. ``--permission-mode dontAsk`` auto-DENIES any tool not pre-approved (a
-HARD deny, recorded in the result's ``permission_denials`` — verified live), but
-it still auto-RUNS read-only Bash, so we ALSO ``--disallowedTools`` the exec/
-file/network/subagent vectors (Bash above all). We run in a neutral temp cwd and
-strip the child env (see ``_child_env``) so we don't inherit the host's
-CLAUDE.md / settings / plugins / nested-harness. For tool-less mode
-``--strict-mcp-config`` loads ZERO MCP servers. For delegation we write a
-per-recipe ``--mcp-config`` with ONLY the servers the allow-list references and
-pass ``--allowedTools`` listing ONLY those tools — so the recipe allow-list stays
-a hard boundary even though Claude drives the loop (defense-in-depth: config
-containment AND allow-list AND the built-in lockdown). Delegation only ADDS the
-recipe's MCP tools; it removes none of the above. Opt-in live tests
-(tests/test_integration.py, ``@needs_claude_code``, run in a PLAIN terminal — a
-nested child inherits the parent harness) verify both a Bash refusal and that an
-out-of-list tool is denied in delegation mode.
+Safety. The built-in tool lockdown is an ALLOW-LIST set to NONE — ``--tools ""``
+disables the entire built-in tool set. This is deliberately stronger than a
+deny-list: ``--permission-mode dontAsk`` hard-denies tools that would *prompt*
+(MCP tools, recorded in ``permission_denials`` — verified live), BUT a machine's
+global config / plugins can auto-APPROVE extra tools (Skill, Workflow, Cron, …)
+that dontAsk then does NOT deny and a deny-list can't enumerate. ``--tools ""``
+removes them all at the source. ``_DENY_TOOLS`` is kept as defense-in-depth (and
+carries ``LSP``, the one tool ``--tools ""`` leaves — ``--bare`` would drop it
+too but ``--bare`` breaks subscription auth). Because ``--tools ""`` also
+disables the built-in ToolSearch that surfaces *deferred* MCP tools,
+``_child_env`` sets ``ENABLE_TOOL_SEARCH=false`` so the recipe's MCP tools load
+UPFRONT. We also run in a neutral temp cwd and strip the child env (no
+``ANTHROPIC_API_KEY`` / ``CLAUDE_CODE*`` leak).
+
+For tool-less mode ``--strict-mcp-config`` loads ZERO MCP servers, so the child
+has no tools at all. For delegation we write a per-recipe ``--mcp-config`` with
+ONLY the servers the allow-list references and pass ``--allowedTools`` listing
+ONLY those tools — so the child has EXACTLY the recipe's MCP tools and nothing
+else (config containment AND the MCP allow-list AND the empty built-in set).
+Delegation only ADDS the recipe's MCP tools. Opt-in live tests
+(tests/test_integration.py, ``@needs_claude_code``) verify a delegated tool runs
+and a shell-exec attempt is refused.
 """
 from __future__ import annotations
 
@@ -49,12 +56,19 @@ log = logging.getLogger("woollama.claude_code")
 # Override the binary (e.g. an absolute path) via this env var.
 CLAUDE_BIN = os.environ.get("WOOLLAMA_CLAUDE_BIN", "claude")
 
-# Defense-in-depth tool lockdown. dontAsk already auto-denies tools that would
-# prompt, but read-only Bash slips through — so deny it explicitly, plus the
-# other obvious leak/exec vectors. Tools NOT listed are still auto-denied by
-# dontAsk; this list is belt-and-suspenders for the dangerous categories.
+# Tool lockdown. The PRIMARY mechanism is `--tools ""` (see _build_args /
+# _build_delegate_args): an ALLOW-LIST of built-in tools set to NONE, which is
+# robust against whatever extra tools a given machine's global config / plugins
+# enable (Skill, Workflow, Cron, … — a deny-list can't enumerate those, and
+# `dontAsk` does NOT deny them because they're auto-approved). `--tools ""`
+# removes the built-in set entirely; MCP tools (delegation) are a separate
+# category, gated by --mcp-config + --allowedTools.
+#
+# `_DENY_TOOLS` remains as DEFENSE-IN-DEPTH for the dangerous built-ins, and
+# carries `LSP` — the one tool `--tools ""` leaves behind (it's managed
+# separately; only `--bare` drops it, and `--bare` breaks subscription auth).
 _DENY_TOOLS = ("Bash,Read,Write,Edit,NotebookEdit,WebFetch,WebSearch,"
-               "Glob,Grep,Task")
+               "Glob,Grep,Task,LSP")
 
 
 class ClaudeCodeError(RuntimeError):
@@ -73,10 +87,16 @@ def _child_env() -> dict:
       observed contaminating the delegation spike). Stripping them gives a clean
       child regardless of where woollama runs.
     """
-    return {k: v for k, v in os.environ.items()
-            if k != "ANTHROPIC_API_KEY"
-            and k != "CLAUDECODE"
-            and not k.startswith("CLAUDE_CODE")}
+    env = {k: v for k, v in os.environ.items()
+           if k != "ANTHROPIC_API_KEY"
+           and k != "CLAUDECODE"
+           and not k.startswith("CLAUDE_CODE")}
+    # `--tools ""` disables the built-in ToolSearch, which is how Claude Code
+    # discovers DEFERRED MCP tools by default. Disable deferred search so the
+    # recipe's MCP tools (delegation) load UPFRONT and stay reachable; harmless
+    # for the tool-less path (no MCP servers).
+    env["ENABLE_TOOL_SEARCH"] = "false"
+    return env
 
 
 def _mcp_tool_name(namespaced: str) -> str:
@@ -140,7 +160,8 @@ def _build_args(prompt: str, system: str, model: str,
             "--max-turns", "1",
             "--strict-mcp-config",                 # zero MCP servers
             "--permission-mode", "dontAsk",        # non-interactive (no hang)
-            "--disallowedTools", _DENY_TOOLS]      # ...and genuinely tool-less
+            "--tools", "",                         # NO built-in tools (allow-list of none)
+            "--disallowedTools", _DENY_TOOLS]      # defense-in-depth (+ LSP)
     if resume:
         args += ["--resume", resume]               # continue an existing session
     # The system prompt is set when STARTING a session; --resume carries it
@@ -239,7 +260,8 @@ def _build_delegate_args(prompt: str, system: str, model: str,
             "--mcp-config", mcp_config_path,
             "--strict-mcp-config",                 # ONLY the config we write loads
             "--permission-mode", "dontAsk",        # hard-denies anything not allow-listed
-            "--disallowedTools", _DENY_TOOLS,      # built-in exec/file/net lockdown
+            "--tools", "",                         # NO built-in tools (allow-list of none)
+            "--disallowedTools", _DENY_TOOLS,      # defense-in-depth (+ LSP)
             "--allowedTools", ",".join(allowed)]   # ONLY the recipe's MCP tools
     if system:
         args += ["--system-prompt", system]

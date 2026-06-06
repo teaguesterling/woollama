@@ -129,14 +129,18 @@ Smaller follow-ons (not blocking):
   `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k claude_code`
   (checks a real completion works AND neither a shell-exec nor a file-read
   prompt-injection succeeds).
-- **Tool delegation** (executor): the per-recipe `--mcp-config` + `--allowedTools`
-  containment is verified by construction + unit tests, and the `claude` flag
-  behaviour (allow-listed tool runs; out-of-list tool HARD-denied) by the spike.
-  The positive path is verified at the event level through woollama's GENERATED
-  config: the hello server launched and Claude invoked `mcp__hello__count_to`
-  (`result.is_error=False`, no denials). The adversarial half (a shell-exec
-  attempt refused in delegation mode) must run in a PLAIN terminal — a nested
-  `claude` child inherits the parent harness and contaminates the run. Run there:
+- ~~**Tool delegation** (executor)~~ — ✅ VERIFIED + HARDENED. The lockdown is
+  `--tools ""` (an allow-list of built-in tools set to NONE) — robust against
+  whatever tools a deployment's global config / plugins enable, which a deny-list
+  can't enumerate and `dontAsk` doesn't deny (it only hard-denies tools that
+  *prompt*; auto-approved extras like Skill/Workflow slipped through the old
+  deny-list). `ENABLE_TOOL_SEARCH=false` keeps the recipe's MCP tools reachable
+  (they load upfront once the built-in ToolSearch is gone). Verified at the event
+  level through woollama's real code: the delegated Claude exposes ONLY the
+  recipe's MCP server tools (no built-ins, no LSP, no harness tools), the
+  out-of-list tool is HARD-denied, the delegated tool runs, and a shell-exec
+  attempt is refused (Bash is absent, not merely denied). Because `--tools ""`
+  strips the harness, the live gate now runs trustworthily even nested:
   `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k delegation`
 - **Anthropic (and other cloud) live round-trips** (slices j/k): routing/auth
   is unit-tested on the emit side + doc-confirmed (tools supported); the live

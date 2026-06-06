@@ -539,3 +539,35 @@ woollama returns only the final answer. Distinct from the tool-less inferencer
   claim. (The adversarial Bash-in-delegation refusal stays plain-terminal-only;
   it rests on construction + the shared `_DENY_TOOLS`, not yet observed.)
 - **Verified**: default suite 132 passed / 16 deselected; ruff clean.
+
+## Follow-on slice — claude-code tool lockdown: deny-list → allow-list-of-none (2026-06-06)
+
+Running the delegation live gate surfaced a real robustness gap. The lockdown was
+a DENY-LIST (`_DENY_TOOLS`: Bash/Read/Write/…). On a machine whose global Claude
+config / plugins enable extra tools NOT in that list (this box has Skill,
+Workflow, Cron, Monitor, ToolSearch, LSP, …), those tools stayed reachable: a
+deny-list can't enumerate every deployment's tools, and `--permission-mode
+dontAsk` does NOT deny them (it hard-denies only tools that would *prompt*;
+auto-approved extras pass through — confirmed: a spike showed `Skill` launching,
+not being denied). What looked like "nested-session contamination" was actually
+this machine's global config: a fully-scrubbed `env -i` child still showed the
+extras, so they're not a session leak.
+
+Fix (authoritative `claude` flags, confirmed via the claude-code guide + probes):
+- **`--tools ""`** — the primary lockdown: an ALLOW-LIST of built-in tools set to
+  NONE. Removes the entire built-in/plugin set at the source, robust against any
+  deployment's extras. (Added to BOTH the tool-less and delegation arg builders.)
+- **`ENABLE_TOOL_SEARCH=false`** (in `_child_env`) — `--tools ""` also disables the
+  built-in ToolSearch that surfaces *deferred* MCP tools (Claude Code's default),
+  so the recipe's MCP tools would vanish; this loads them UPFRONT instead.
+- `_DENY_TOOLS` kept as defense-in-depth, now carrying **`LSP`** — the one tool
+  `--tools ""` leaves behind (only `--bare` drops it, and `--bare` breaks
+  subscription auth — rejected: a probe returned "Not logged in").
+- Rejected `--bare` (kills keychain/credential reads → no auth).
+
+Verified at the event level through woollama's real `_build_delegate_args` +
+`_child_env`: the delegated Claude now exposes ONLY the recipe's MCP server tools
+(no built-ins, no LSP, no Skill/Workflow), the out-of-list MCP tool is hard-denied,
+the delegated tool runs, and a shell-exec attempt is refused (Bash absent). Because
+the harness tools are now stripped, the delegation + tool-less live gates pass
+trustworthily even nested. 154 hermetic pass; ruff clean.

@@ -68,8 +68,11 @@ async def test_builds_tool_less_locked_down_command(monkeypatch):
     # Tool-less lockdown is present.
     assert "--strict-mcp-config" in args
     assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    # PRIMARY lockdown: an allow-list of built-in tools set to NONE.
+    assert args[args.index("--tools") + 1] == ""
     deny = args[args.index("--disallowedTools") + 1]
-    assert "Bash" in deny and "Read" in deny and "WebFetch" in deny
+    # defense-in-depth deny-list still covers the dangerous built-ins + LSP.
+    assert "Bash" in deny and "Read" in deny and "WebFetch" in deny and "LSP" in deny
     # System prompt + model wired through; JSON output.
     assert args[args.index("--system-prompt") + 1] == "You are a counter."
     assert args[args.index("--model") + 1] == "haiku"
@@ -177,9 +180,10 @@ async def test_delegation_builds_contained_command(monkeypatch):
     args = captured["args"]
     # allow-list maps to EXACTLY the recipe's mcp tool id, nothing else.
     assert args[args.index("--allowedTools") + 1] == "mcp__hello__count_to"
-    # the slice-i built-in lockdown is kept verbatim.
+    # the built-in lockdown is kept: allow-list of built-ins = none, + deny-list.
     assert "--strict-mcp-config" in args
     assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert args[args.index("--tools") + 1] == ""        # no built-in tools at all
     assert "Bash" in args[args.index("--disallowedTools") + 1]
     # the --mcp-config contains ONLY the referenced server.
     assert captured["mcp_config"] == {
@@ -231,6 +235,9 @@ async def test_tool_less_path_also_strips_harness_env(monkeypatch):
     await claude_code.run_completion("s", [{"role": "user", "content": "x"}], "haiku")
     assert "CLAUDECODE" not in captured["env"]
     assert "CLAUDE_CODE_ENTRYPOINT" not in captured["env"]
+    # deferred-tool search disabled so MCP tools (delegation) load upfront once
+    # --tools "" removes the built-in ToolSearch.
+    assert captured["env"]["ENABLE_TOOL_SEARCH"] == "false"
 
 
 # ---------------------------------------------------------------------------

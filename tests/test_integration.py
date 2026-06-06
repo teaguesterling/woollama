@@ -512,14 +512,14 @@ async def test_claude_code_delegation_runs_tool_and_keeps_boundary(tmp_path, mon
     tools=[hello.count_to]: Claude OWNS the agentic loop and calls the tool
     itself (woollama spawns a `claude` whose --mcp-config contains only the hello
     server, --allowedTools only hello's count_to). Verifies (1) the delegated tool
-    actually runs end-to-end, and (2) the boundary still holds in delegation
-    mode — a shell-exec attempt does NOT touch the host, because delegation only
-    ADDED hello.count_to to the allowed set, not Bash.
+    actually runs end-to-end, and (2) the boundary holds — a shell-exec attempt
+    does NOT touch the host, because the lockdown is `--tools ""` (NO built-in
+    tools at all, an allow-list of none) so Bash isn't merely denied, it's absent.
 
-    MUST run in a PLAIN terminal: a `claude` child spawned INSIDE a Claude Code
-    session inherits the parent harness (its meta-tools / nested mode), which
-    contaminates the run — observed directly in the delegation spike. The
-    WOOLLAMA_TEST_CLAUDE_CODE gate keeps it out of the default + nested runs."""
+    Runs trustworthily even nested: `--tools ""` strips the parent harness's
+    tools (Skill/Workflow/…) that used to contaminate a nested child, so the only
+    tools the delegated Claude sees are the recipe's MCP tools (verified at the
+    event level). WOOLLAMA_TEST_CLAUDE_CODE gates it (real `claude`, real cost)."""
     from woollama import recipes, router
 
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))   # mcp falls back to bundled (hello)
