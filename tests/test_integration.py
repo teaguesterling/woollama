@@ -297,6 +297,66 @@ def test_conversations_surface_full_journey_live(woollama_server):
     assert cid not in [c["id"] for c in listing2]
 
 
+@needs_anthropic
+def test_managed_agents_conversation_journey_live(woollama_server):
+    """E2E for the managed-agents backend (conv-6) against the LIVE Anthropic
+    Managed Agents API. Mirrors the claude-resume journey on a DIFFERENT
+    state-owning backend (Anthropic hosts the session), and additionally proves
+    the capability win: `/items` SERVES the transcript here (managed-agents
+    exposes `history`), where claude-resume 501s.
+
+    ⚠️ PAID + side-effects: this spends real ANTHROPIC_API_KEY credits and
+    creates persistent account objects (an agent + a per-session container). The
+    test deletes the SESSION at the end; the per-model AGENT object persists
+    (created once, reused). Run it deliberately, and launch with the `agents`
+    extra so the server subprocess has the `anthropic` SDK:
+      WOOLLAMA_TEST… ANTHROPIC_API_KEY=… \
+      uv run --extra dev --extra agents pytest tests/test_integration.py \
+        -m integration -k managed_agents_conversation_journey_live -v
+    """
+    import openai
+    base = woollama_server
+    model = "claude-agent/haiku"        # cheapest; backend = managed-agents
+
+    # 1) CREATE (woollama needs `model` to pick the backend → drive via httpx).
+    created = httpx.post(f"{base}/v1/conversations",
+                         json={"model": model, "title": "journey",
+                               "metadata": {"k": "v"}}, timeout=30)
+    assert created.status_code == 201, created.text
+    conv = created.json()
+    cid = conv["id"]
+    assert conv["backend"] == "managed-agents" and conv["title"] == "journey"
+
+    # 2) DISCOVER: in the list, and GET /{id} matches.
+    listing = httpx.get(f"{base}/v1/conversations", timeout=10).json()["data"]
+    assert cid in [c["id"] for c in listing]
+    got = httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).json()
+    assert got["id"] == cid and got["model"] == model
+
+    # 3) DRIVE two turns; the recall proves Anthropic resumed the same session.
+    c = openai.OpenAI(base_url=f"{base}/v1", api_key="not-required")
+    r1 = c.responses.create(model=model, conversation=cid,
+                            input="Remember this codeword: banana. Reply only: ok",
+                            timeout=300)
+    assert r1.conversation.id == cid
+    r2 = c.responses.create(model=model, conversation=cid,
+                            input="What codeword did I ask you to remember? "
+                                  "Reply with only that word.", timeout=300)
+    assert "banana" in r2.output_text.lower(), \
+        f"attach-by-conversation should recall via the hosted session; got {r2.output_text!r}"
+
+    # 4) ITEMS — the capability win: the transcript is SERVED (200), not 501.
+    items = httpx.get(f"{base}/v1/conversations/{cid}/items", timeout=30)
+    assert items.status_code == 200, items.text
+    roles = [it["role"] for it in items.json()["data"]]
+    assert "user" in roles and "assistant" in roles
+
+    # 5) DELETE the session (tears down the billed container), then confirm gone.
+    deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=30).json()
+    assert deleted["deleted"] is True
+    assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
+
+
 @needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to

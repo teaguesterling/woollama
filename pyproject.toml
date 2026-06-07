@@ -34,6 +34,9 @@ dev = [
     "fastmcp>=2.0",          # for the bundled hello example server
     "ruff",
 ]
+agents = [
+    "anthropic>=0.107.1",
+]
 
 [project.scripts]
 woollama = "woollama.__main__:main"

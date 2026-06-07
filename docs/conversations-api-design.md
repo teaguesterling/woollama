@@ -56,7 +56,7 @@ cosmic-fabric / OpenAI client
         ├─▶ claude-tmux        (delegated, LIVE + interactive) ──HTTP/SSE──▶ session driver (Rust)
         │                                                          owns: tmux, send-keys (Esc/Enter),
         │                                                          jsonl tail, turn/pending detection
-        └─▶ managed-agents     (Anthropic-hosted; /v1/sessions)  [later, §8.7]
+        └─▶ managed-agents     (Anthropic-hosted; /v1/sessions)  [conv-6, §8.7]
 ```
 
 ## 1. External API — `/v1/responses`
@@ -239,9 +239,27 @@ plain terminal before building the claude-tmux backend:
    *client* to — e.g. a "conversation store" MCP server, or Managed Agents
    (item 7) — never woollama's own embedded DB.
 6. **cosmic-fabric wiring** — when that UX returns.
-7. **`managed-agents` backend (Claude-hosted stateful sessions)** — a
-   `ConversationBackend` that defers conversation state to **Anthropic's Managed
-   Agents** API (`/v1/agents` + `/v1/sessions`, beta `managed-agents-2026-04-01`).
+7. **`managed-agents` backend (Claude-hosted stateful sessions)** — **SHIPPED
+   2026-06-07 (conv-6).** A `ConversationBackend` that defers conversation state
+   to **Anthropic's Managed Agents** API (`/v1/agents` + `/v1/sessions`, beta
+   `managed-agents-2026-04-01`).
+
+   *Shipped scope:* namespace `claude-agent/<model>` → backend `managed-agents`
+   (`conversations.ManagedAgentsBackend`, SDK wrapper in `managed_agents.py`). One
+   TOOL-LESS agent per model, created lazily + cached on the backend instance
+   (never per session); a single shared environment, created once; a session per
+   conversation, created on the first turn. `send_turn` streams events to
+   `session.status_idle` and collects the `agent.message` text (sending only the
+   NEW turn — Anthropic owns prior history). **`history` IS implemented** (parses
+   `events.list` → transcript items), so `/v1/conversations/{id}/items` serves the
+   transcript here — the first backend for which it does (claude-resume still
+   501s). `delete` → `sessions.delete`. Hermetic tests mock the SDK seam
+   (`managed_agents._client`); the live gate is `@needs_anthropic` (PAID).
+   *Deferred (unchanged from below):* recipe→agent MCP mapping, vaults, file/repo
+   resources, the `requires_action` interactive path. *Known limit:* the
+   in-memory handle table means a restart orphans live (billed) sessions, and each
+   fresh process re-creates its per-model agent — the `ant`-YAML / reuse-by-name
+   control plane is the eventual fix.
    The purest embodiment of "backends own state" — Anthropic literally hosts the
    session, the loop, and a per-session container; woollama just routes the
    handle. **An alternative to slices 3/4** (the Rust claude-tmux driver +

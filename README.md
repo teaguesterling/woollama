@@ -62,10 +62,13 @@ MCP tools itself — tool delegation). Config is file-driven (`mcp.json`,
 `recipes.toml`, `inferencers.toml`).
 
 **Stateful conversations** route *handles*; backends own the *state* — woollama
-never stores transcripts in its own system. Today the one state-owning backend is
-`claude-resume` (`claude --resume`, for `claude-code` models; the Claude session
-owns the bytes). Models with no state-owning backend (ollama/cloud/recipe) are
-stateless — the caller owns history (`store:false`). Long-lived MCP
+never stores transcripts in its own system. Two state-owning backends:
+`claude-resume` (`claude --resume`, for `claude-code` models; keyless, the Claude
+session owns the bytes) and `managed-agents` (Anthropic's Managed Agents, for
+`claude-agent` models; `ANTHROPIC_API_KEY`, Anthropic hosts the session — and
+exposes the transcript, so `/v1/conversations/{id}/items` works). Models with no
+state-owning backend (ollama/cloud/recipe) are stateless — the caller owns
+history (`store:false`). Long-lived MCP
 connections. Served on **both a Unix socket** (`$XDG_RUNTIME_DIR/woollama.sock`,
 mode 0600 — the default for local MCP clients) and an ephemeral loopback TCP
 port; never `0.0.0.0` without explicit opt-in.
@@ -169,10 +172,12 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
   recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
   introspection
 - **Stateful surface**: `/v1/responses` (stateless subset + stateful) and
-  `/v1/conversations` (create/list/get/delete). woollama routes conversation
-  *handles*; backends own state (woollama never stores transcripts itself) —
-  `claude-resume` for `claude-code` models; models with no state-owning backend
-  are stateless (`store:false`)
+  `/v1/conversations` (create/list/get/delete, plus `items` where the backend
+  exposes its transcript). woollama routes conversation *handles*; backends own
+  state (woollama never stores transcripts itself) — `claude-resume` for
+  `claude-code` models, `managed-agents` (Anthropic Managed Agents) for
+  `claude-agent` models; models with no state-owning backend are stateless
+  (`store:false`)
 - Multi-backend routing by `<provider>/<model>`: ollama, anthropic, openai,
   groq, together, openrouter, `claude-code`, + any OpenAI-compatible endpoint
   via `inferencers.toml`

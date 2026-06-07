@@ -34,11 +34,17 @@ status is `docs/roadmap.md`.
   AND as an **executor** (tool delegation): a `claude-code` recipe with tools
   lets Claude own the agentic loop and call the recipe's allow-listed MCP tools
   itself, contained by a per-recipe `--mcp-config` + `--allowedTools`.
-- **Conversation backend**: `claude-resume` (`claude --resume`) — the native
-  Claude session owns the bytes; woollama holds only the handle. Models with no
-  state-owning backend are stateless (`store:false`). (A duckdb `stored` backend
-  was briefly added and reverted — woollama does not store conversations in its
-  own system; it routes handles to backends that own the state.)
+- **Conversation backends** (woollama routes handles; backends own state):
+  - `claude-resume` (`claude --resume`, for `claude-code/<model>`) — the native
+    Claude session owns the bytes; keyless/subscription.
+  - `managed-agents` (Anthropic Managed Agents, for `claude-agent/<model>`) —
+    Anthropic hosts the session + container; `ANTHROPIC_API_KEY` (paid). The
+    first backend to implement transcript retrieval, so
+    `/v1/conversations/{id}/items` serves it. (In the `agents` optional extra.)
+  - Models with no state-owning backend are stateless (`store:false`). (A duckdb
+    `stored` backend was briefly added and reverted — woollama does not store
+    conversations in its own system; it routes handles to backends that own the
+    state.)
 
 ### Platform
 

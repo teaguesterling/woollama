@@ -12,13 +12,18 @@ fabricate a store of its own.
 Backends (only state-OWNING backends belong here):
 - `claude-resume` (conv-1b): `claude --resume <sid> -p`, the non-interactive
   path — verified not to hang nested. The native Claude session owns the bytes
-  (in `~/.claude`); woollama holds only the handle → session_id mapping.
+  (in `~/.claude`); woollama holds only the handle → session_id mapping. Keyless
+  (subscription); routed for `claude-code/<model>`.
+- `managed-agents` (conv-6): Anthropic's Managed Agents API — Anthropic hosts the
+  session, the loop, and a per-session container; woollama holds only the
+  `session_id`. Paid (`ANTHROPIC_API_KEY`); routed for `claude-agent/<model>`.
+  The first backend that also serves `history` (Anthropic exposes the event log).
 
 Models with NO state-owning backend (ollama, recipes, cloud providers) have no
 stateful conversation here — they are stateless (`store:false`; the caller owns
-history, exactly as the Anthropic Messages API itself is stateless). Future
-state-owning backends — a Claude-in-tmux driver, and Anthropic Managed Agents
-(see the design doc) — also OWN their state; woollama still just routes handles.
+history, exactly as the Anthropic Messages API itself is stateless). A future
+Claude-in-tmux driver would also OWN its state; woollama still just routes
+handles.
 
 Limitations (documented, not hidden):
 - **In-memory handle table** — `conv_id → claude session_id` mappings are
@@ -38,7 +43,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
-from . import claude_code, responses
+from . import claude_code, managed_agents, responses
 
 
 def _now() -> int:
@@ -136,20 +141,93 @@ class ClaudeResumeBackend:
         conv.status = "dead"
 
 
+def _latest_user_text(messages: list[dict]) -> str:
+    """The new user input for a stateful turn. The backend already owns prior
+    history (Anthropic's session holds it), so woollama sends only the latest
+    user message — not the whole transcript."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return messages[-1].get("content", "") if messages else ""
+
+
+class ManagedAgentsBackend:
+    """Claude-hosted stateful sessions via Anthropic's Managed Agents API
+    (`/v1/agents` + `/v1/sessions`). Anthropic owns the session, the agentic
+    loop, and a per-session container; woollama holds only the `session_id`. The
+    purest 'backend owns state' backend — and the first that can serve `history`
+    (Anthropic exposes the event log; woollama RETRIEVES, never stores).
+
+    Minimal (§8.7): one TOOL-LESS agent per model, created lazily and cached on
+    this instance (never per session, the documented anti-pattern); a single
+    shared environment, created once. See managed_agents.py for the auth and the
+    cost/orphan lifecycle notes (sessions are billed; a restart orphans them)."""
+
+    name = "managed-agents"
+
+    def __init__(self) -> None:
+        self._env_id: str | None = None
+        self._agents: dict[str, str] = {}        # full model id → agent_id (reused)
+        self._setup_lock = asyncio.Lock()
+
+    async def _ensure_agent(self, model: str) -> tuple[str, str]:
+        """Lazily create + cache the shared environment and a per-model tool-less
+        agent. Serialized so concurrent first-turns don't double-create."""
+        full = managed_agents.resolve_model(model)
+        async with self._setup_lock:
+            if self._env_id is None:
+                self._env_id = await managed_agents.create_environment("woollama-agents")
+            if full not in self._agents:
+                self._agents[full] = await managed_agents.create_agent(
+                    name=f"woollama:{full}", model=full, system="")
+        return self._agents[full], self._env_id
+
+    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
+        # The session (Anthropic's, holding the transcript) is created lazily on
+        # the first turn; later turns reuse it via its native session_id.
+        if conv.native_id is None:
+            agent_id, env_id = await self._ensure_agent(conv.model)
+            conv.native_id = await managed_agents.create_session(
+                agent_id, env_id, title=conv.title, metadata=conv.metadata)
+        return await managed_agents.run_turn(conv.native_id, _latest_user_text(messages))
+
+    async def history(self, conv: Conversation) -> list[dict]:
+        """Retrieve the backend's transcript (Anthropic owns the bytes). Empty
+        until the first turn creates the session."""
+        if conv.native_id is None:
+            return []
+        events = await managed_agents.list_events(conv.native_id)
+        return managed_agents.events_to_messages(events)
+
+    async def delete(self, conv: Conversation) -> None:
+        """Tear down the Anthropic session (a billed container — deletion matters
+        more here than for claude-resume's on-disk session)."""
+        if conv.native_id:
+            await managed_agents.delete_session(conv.native_id)
+        conv.status = "dead"
+
+
 # Backend registry, keyed by the name stored on a Conversation. ONLY backends
 # that own their conversation state belong here — woollama routes handles to
 # them, it never owns conversation state itself.
-BACKENDS: dict[str, object] = {ClaudeResumeBackend.name: ClaudeResumeBackend()}
+BACKENDS: dict[str, object] = {
+    ClaudeResumeBackend.name: ClaudeResumeBackend(),
+    ManagedAgentsBackend.name: ManagedAgentsBackend(),
+}
 
 
 def backend_for_model(model: str) -> str | None:
-    """Which state-owning backend (if any) backs conversations for this `model`.
-    Only `claude-code/<model>` has one in this build — `claude-resume`, where the
-    native Claude session owns the bytes. Every other model (ollama, recipes,
-    cloud providers) has NO state owner, so it has no stateful backend: those
-    conversations are stateless (`store:false`, the caller owns history).
-    woollama does not store transcripts in its own system."""
+    """Which state-owning backend (if any) backs conversations for this `model`:
+    - `claude-code/<model>` → `claude-resume` (the native Claude session owns the
+      bytes on disk; keyless/subscription).
+    - `claude-agent/<model>` → `managed-agents` (Anthropic hosts the session;
+      `ANTHROPIC_API_KEY`, paid).
+    Every other model (ollama, recipes, cloud providers) has NO state owner, so it
+    has no stateful backend — those conversations are stateless (`store:false`,
+    the caller owns history). woollama does not store transcripts itself."""
     provider = model.split("/", 1)[0]
     if provider == "claude-code":
         return ClaudeResumeBackend.name
+    if provider == "claude-agent":
+        return ManagedAgentsBackend.name
     return None

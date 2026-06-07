@@ -35,13 +35,15 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
 | **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
 | **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras) | `router.py`, `conversations.py` | conv-2 |
+| **`managed-agents` backend** — `claude-agent/<model>` → Anthropic Managed Agents (hosted session owns state); implements `history` so `/items` serves the transcript | `managed_agents.py`, `conversations.py` | conv-6 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
 orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
-subset + stateful via the `claude-resume` backend — OpenAI Responses shape;
-non-claude models are stateless-only, `store:false`), `/v1/conversations`
-(create/list/get/delete), `/v1/models`,
+subset + stateful via the `claude-resume` and `managed-agents` backends — OpenAI
+Responses shape; non-claude models are stateless-only, `store:false`),
+`/v1/conversations` (create/list/get/delete + `items` for managed-agents),
+`/v1/models`,
 `/v1/tools`, `/mcp` (Streamable HTTP),
 and `woollama mcp` (stdio) — served on BOTH a Unix socket
 (`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
@@ -91,10 +93,16 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      501 on `store:true`). Stateful conversations for them, if ever needed, must
      defer to an EXTERNAL owner (a conversation-store MCP server, or Managed
      Agents) — not woollama's own DB. See conversations-api-design.md §8.5.
-   - [ ] **conv-6 — `managed-agents` backend** (NEW, design-doc §8.7): defer
-     conversation state to Anthropic's `/v1/agents` + `/v1/sessions`. The purest
-     "backend owns state"; needs an API key (not subscription); also a path to
-     the interactive/executor capability WITHOUT the §6-blocked tmux driver.
+   - [x] **conv-6 — `managed-agents` backend** SHIPPED 2026-06-07 (design-doc
+     §8.7): defers conversation state to Anthropic's `/v1/agents` +
+     `/v1/sessions`. Namespace `claude-agent/<model>`; one tool-less agent per
+     model (cached, reused), a session per conversation; `send_turn` streams to
+     idle, `delete` → `sessions.delete`. The purest "backend owns state" — and
+     the FIRST backend to implement `history`, so `/items` serves the transcript
+     (claude-resume still 501s). Needs an API key (paid, not subscription).
+     Hermetic-tested (SDK seam mocked); the live round-trip is PENDING (paid —
+     see below). Deferred: recipe→agent MCP mapping, vaults, the interactive
+     `requires_action` path (the remaining route to the §6-blocked tmux capability).
    - [ ] conv-3/4 — the Rust session driver + claude-tmux backend (gated on the
      §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`);
      interactive `requires_action`; cosmic-fabric wiring.
@@ -156,6 +164,14 @@ Smaller follow-ons (not blocking):
   is unit-tested on the emit side + doc-confirmed (tools supported); the live
   round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:
   `uv run --extra dev pytest tests/test_integration.py -m integration -k anthropic`
+- **managed-agents backend live round-trip** (conv-6): hermetic tests mock the
+  SDK seam, so green proves woollama's WIRING, not the Managed Agents API
+  contract — and the bindings come from skill docs against `anthropic==0.107.1`,
+  so the live gate is the only thing that proves them real. **PAID + creates
+  persistent account objects** (an agent + a per-session container). With
+  `ANTHROPIC_API_KEY` set, launch WITH the `agents` extra so the server
+  subprocess has the SDK:
+  `uv run --extra dev --extra agents pytest tests/test_integration.py -m integration -k managed_agents_conversation_journey_live`
 - ~~**Streaming orchestration against real Ollama**~~ (slice streaming-2): ✅
   VERIFIED 2026-06-04 against real Ollama (`qwen3:14b-iq4xs`) — fragmented
   tool_call SSE deltas reassemble, the tool loop stays hidden, and the answer

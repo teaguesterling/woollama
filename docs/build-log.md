@@ -646,3 +646,49 @@ end-to-end against the real `claude-resume` backend (`claude-code/haiku`) — fu
 CRUD + discover, two-turn recall proving the resumed Claude session owns the
 state, `items → 501`, delete → 404. Green in 17.2s. (The revert commit `2d45f23`
 predates this run and flags the journey as "not yet run live"; it now is.)
+
+## conv-6 — the `managed-agents` backend (2026-06-07)
+
+The second state-owning conversation backend, and the purest one: it defers all
+state to **Anthropic's Managed Agents** API (`/v1/agents` + `/v1/sessions`, beta
+`managed-agents-2026-04-01`). Anthropic hosts the session, the loop, and a
+per-session container; woollama holds only the `session_id`. This is the
+alternative to the §6-blocked Rust tmux driver for a hosted, stateful, tool-
+capable session — the hard infra is Anthropic's.
+
+Shape (design-doc §8.7): new namespace `claude-agent/<model>` →
+`backend_for_model` → `managed-agents`. `managed_agents.py` is the SDK wrapper
+(parallel to `claude_code.py`): the sync `anthropic` SDK run in
+`asyncio.to_thread`, with `_client()` as the single mock seam (lazy `import
+anthropic`, so the core install and the hermetic suite need neither the package
+nor a key). `conversations.ManagedAgentsBackend` holds the cache: ONE tool-less
+agent per model (created lazily, reused — never per session, the documented
+anti-pattern) + one shared environment; a session per conversation, created on
+the first turn. `send_turn` opens the event stream, sends only the NEW user turn
+(Anthropic owns prior history), and collects `agent.message` text to
+`session.status_idle`, under a per-event wall-clock deadline + an outer
+`wait_for` (SDK stream timeouts are per-chunk, not total). **`history` is
+implemented** (`events.list` → transcript items), so
+`/v1/conversations/{id}/items` SERVES the transcript for this backend — the first
+for which it does (claude-resume still 501s). `delete` → `sessions.delete`.
+`ManagedAgentsError` now also maps to 502 in `_responses_stateful`.
+
+Dependency: `anthropic>=0.107.1` in a new optional `agents` extra (verified the
+`beta.{agents,environments,sessions.events}` surface exists in 0.107.1 before
+writing against it).
+
+Tests: `tests/test_managed_agents.py` (10) mocks the SDK with a fake client that
+records control-plane calls and scripts the event stream — asserts lazy
+create-then-reuse, agent/env created once across conversations, the new-turn-only
+send, `history` retrieval, `/items` now 200 (the capability win), delete teardown,
+and the 502 mapping. 161 hermetic pass; ruff clean.
+
+Honesty: the hermetic tests prove woollama's WIRING, not the Managed Agents API
+contract — the bindings come from the claude-api skill docs against
+`anthropic==0.107.1`, so the `@needs_anthropic` live gate
+(`test_managed_agents_conversation_journey_live`) is the only thing that proves
+them real. It is **PAID** and creates persistent account objects, so it is
+written-but-NOT-run-live. Known limit (documented, not solved): the in-memory
+handle table means a restart orphans live (billed) sessions, and each fresh
+process re-creates its per-model agent — the `ant`-YAML / reuse-by-name control
+plane is the eventual fix.

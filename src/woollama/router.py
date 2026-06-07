@@ -23,7 +23,15 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import claude_code, config, conversations, inferencers, recipes, responses
+from . import (
+    claude_code,
+    config,
+    conversations,
+    inferencers,
+    managed_agents,
+    recipes,
+    responses,
+)
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -203,10 +211,11 @@ async def _responses_stateful(body: dict, model: str,
         backend = conversations.backend_for_model(model)
         if backend is None:
             return _error(
-                f"no stateful backend for model '{model}': only claude-code models "
-                "have a state-owning backend (claude-resume) in this build. woollama "
-                "does not store conversations in its own system — use `store:false` "
-                "(the caller owns history) for ollama/recipe/cloud models.",
+                f"no stateful backend for model '{model}': only claude-code "
+                "(claude-resume) and claude-agent (managed-agents) models have a "
+                "state-owning backend in this build. woollama does not store "
+                "conversations in its own system — use `store:false` (the caller "
+                "owns history) for ollama/recipe/cloud models.",
                 "not_implemented", 501)
         conv = conversation_store.create(backend, model)
 
@@ -215,7 +224,7 @@ async def _responses_stateful(body: dict, model: str,
         conv.status = "busy"
         try:
             text = await backend_impl.send_turn(conv, messages)
-        except claude_code.ClaudeCodeError as e:
+        except (claude_code.ClaudeCodeError, managed_agents.ManagedAgentsError) as e:
             conv.status = "idle"
             return _error(f"{conv.backend} backend: {e}", "server_error", 502)
         conv.status = "idle"
@@ -241,10 +250,11 @@ async def conversations_create(request: Request) -> Response:
     backend = body.get("backend") or conversations.backend_for_model(model)
     if backend is None or backend not in conversations.BACKENDS:
         return _error(
-            f"no state-owning backend for model '{model}': only claude-code models "
-            "have one (claude-resume) in this build. woollama does not store "
-            "conversations in its own system — ollama/recipe/cloud models are "
-            "stateless (use `store:false`).", "not_implemented", 501)
+            f"no state-owning backend for model '{model}': only claude-code "
+            "(claude-resume) and claude-agent (managed-agents) models have one in "
+            "this build. woollama does not store conversations in its own system — "
+            "ollama/recipe/cloud models are stateless (use `store:false`).",
+            "not_implemented", 501)
     conv = conversation_store.create(backend, model,
                                      metadata=body.get("metadata") or {},
                                      title=body.get("title"))
@@ -270,10 +280,11 @@ async def conversations_get(conv_id: str) -> Response:
 
 @app.get("/v1/conversations/{conv_id}/items")
 async def conversations_items(conv_id: str) -> Response:
-    """The transcript. The `stored` backend owns its bytes, so woollama serves
-    them directly. For delegated backends (claude-resume) reading the transcript
-    means parsing the backend's own session log — that's the session driver's job
-    (a later slice), so those still 501."""
+    """The transcript. A backend that exposes its event log (managed-agents:
+    Anthropic owns the bytes, woollama RETRIEVES them via `history`) serves items
+    directly. For `claude-resume`, reading the transcript means parsing the
+    backend's own session log — that's the session driver's job (a later slice),
+    so it has no `history` and still 501s."""
     conv = conversation_store.get(conv_id)
     if conv is None:
         return _error(f"unknown conversation '{conv_id}'", "not_found", 404)
@@ -281,8 +292,8 @@ async def conversations_items(conv_id: str) -> Response:
     if not hasattr(backend_impl, "history"):
         return _error(
             f"conversation transcript items are not available for the "
-            f"'{conv.backend}' backend yet — reading a delegated backend's "
-            "transcript is the session driver's job (a later slice).",
+            f"'{conv.backend}' backend yet — reading its transcript is the "
+            "session driver's job (a later slice).",
             "not_implemented", 501)
     data = [responses.item_object(m) for m in await backend_impl.history(conv)]
     return JSONResponse({
