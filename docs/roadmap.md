@@ -109,13 +109,16 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`);
      interactive `requires_action`; cosmic-fabric wiring.
    - [~] **conv-7 — store-only backend for non-claude models** (issue #2):
-     DESIGNED 2026-06-07 (design-doc §10), impl pending cosmic-fabric
-     coordination. Makes `ollama/<model>` (+ recipes) stateful by deferring the
-     transcript to fabric's session store (first of a **pluggable** store-provider
-     seam) and doing assembly + stateless inference woollama-side — woollama never
-     owns bytes. Managed Agents was ruled out (pins inference to Claude); ollama
-     has no native sessions (verified). Blocked on the fabric read/append contract;
-     design-slice-first by decision, to avoid a second conv-5-style revert.
+     woollama-side mechanism IMPLEMENTED 2026-06-07 (design-doc §10) behind an
+     UN-WIRED seam; fabric provider + contract pending. `ConversationStoreProvider`
+     protocol + `StoreBackedBackend` (assemble prior history → stateless inference
+     → append turn) + routing gate + clean error path, hermetically tested
+     (`tests/test_store_backend.py`, 8). No provider ships by default, so non-claude
+     models stay stateless (the `ollama→501` test is the no-regression gate).
+     Managed Agents was ruled out (pins inference to Claude); ollama has no native
+     sessions (verified). Remaining (cross-repo, not guessed): the fabric
+     read/append contract — woollama's `create/get/append/delete` proposal was fed
+     back to cosmic-fabric (#2) — then a thin fabric provider + the wiring.
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
 Smaller follow-ons (not blocking):

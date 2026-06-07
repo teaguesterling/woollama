@@ -19,11 +19,18 @@ Backends (only state-OWNING backends belong here):
   `session_id`. Paid (`ANTHROPIC_API_KEY`); routed for `claude-agent/<model>`.
   The first backend that also serves `history` (Anthropic exposes the event log).
 
-Models with NO state-owning backend (ollama, recipes, cloud providers) have no
-stateful conversation here — they are stateless (`store:false`; the caller owns
-history, exactly as the Anthropic Messages API itself is stateless). A future
-Claude-in-tmux driver would also OWN its state; woollama still just routes
-handles.
+- `store-backed` (conv-7, issue #2): a STORE-ONLY / BYO-inference backend — an
+  external `ConversationStore` provider owns the transcript while woollama does
+  assembly + STATELESS inference (design-doc §3.1, §10). Makes ollama/cloud/recipe
+  models stateful WITHOUT woollama owning bytes. Registered only when a provider
+  is wired in (`register_store_backend`); the first provider is fabric, pending
+  its read/append contract — so none ships by default.
+
+Models with NO state-owning backend registered (ollama, recipes, cloud providers
+when no store provider is wired) have no stateful conversation here — they are
+stateless (`store:false`; the caller owns history, exactly as the Anthropic
+Messages API itself is stateless). A future Claude-in-tmux driver would also OWN
+its state; woollama still just routes handles.
 
 Limitations (documented, not hidden):
 - **In-memory handle table** — `conv_id → claude session_id` mappings are
@@ -41,7 +48,9 @@ import asyncio
 import shutil
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from . import claude_code, managed_agents, responses
 
@@ -207,13 +216,89 @@ class ManagedAgentsBackend:
         conv.status = "dead"
 
 
+class ConversationStoreProvider(Protocol):
+    """**PROVISIONAL contract proposal — issue #2 / design-doc §10; NOT yet agreed
+    with fabric.** A pluggable external owner of conversation transcripts that
+    woollama is a CLIENT to — woollama never holds the bytes. (Distinct from the
+    `ConversationStore` handle table above, which only maps woollama's opaque
+    `conv_id`s to backends — that is routing state, not transcript storage.) The
+    first intended provider is fabric / the cosmic-fabricd session daemon; this
+    `create/get/append/delete` shape is woollama's PROPOSED read/append surface
+    and may change once that cross-repo contract is settled. An MCP
+    conversation-store or a JSONL reader can implement the same Protocol later."""
+
+    async def create(self) -> str: ...
+    async def get(self, thread_id: str) -> list[dict]: ...
+    async def append(self, thread_id: str, messages: list[dict]) -> None: ...
+    async def delete(self, thread_id: str) -> None: ...
+
+
+# Inference callable injected into a StoreBackedBackend: (model, messages) ->
+# assistant text. Injected (not imported) so this module never imports `router`
+# (which owns inferencer routing) — avoids a conversations↔router cycle.
+CompleteFn = Callable[[str, list[dict]], Awaitable[str]]
+
+
+class StoreBackedBackend:
+    """Store-only / BYO-inference backend (design-doc §3.1, §10): an external
+    `ConversationStore` owns the transcript; woollama assembles prior history +
+    the new turn, runs the STATELESS inferencer, and writes the turn back. Makes
+    non-claude models (ollama, cloud, recipes) stateful WITHOUT woollama ever
+    owning the bytes.
+
+    Known seam (#1 ↔ #2): the injected `complete` routes ollama through its /v1
+    endpoint, which IGNORES `num_ctx` — so a store-backed ollama turn does NOT yet
+    honor a requested context size (issue #1's native /api/chat path is
+    passthrough-only). A documented follow-on, not a silent regression."""
+
+    def __init__(self, name: str, store: ConversationStoreProvider, complete: CompleteFn):
+        self.name = name
+        self._store = store
+        self._complete = complete
+
+    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
+        if conv.native_id is None:
+            conv.native_id = await self._store.create()    # store mints the thread
+        prior = await self._store.get(conv.native_id)      # bytes owned by the store
+        answer = await self._complete(conv.model, prior + messages)
+        await self._store.append(                          # write the turn back
+            conv.native_id, list(messages) + [{"role": "assistant", "content": answer}])
+        return answer
+
+    async def history(self, conv: Conversation) -> list[dict]:
+        if conv.native_id is None:
+            return []
+        return await self._store.get(conv.native_id)
+
+    async def delete(self, conv: Conversation) -> None:
+        if conv.native_id:
+            await self._store.delete(conv.native_id)
+        conv.status = "dead"
+
+
 # Backend registry, keyed by the name stored on a Conversation. ONLY backends
-# that own their conversation state belong here — woollama routes handles to
-# them, it never owns conversation state itself.
+# that own (or defer to an external owner of) their conversation state belong
+# here — woollama routes handles to them, it never owns conversation state itself.
 BACKENDS: dict[str, object] = {
     ClaudeResumeBackend.name: ClaudeResumeBackend(),
     ManagedAgentsBackend.name: ManagedAgentsBackend(),
 }
+
+# Name under which a store-backed backend registers, IF a conversation-store
+# provider is wired in (register_store_backend). None ships by default — the
+# fabric provider contract (§10.2) is pending — so non-claude models stay
+# stateless until then.
+STORE_BACKEND_NAME = "store-backed"
+
+
+def register_store_backend(store: ConversationStoreProvider, complete: CompleteFn,
+                           *, name: str = STORE_BACKEND_NAME) -> None:
+    """Wire a `ConversationStoreProvider` in as the state owner for non-claude
+    models (so `/v1/responses` + `/v1/conversations` become stateful for them).
+    Until called, those models are STATELESS (`backend_for_model` → None) — no
+    provider ships by default. The router passes `complete_stateless` as the
+    inference fn."""
+    BACKENDS[name] = StoreBackedBackend(name, store, complete)
 
 
 def backend_for_model(model: str) -> str | None:
@@ -230,4 +315,9 @@ def backend_for_model(model: str) -> str | None:
         return ClaudeResumeBackend.name
     if provider == "claude-agent":
         return ManagedAgentsBackend.name
+    # Any other model (ollama, cloud, recipe) is stateful ONLY when a
+    # conversation-store provider has been registered (§10); else stateless —
+    # woollama owns no store of its own.
+    if STORE_BACKEND_NAME in BACKENDS:
+        return STORE_BACKEND_NAME
     return None

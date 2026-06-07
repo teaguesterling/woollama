@@ -751,3 +751,38 @@ fabric as first provider, MCP-store / JSONL as future pluggable providers).
 
 Status: impl BLOCKED pending the fabric read/append contract (cosmic-fabric side).
 Tracked as issue #2 / roadmap conv-7. No src/test changes this slice.
+
+## issue #2 — store-backed backend mechanism (2026-06-07, same day as the design)
+
+Built the woollama-SIDE half of #2 behind an un-wired seam — the part that's
+codeable without the cross-repo contract. `conversations.py` gains:
+`ConversationStoreProvider` (a Protocol — the PROVISIONAL `create/get/append/
+delete` contract woollama proposes to fabric; named to avoid clashing with the
+`ConversationStore` handle table, which is routing state, not bytes);
+`StoreBackedBackend` (store-only / BYO-inference: `native_id = store.create()` →
+assemble `store.get(...) + new turn` → STATELESS inference → `store.append(...)`;
+`history` serves `/items` for free); `register_store_backend(provider, complete)`
++ a `backend_for_model` gate that routes non-claude models to it ONLY when a
+provider is registered. The inference fn is INJECTED (router passes
+`complete_stateless`) so conversations never imports router.
+
+Error path (advisor-caught, the happy-path fake wouldn't surface it):
+`complete_stateless` raises `OrchestrationError`, which `_responses_stateful`
+didn't catch (only `ClaudeCodeError`/`ManagedAgentsError`) → a store inference
+failure would 500. Added an `OrchestrationError` arm there that surfaces
+`payload`/`status` like the stateless branch. Tested with a completer that raises.
+
+Known seam (#1 ↔ #2, documented not fixed): `complete_stateless` sends ollama via
+/v1, so a store-backed ollama turn does NOT honor `num_ctx` yet — issue #1's
+native path is passthrough-only.
+
+Default behavior UNCHANGED: no provider ships, so `backend_for_model("ollama/…")`
+→ None and non-claude `store:true` still 501s (the no-regression gate, still
+green). Tests: `tests/test_store_backend.py` (8) over an in-memory fake provider —
+assemble/complete/append, cross-turn recall via reassembly, `/items`, delete, the
+routing gate, register(), and the clean-error path. 180 hermetic pass; ruff clean.
+
+Framing (per the chosen design→confirm→implement plan): the protocol is a VISIBLE
+proposal, not a settled contract — fed back to cosmic-fabric on issue #2 as the
+"confirm" step. #2 stays open: the fabric provider + the agreed contract + the
+cosmic-fabric wiring remain.

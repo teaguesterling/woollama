@@ -331,15 +331,18 @@ plain terminal before building the claude-tmux backend:
    agent_toolset session that proves the handle-routing + retrieve-transcript +
    requires_action path end-to-end.
 
-8. **Store-only backend for non-claude models (issue #2)** — **DESIGNED
-   2026-06-07; impl pending cosmic-fabric coordination.** The first BYO-inference
-   backend (§3.1, §10): makes `ollama/<model>` (and recipes) stateful by deferring
-   the transcript to fabric's session store (the first pluggable store provider)
-   and doing assembly + stateless inference woollama-side. Decision: **defer to
-   fabric / the cosmic-fabricd session daemon now, behind a provider-agnostic
-   store seam** so an MCP conversation-store or a JSONL reader can drop in later.
-   Approach is *design-slice-first* (this section) to avoid a second wrong-guess
-   revert on the no-store principle. See §10 for the full design.
+8. **Store-only backend for non-claude models (issue #2)** — **woollama-side
+   mechanism IMPLEMENTED 2026-06-07 behind an un-wired seam; fabric provider +
+   contract pending.** The first BYO-inference backend (§3.1, §10): makes
+   `ollama/<model>` (and recipes) stateful by deferring the transcript to an
+   external store provider and doing assembly + stateless inference woollama-side.
+   `ConversationStoreProvider` protocol + `StoreBackedBackend` + routing gate +
+   clean error path shipped and tested; no provider ships by default (non-claude
+   models stay stateless). Decision: **defer to fabric / the cosmic-fabricd
+   session daemon, behind a provider-agnostic store seam** so an MCP
+   conversation-store or a JSONL reader can drop in later. The protocol shape is a
+   *provisional proposal* fed back to cosmic-fabric (issue #2), not a settled
+   contract. See §10.
 
 ## 9. Risk flags
 
@@ -376,48 +379,65 @@ cosmic-fabricd session daemon** (where these sessions' bytes already live), behi
 a **provider-agnostic conversation-store seam** so the choice of owner is
 pluggable. woollama stays a router/client to the store; it never holds bytes.
 
-### 10.1 The store-provider seam
+### 10.1 The store-provider seam — IMPLEMENTED (woollama side)
 
 A small protocol woollama is a *client* to (mirrors how claude-resume is a client
-to Claude's JSONL and managed-agents to Anthropic's session API):
+to Claude's JSONL and managed-agents to Anthropic's session API). Implemented as
+`conversations.ConversationStoreProvider` (named to avoid clashing with the
+`ConversationStore` handle table, which is routing state, not transcript bytes):
 
 ```
-ConversationStore (provider):
+ConversationStoreProvider:                        # PROVISIONAL contract (see 10.2)
     create()                  -> thread_id        # owner mints the thread
     get(thread_id)            -> [messages]       # the transcript (woollama RETRIEVES)
     append(thread_id, turn)   -> None             # user + assistant messages of one turn
     delete(thread_id)         -> None
 ```
 
-A **store-only `ConversationBackend`** (§3.1) composes a store provider with a
-stateless inferencer:
+The store-only `StoreBackedBackend` (§3.1) composes a provider with a stateless
+inferencer (injected as `complete`, not imported, to avoid a conversations↔router
+cycle — the router passes `complete_stateless`):
 
 ```
 send_turn(conv, input):
-    prior   = store.get(conv.native_id)           # bytes owned by the provider
-    msgs    = prior + [input]                      # ASSEMBLY (woollama)
-    answer  = inferencer.complete(conv.model, msgs)# stateless ollama call (num_ctx honored)
-    store.append(conv.native_id, [input, answer])  # write back to the owner
+    if conv.native_id is None: conv.native_id = store.create()
+    prior   = store.get(conv.native_id)            # bytes owned by the provider
+    answer  = complete(conv.model, prior + input)  # stateless inference (woollama ASSEMBLY)
+    store.append(conv.native_id, input + [answer]) # write the turn back
     return answer
-history(conv): return store.get(conv.native_id)   # /items works for free
+history(conv): return store.get(conv.native_id)    # /items works for free
 ```
 
-`native_id` = the provider's thread key (a fabric `sessionName`). `create()` maps
-a woollama `conv_id` → a provider thread. One writer per conversation (existing
-per-conv lock). This reuses conv-6's handle-table scaffolding verbatim — only the
-owner of the bytes differs.
+`native_id` = the provider's thread key (a fabric `sessionName`). One writer per
+conversation (existing per-conv lock). Reuses conv-6's handle-table scaffolding
+verbatim — only the owner of the bytes differs. Routing: `backend_for_model`
+returns the store backend for any non-claude model **iff** a provider has been
+wired in via `register_store_backend` — none ships by default, so non-claude
+models stay stateless until a provider exists (the existing `ollama→501` test is
+the no-regression gate). Hermetically tested with an in-memory fake provider
+(`tests/test_store_backend.py`): assemble→complete→append, cross-turn recall via
+reassembly, `/items`, delete, the routing gate, and that an inference failure
+surfaces cleanly (not a 500).
 
-### 10.2 First provider: fabric / cosmic-fabricd
+**Known seam (#1 ↔ #2):** the injected `complete_stateless` routes ollama through
+its `/v1` endpoint, which ignores `num_ctx` — so a store-backed ollama turn does
+NOT yet honor a requested context size (issue #1's native `/api/chat` path is
+passthrough-only). Documented follow-on.
 
-`backend_for_model("ollama/<model>")` → a `fabric-session` backend whose store
-provider is the fabric/daemon session API. **Coordination needed (cosmic-fabric
-side):** fabric must expose, to woollama, a session **read** (transcript by
-`sessionName`) and **append** (one turn) — today fabric owns `sessionName`
-sessions but the read/append surface woollama would consume needs to be agreed
-(transport: the same owner-only UDS woollama already serves on, or a fabric-side
-endpoint woollama calls). cosmic-fabric then maps a cosmic session name → a
-woollama `conversation_id` and drives turns via `/v1/responses`
-(`store:true`/`conversation`).
+### 10.2 First provider: fabric / cosmic-fabricd — PENDING (the contract proposal)
+
+The woollama-side mechanism (10.1) is done; what remains is a concrete
+`ConversationStoreProvider` for fabric. The `create/get/append/delete` shape above
+is woollama's **proposed read/append contract** — fabric hasn't agreed it yet.
+**Coordination needed (cosmic-fabric side):** fabric must expose, to woollama, a
+session **read** (transcript by `sessionName`) and **append** (one turn) mapping
+onto that Protocol — today fabric owns `sessionName` sessions but this consume
+surface needs agreeing (transport: the owner-only UDS woollama already serves on,
+or a fabric endpoint woollama calls). Once agreed, the provider is a thin adapter
++ a `register_store_backend(provider, complete_stateless)` call at startup; then
+cosmic-fabric maps a cosmic session name → a woollama `conversation_id` and drives
+turns via `/v1/responses` (`store:true`/`conversation`). The proposal has been
+fed back to cosmic-fabric (issue #2) as the "confirm" step.
 
 ### 10.3 Future providers (pluggable, not now)
 
@@ -429,8 +449,13 @@ woollama `conversation_id` and drives turns via `/v1/responses`
 
 ### 10.4 Scope / status
 
-Design slice only (per the chosen approach). **Not codeable to completion today**
-— it's entangled with the last v1.0 gate (cosmic-fabric consuming the surface)
-and needs the fabric read/append contract agreed first. Deliberately deferred so
-we don't repeat the conv-5 revert by guessing the owner. Tracked as issue #2;
-build-sequence item §8.8.
+**Woollama-side mechanism IMPLEMENTED + hermetically tested (2026-06-07), behind
+an un-wired seam.** The protocol, the `StoreBackedBackend`, the routing gate, and
+the clean error path all exist and pass; no provider ships, so runtime behavior is
+unchanged (non-claude models stay stateless). What remains is cross-repo and
+deliberately not guessed: (1) **the contract** — the `create/get/append/delete`
+shape is woollama's *proposal* to fabric, not an agreed contract; (2) **the fabric
+provider** — a thin adapter once that's settled; (3) **cosmic-fabric wiring**
+(part of the last v1.0 gate). This stages #2 as a *visible proposal that invites
+correction* rather than a silent guess baked into a hard-to-revert backend.
+Tracked as issue #2 / roadmap conv-7; build-sequence item §8.8.

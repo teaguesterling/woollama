@@ -229,6 +229,14 @@ async def _responses_stateful(body: dict, model: str,
         except (claude_code.ClaudeCodeError, managed_agents.ManagedAgentsError) as e:
             conv.status = "idle"
             return _error(f"{conv.backend} backend: {e}", "server_error", 502)
+        except OrchestrationError as e:
+            # A store-backed backend runs inference via complete_stateless, which
+            # raises OrchestrationError (bad model, inferencer down, recipe error).
+            # Surface it cleanly instead of letting it 500.
+            conv.status = "idle"
+            if e.payload is not None:
+                return JSONResponse(e.payload, status_code=e.status)
+            return _error(e.message, e.kind, e.status)
         conv.status = "idle"
 
     resp_id = responses.new_id("resp")
