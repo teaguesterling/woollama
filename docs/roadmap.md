@@ -142,6 +142,11 @@ Smaller follow-ons (not blocking):
   attempt is refused (Bash is absent, not merely denied). Because `--tools ""`
   strips the harness, the live gate now runs trustworthily even nested:
   `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k delegation`
+  The **adversarial safety pass** (the executor's flagged prerequisite) is also
+  done — review fixed a provider-key env leak (child env is now an allow-list), a
+  host-settings undercut (`--setting-sources project`), and a tool-name comma
+  injection; SQL/argv/JSON-injection + path surfaces verified safe; same-server
+  sibling-tool denial now has a live test. See docs/build-log.md (2026-06-06).
 - **Anthropic (and other cloud) live round-trips** (slices j/k): routing/auth
   is unit-tested on the emit side + doc-confirmed (tools supported); the live
   round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:

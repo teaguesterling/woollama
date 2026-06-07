@@ -31,17 +31,24 @@ carries ``LSP``, the one tool ``--tools ""`` leaves — ``--bare`` would drop it
 too but ``--bare`` breaks subscription auth). Because ``--tools ""`` also
 disables the built-in ToolSearch that surfaces *deferred* MCP tools,
 ``_child_env`` sets ``ENABLE_TOOL_SEARCH=false`` so the recipe's MCP tools load
-UPFRONT. We also run in a neutral temp cwd and strip the child env (no
-``ANTHROPIC_API_KEY`` / ``CLAUDE_CODE*`` leak).
+UPFRONT. We run in a neutral temp cwd, ALLOW-LIST the child env (``_child_env``:
+operational vars only — no provider keys / secrets / parent-harness vars reach
+``claude`` or the MCP servers it spawns), and pass ``--setting-sources project``
+so the child does NOT inherit the host's ``~/.claude`` settings — a stray
+``permissions.allow`` rule there could otherwise auto-approve a tool and slip
+past ``dontAsk``.
 
 For tool-less mode ``--strict-mcp-config`` loads ZERO MCP servers, so the child
 has no tools at all. For delegation we write a per-recipe ``--mcp-config`` with
 ONLY the servers the allow-list references and pass ``--allowedTools`` listing
-ONLY those tools — so the child has EXACTLY the recipe's MCP tools and nothing
-else (config containment AND the MCP allow-list AND the empty built-in set).
-Delegation only ADDS the recipe's MCP tools. Opt-in live tests
-(tests/test_integration.py, ``@needs_claude_code``) verify a delegated tool runs
-and a shell-exec attempt is refused.
+ONLY those tools (recipe tool names are validated — no commas/whitespace — so a
+name can't inject a second allow-list entry). The child has EXACTLY the recipe's
+MCP tools and nothing else (config containment AND the MCP allow-list AND the
+empty built-in set AND no inherited host settings). Note: a referenced server's
+NON-allow-listed sibling tools still load (``--mcp-config`` is per-server), but
+``dontAsk`` denies them at call time. Opt-in live tests (tests/test_integration.py,
+``@needs_claude_code``) verify a delegated tool runs, a shell-exec attempt is
+refused, and a same-server sibling tool is denied.
 """
 from __future__ import annotations
 
@@ -76,21 +83,31 @@ class ClaudeCodeError(RuntimeError):
     result, a timeout, or unparseable output."""
 
 
-def _child_env() -> dict:
-    """Environment for the ``claude`` child process. Strips:
+# Environment passed to the `claude` child is an ALLOW-LIST, not a deny-list.
+# woollama is a key-custody router: it must NOT hand the user's provider keys
+# (OPENAI_API_KEY, GROQ_API_KEY, TOGETHER_API_KEY, OPENROUTER_API_KEY, any
+# `api_key_env` from inferencers.toml — see inferencers.py) to the `claude`
+# subprocess OR to the MCP servers `claude` launches. A deny-list of a few known
+# keys (the old approach) silently leaks every key not on it. We pass ONLY the
+# operational vars claude needs to run + authenticate — subscription auth lives
+# under $HOME/.claude, so HOME is the load-bearing one. Deliberately omitted:
+# ANTHROPIC_API_KEY (force subscription, not API billing), the CLAUDE_CODE*/
+# CLAUDECODE parent-harness vars, and every secret. Verified live: a completion
+# authenticates with just this set (and `--setting-sources project` — see the arg
+# builders). `LC_*` and proxy vars pass through (operational, not secret).
+_CHILD_ENV_ALLOW = frozenset({
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "TMPDIR",
+    "LANG", "LANGUAGE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+})
 
-    * ``ANTHROPIC_API_KEY`` — force subscription/OAuth auth (the keyless point);
-      a key in the child would silently switch Claude Code to API billing.
-    * ``CLAUDECODE`` / ``CLAUDE_CODE_*`` — the parent harness vars. When woollama
-      itself runs INSIDE a Claude Code session, leaving these set leaks the
-      parent harness into the child (its meta-tools / nested deferred-tool mode —
-      observed contaminating the delegation spike). Stripping them gives a clean
-      child regardless of where woollama runs.
-    """
+
+def _child_env() -> dict:
+    """Allow-listed environment for the ``claude`` child (see _CHILD_ENV_ALLOW):
+    operational vars only, no provider keys / secrets / parent-harness vars."""
     env = {k: v for k, v in os.environ.items()
-           if k != "ANTHROPIC_API_KEY"
-           and k != "CLAUDECODE"
-           and not k.startswith("CLAUDE_CODE")}
+           if k in _CHILD_ENV_ALLOW or k.startswith("LC_")}
     # `--tools ""` disables the built-in ToolSearch, which is how Claude Code
     # discovers DEFERRED MCP tools by default. Disable deferred search so the
     # recipe's MCP tools (delegation) load UPFRONT and stay reachable; harmless
@@ -102,7 +119,16 @@ def _child_env() -> dict:
 def _mcp_tool_name(namespaced: str) -> str:
     """Map a recipe's ``<server>.<tool>`` to the id Claude Code exposes for a
     tool from a ``--mcp-config`` server: ``mcp__<server>__<tool>`` (the clean,
-    no-dot naming verified in the delegation spike)."""
+    no-dot naming verified in the delegation spike).
+
+    Rejects a name containing a comma or whitespace: ``--allowedTools`` is a
+    comma-joined string, so a name like ``count_to,mcp__hello__hello`` would
+    inject a SECOND allow-list entry (a same-server sibling), widening the grant
+    beyond the recipe. Defense-in-depth — the router validates first."""
+    if "," in namespaced or any(ch.isspace() for ch in namespaced):
+        raise ValueError(
+            f"invalid tool name in recipe allow-list: {namespaced!r} "
+            "(commas/whitespace are not allowed)")
     server, _, tool = namespaced.partition(".")
     return f"mcp__{server}__{tool}"
 
@@ -159,6 +185,7 @@ def _build_args(prompt: str, system: str, model: str,
             "--output-format", "json",
             "--max-turns", "1",
             "--strict-mcp-config",                 # zero MCP servers
+            "--setting-sources", "project",        # don't inherit host ~/.claude settings
             "--permission-mode", "dontAsk",        # non-interactive (no hang)
             "--tools", "",                         # NO built-in tools (allow-list of none)
             "--disallowedTools", _DENY_TOOLS]      # defense-in-depth (+ LSP)
@@ -259,6 +286,7 @@ def _build_delegate_args(prompt: str, system: str, model: str,
             "--max-turns", str(max_turns),
             "--mcp-config", mcp_config_path,
             "--strict-mcp-config",                 # ONLY the config we write loads
+            "--setting-sources", "project",        # don't inherit host ~/.claude permissions.allow
             "--permission-mode", "dontAsk",        # hard-denies anything not allow-listed
             "--tools", "",                         # NO built-in tools (allow-list of none)
             "--disallowedTools", _DENY_TOOLS,      # defense-in-depth (+ LSP)

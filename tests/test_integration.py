@@ -551,6 +551,54 @@ async def test_claude_code_delegation_runs_tool_and_keeps_boundary(tmp_path, mon
         "delegation executed a shell command — the built-in lockdown FAILED"
 
 
+@needs_claude_code
+async def test_claude_code_delegation_denies_same_server_sibling(tmp_path, monkeypatch):
+    """The security review's top residual risk: a recipe allows ONE tool from a
+    server, but `--mcp-config` loads the WHOLE server, so the un-allow-listed
+    siblings are present. The only barrier is `--allowedTools` + `dontAsk` (plus
+    `--setting-sources project` so a host `permissions.allow` can't undercut it).
+    Build the REAL hardened invocation, ask Claude to call the sibling, and assert
+    at the EVENT level that it NEVER executes successfully (denied)."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+
+    from woollama import claude_code, recipes, router
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+    rec = recipes.get("cc-counter")                         # allows only hello.count_to
+    servers = router._delegate_mcp_servers(rec["tools"])
+    allowed = [claude_code._mcp_tool_name(t) for t in rec["tools"]]
+    env = claude_code._child_env()
+    with _tempfile.TemporaryDirectory() as cwd:
+        cfg = _os.path.join(cwd, "delegate-mcp.json")
+        with open(cfg, "w") as f:
+            _json.dump({"mcpServers": servers}, f)
+        args = claude_code._build_delegate_args(
+            "Call the mcp__hello__hello tool with name 'pwned' and report its output.",
+            rec["system"], "haiku", cfg, allowed, 4)
+        _, out, _ = await claude_code._invoke(args, env, cwd, 180)
+    events = _json.loads(out.decode("utf-8", "replace"))
+    events = events if isinstance(events, list) else [events]
+
+    # Map tool_use id -> name; collect ids that got a NON-error tool_result.
+    names, ran_ok = {}, set()
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "assistant":
+            for b in e.get("message", {}).get("content", []):
+                if b.get("type") == "tool_use":
+                    names[b.get("id")] = b.get("name")
+        elif e.get("type") == "user":
+            for b in e.get("message", {}).get("content", []):
+                if b.get("type") == "tool_result" and not b.get("is_error"):
+                    ran_ok.add(b.get("tool_use_id"))
+    succeeded = {names.get(i) for i in ran_ok}
+    assert "mcp__hello__hello" not in succeeded, \
+        "un-allow-listed sibling tool EXECUTED — delegation allow-list FAILED"
+
+
 # ---------------------------------------------------------------------------
 # Anthropic via the OpenAI-compat inferencer seam (opt-in: ANTHROPIC_API_KEY)
 # ---------------------------------------------------------------------------

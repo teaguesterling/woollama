@@ -70,6 +70,9 @@ async def test_builds_tool_less_locked_down_command(monkeypatch):
     assert args[args.index("--permission-mode") + 1] == "dontAsk"
     # PRIMARY lockdown: an allow-list of built-in tools set to NONE.
     assert args[args.index("--tools") + 1] == ""
+    # don't inherit the host's ~/.claude settings (a stray permissions.allow there
+    # could auto-approve a tool past dontAsk).
+    assert args[args.index("--setting-sources") + 1] == "project"
     deny = args[args.index("--disallowedTools") + 1]
     # defense-in-depth deny-list still covers the dangerous built-ins + LSP.
     assert "Bash" in deny and "Read" in deny and "WebFetch" in deny and "LSP" in deny
@@ -79,14 +82,23 @@ async def test_builds_tool_less_locked_down_command(monkeypatch):
     assert args[args.index("--output-format") + 1] == "json"
 
 
-async def test_strips_anthropic_api_key_to_force_subscription(monkeypatch):
+async def test_child_env_is_allowlist_not_denylist(monkeypatch):
+    """The child env is ALLOW-LISTED: no provider keys / secrets reach the claude
+    subprocess (or the MCP servers it spawns), but operational vars (HOME/PATH)
+    do. ANTHROPIC_API_KEY is omitted to force subscription auth."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-should-not-leak")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-should-not-leak")
+    monkeypatch.setenv("SOME_SECRET_TOKEN", "nope")
     captured = _patch_invoke(monkeypatch, out=_result_array())
 
     await claude_code.run_completion("sys", [{"role": "user", "content": "hi"}], "haiku")
 
-    assert "ANTHROPIC_API_KEY" not in captured["env"], \
-        "API key must be stripped so Claude Code uses subscription auth"
+    env = captured["env"]
+    for leaked in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY",
+                   "SOME_SECRET_TOKEN"):
+        assert leaked not in env, f"{leaked} must NOT reach the claude child"
+    assert "HOME" in env and "PATH" in env, "operational vars must pass through"
 
 
 async def test_omits_system_and_model_when_empty(monkeypatch):
@@ -169,6 +181,14 @@ def test_mcp_tool_name_maps_dotted_to_double_underscore():
     assert claude_code._mcp_tool_name("hello.count_to") == "mcp__hello__count_to"
 
 
+def test_mcp_tool_name_rejects_comma_injection():
+    """A tool name with a comma would inject a 2nd --allowedTools entry."""
+    with pytest.raises(ValueError, match="invalid tool name"):
+        claude_code._mcp_tool_name("count_to,mcp__hello__hello")
+    with pytest.raises(ValueError, match="invalid tool name"):
+        claude_code._mcp_tool_name("count to")
+
+
 async def test_delegation_builds_contained_command(monkeypatch):
     captured = _patch_invoke_deleg(monkeypatch)
     resp = await claude_code.run_delegated(
@@ -184,6 +204,7 @@ async def test_delegation_builds_contained_command(monkeypatch):
     assert "--strict-mcp-config" in args
     assert args[args.index("--permission-mode") + 1] == "dontAsk"
     assert args[args.index("--tools") + 1] == ""        # no built-in tools at all
+    assert args[args.index("--setting-sources") + 1] == "project"   # no host settings
     assert "Bash" in args[args.index("--disallowedTools") + 1]
     # the --mcp-config contains ONLY the referenced server.
     assert captured["mcp_config"] == {
@@ -215,6 +236,7 @@ async def test_delegation_strips_harness_and_key_env(monkeypatch):
     parent-harness leak (CLAUDECODE / CLAUDE_CODE_*) — the nested-contamination
     fix the spike surfaced."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-leak")
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-sess")
     captured = _patch_invoke_deleg(monkeypatch)
@@ -223,7 +245,7 @@ async def test_delegation_strips_harness_and_key_env(monkeypatch):
         allowed_tools=["hello.count_to"],
         mcp_servers={"hello": {"command": "h", "args": []}})
     env = captured["env"]
-    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env and "OPENAI_API_KEY" not in env
     assert "CLAUDECODE" not in env and "CLAUDE_CODE_SESSION_ID" not in env
 
 

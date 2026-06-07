@@ -420,6 +420,12 @@ def _delegate_mcp_servers(tools: list[str]) -> dict[str, dict]:
     available = config.load_mcp_servers()
     servers: dict[str, dict] = {}
     for t in tools:
+        # A comma/whitespace in a tool name would inject extra entries into the
+        # comma-joined --allowedTools (a same-server sibling grant). Reject it.
+        if "," in t or any(ch.isspace() for ch in t):
+            raise OrchestrationError(
+                f"invalid tool name in recipe allow-list: {t!r} "
+                "(commas/whitespace are not allowed)", "invalid_request_error", 400)
         server = t.split(".", 1)[0]
         if server not in available:
             raise OrchestrationError(

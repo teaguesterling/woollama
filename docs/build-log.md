@@ -571,3 +571,41 @@ Verified at the event level through woollama's real `_build_delegate_args` +
 the delegated tool runs, and a shell-exec attempt is refused (Bash absent). Because
 the harness tools are now stripped, the delegation + tool-less live gates pass
 trustworthily even nested. 154 hermetic pass; ruff clean.
+
+## Follow-on slice — executor adversarial safety pass (2026-06-06)
+
+The "adversarial safety pass" the executor was always flagged as needing. A
+focused security review of the delegation path + lockdown + stored store (with
+each finding verified against the code, not speculated) found three real issues,
+now fixed:
+
+- **HIGH — provider keys leaked to the child.** `_child_env` was a DENY-LIST of 3
+  vars, so `OPENAI_API_KEY`/`GROQ_API_KEY`/`TOGETHER_API_KEY`/`OPENROUTER_API_KEY`
+  (and any `inferencers.toml` `api_key_env`) flowed into the `claude` child AND
+  the MCP servers it spawns. A key-custody router must not do that. Fixed:
+  `_child_env` is now an ALLOW-LIST (`_CHILD_ENV_ALLOW`: HOME/PATH/locale/proxy/
+  TERM/… only) — no provider keys/secrets reach the child. Verified live that
+  subscription auth still works with just that set (HOME carries `~/.claude`).
+- **MEDIUM — host settings could undercut the sibling boundary.** The child read
+  the host's `~/.claude/settings.json`; a `permissions.allow: mcp__*` rule there
+  would auto-approve a tool and slip past `dontAsk`. Fixed: `--setting-sources
+  project` on both arg builders (neutral temp cwd → loads no settings). Verified
+  auth survives it.
+- **MEDIUM — comma in a recipe tool name injected an extra `--allowedTools`
+  entry** (a same-server sibling grant, e.g. `count_to,mcp__hello__hello`). Fixed:
+  reject commas/whitespace in tool names — at the router (`_delegate_mcp_servers`
+  → 400) and defensively in `_mcp_tool_name` (ValueError).
+
+Verified SAFE (checked, hold up): no SQL injection (all duckdb queries
+parameterized), no `--mcp-config` JSON injection (`json.dump` + server-name
+validated against config), no argv/shell injection (`create_subprocess_exec` list
+form), no tempdir/path traversal (random `TemporaryDirectory`/`mkdtemp`), turn +
+timeout bounds present. Accepted LOW / out-of-scope: `--tools ""` empty-string
+semantics are CLI-version-coupled (deny-list `_DENY_TOOLS` is the backstop);
+conversations have no per-caller ownership (mitigated by 122-bit unguessable
+`uuid4` ids; woollama is local single-user).
+
+New: a live **sibling-denial** test (`test_claude_code_delegation_denies_same_
+server_sibling`) — the review's top previously-untested risk — asserts at the
+event level that an un-allow-listed same-server tool never executes. 156 hermetic
+pass; ruff clean; all three `@needs_claude_code` live gates green.

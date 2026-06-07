@@ -395,6 +395,21 @@ async def test_claude_code_delegation_missing_server_is_400(monkeypatch, tmp_pat
     assert "not configured" in json.loads(resp.body)["error"]["message"]
 
 
+async def test_claude_code_delegation_rejects_comma_in_tool_name(monkeypatch, tmp_path):
+    """A recipe tool name with a comma would inject an extra --allowedTools entry
+    (a same-server sibling grant) — rejected at routing with a 400."""
+    (tmp_path / "recipes.toml").write_text(
+        '[recipes.inj]\ninferencer="claude-code/haiku"\n'
+        'tools=["hello.count_to,mcp__hello__hello"]\nsystem="x"\n')
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    recipes.reload()
+
+    resp = await router.chat_completions(FakeRequest({
+        "model": "woollama/inj", "messages": [{"role": "user", "content": "x"}]}))
+    assert resp.status_code == 400
+    assert "invalid tool name" in json.loads(resp.body)["error"]["message"]
+
+
 async def test_reject_tool_outside_recipe_allowlist(monkeypatch, tmp_path):
     """THE boundary test: a recipe scoped to hello.count_to must NOT be able to
     reach textops.word_count even though that session is connected. The model
