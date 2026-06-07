@@ -34,9 +34,11 @@ status is `docs/roadmap.md`.
   AND as an **executor** (tool delegation): a `claude-code` recipe with tools
   lets Claude own the agentic loop and call the recipe's allow-listed MCP tools
   itself, contained by a per-recipe `--mcp-config` + `--allowedTools`.
-- **Conversation backends**: `claude-resume` (`claude --resume`) and a
-  server-owned duckdb `stored` backend (transcript replay) for models with no
-  native session; stored handles rehydrate from duckdb at startup.
+- **Conversation backend**: `claude-resume` (`claude --resume`) — the native
+  Claude session owns the bytes; woollama holds only the handle. Models with no
+  state-owning backend are stateless (`store:false`). (A duckdb `stored` backend
+  was briefly added and reverted — woollama does not store conversations in its
+  own system; it routes handles to backends that own the state.)
 
 ### Platform
 

@@ -4,43 +4,39 @@ The principle (docs/conversations-api-design.md): **woollama routes conversation
 *handles*; the backends own the *state*.** This module is that thin routing
 layer — an in-memory handle table mapping woollama's opaque `conv_<hex>` ids to
 the backend that owns the bytes plus that backend's native id, and the backend
-adapters themselves. woollama never stores the conversation transcript.
+adapters themselves. **woollama never stores the conversation transcript in its
+own system.** It proxies/retrieves a backend's transcript; when no backend owns
+the state, the turn is stateless (the caller owns history) — woollama does not
+fabricate a store of its own.
 
-Backends:
+Backends (only state-OWNING backends belong here):
 - `claude-resume` (conv-1b): `claude --resume <sid> -p`, the non-interactive
-  path — verified not to hang nested. The native Claude session owns the bytes;
-  woollama holds only the handle → session_id mapping.
-- `stored` (conv-5): for models with NO native session (ollama, recipes, cloud
-  providers), woollama itself owns the conversation — it persists the visible
-  transcript in a local duckdb file (`StoredStore`) and replays it as context
-  each turn. The one place woollama legitimately stores conversation bytes
-  (there's no backend underneath to defer to).
+  path — verified not to hang nested. The native Claude session owns the bytes
+  (in `~/.claude`); woollama holds only the handle → session_id mapping.
+
+Models with NO state-owning backend (ollama, recipes, cloud providers) have no
+stateful conversation here — they are stateless (`store:false`; the caller owns
+history, exactly as the Anthropic Messages API itself is stateless). Future
+state-owning backends — a Claude-in-tmux driver, and Anthropic Managed Agents
+(see the design doc) — also OWN their state; woollama still just routes handles.
 
 Limitations (documented, not hidden):
-- **Handle table is in-memory; truth for `stored` is duckdb.** `claude-resume`
-  mappings (`conv_id → claude session_id`) are process-lifetime — a restart
-  loses them. `stored` conversations survive a restart (rehydrated from duckdb
-  into the in-memory working set at startup); `response_ids` are NOT persisted,
-  so `previous_response_id` chaining is within-process only — attach-by-
-  `conversation` is the durable path.
+- **In-memory handle table** — `conv_id → claude session_id` mappings are
+  process-lifetime; a restart loses them. The backend's own transcript on disk
+  (`~/.claude`) is intact, but woollama's handle→sid map is gone.
 - **Chaining, not forking** — `claude --resume` continues from the session TIP
   and reports the SAME session_id, so `previous_response_id` attaches to a
   conversation and continues it; claude has no fork-from-earlier-turn primitive.
 - **One writer per conversation** — turns on a given conversation serialize on a
-  per-conversation lock (the backend session is single-threaded). The `stored`
-  backend additionally serializes all duckdb access on a single connection lock.
+  per-conversation lock (the backend session is single-threaded).
 """
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
-
-import duckdb
 
 from . import claude_code, responses
 
@@ -87,13 +83,6 @@ class ConversationStore:
 
     def list(self) -> list[Conversation]:
         return list(self._convs.values())
-
-    def add(self, conv: Conversation) -> None:
-        """Insert a fully-formed handle (e.g. one rehydrated from the `stored`
-        backend at startup). Restores its response_id back-references too."""
-        self._convs[conv.id] = conv
-        for rid in conv.response_ids:
-            self._resp_to_conv[rid] = conv.id
 
     def by_response(self, response_id: str) -> Conversation | None:
         cid = self._resp_to_conv.get(response_id)
@@ -147,189 +136,20 @@ class ClaudeResumeBackend:
         conv.status = "dead"
 
 
-# --- the `stored` backend: server-owned conversations (conv-5) ---------------
-#
-# For models with no native session of their own (ollama, recipes, cloud
-# providers), woollama IS the conversation's home: it persists the visible
-# transcript in a local duckdb file and REPLAYS it as context on each turn
-# (`complete_stateless(model, history + new)`). This is the one place woollama
-# legitimately owns conversation bytes — there's no backend underneath to defer
-# to. Only the visible turns are stored (the caller's messages + each assistant
-# final answer); recipe tool-call internals stay hidden, exactly as
-# `complete_stateless` already returns only the final text.
+# Backend registry, keyed by the name stored on a Conversation. ONLY backends
+# that own their conversation state belong here — woollama routes handles to
+# them, it never owns conversation state itself.
+BACKENDS: dict[str, object] = {ClaudeResumeBackend.name: ClaudeResumeBackend()}
 
 
-def _default_db_path() -> str:
-    """`$WOOLLAMA_DB`, else `$XDG_DATA_HOME/woollama/conversations.duckdb`
-    (defaulting XDG to `~/.local/share`). Tests point `$WOOLLAMA_DB` at a tmp
-    file (or construct `StoredStore(path)` directly)."""
-    env = os.environ.get("WOOLLAMA_DB")
-    if env:
-        return env
-    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    d = os.path.join(base, "woollama")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, "conversations.duckdb")
-
-
-class StoredStore:
-    """duckdb-backed persistence for `stored` conversations. A SINGLE connection
-    serialized by an `asyncio.Lock` — duckdb connections are not thread-safe, so
-    every access goes through the lock (the operations are local + sub-ms, so
-    serializing on the event loop is fine; no thread pool). Two tables:
-    `conversations` (the handle metadata) and `messages` (the visible
-    transcript). Truth lives here; the in-memory `ConversationStore` is the
-    working set, rehydrated from here at startup."""
-
-    def __init__(self, path: str | None = None) -> None:
-        self.path = path or _default_db_path()
-        self._lock = asyncio.Lock()
-        self._con = duckdb.connect(self.path)
-        self._ensure_schema()
-
-    def _ensure_schema(self) -> None:
-        self._con.execute(
-            "CREATE TABLE IF NOT EXISTS conversations ("
-            " id VARCHAR PRIMARY KEY, backend VARCHAR, model VARCHAR,"
-            " title VARCHAR, metadata VARCHAR,"
-            " created_at BIGINT, updated_at BIGINT)")
-        self._con.execute(
-            "CREATE TABLE IF NOT EXISTS messages ("
-            " conversation_id VARCHAR, seq BIGINT, role VARCHAR,"
-            " content VARCHAR, created_at BIGINT)")
-
-    async def save_conversation(self, conv: Conversation) -> None:
-        """Upsert the handle row (idempotent — called on every turn so title /
-        updated_at stay current)."""
-        async with self._lock:
-            self._con.execute(
-                "INSERT INTO conversations"
-                " (id, backend, model, title, metadata, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT (id) DO UPDATE SET"
-                " backend=excluded.backend, model=excluded.model,"
-                " title=excluded.title, metadata=excluded.metadata,"
-                " updated_at=excluded.updated_at",
-                [conv.id, conv.backend, conv.model, conv.title,
-                 json.dumps(conv.metadata or {}), conv.created_at, conv.updated_at])
-
-    async def append_messages(self, conv_id: str, messages: list[dict]) -> None:
-        """Append visible turns, assigning monotonic per-conversation seqs."""
-        if not messages:
-            return
-        async with self._lock:
-            row = self._con.execute(
-                "SELECT COALESCE(MAX(seq), -1) FROM messages WHERE conversation_id = ?",
-                [conv_id]).fetchone()
-            seq = int(row[0]) + 1
-            now = _now()
-            for m in messages:
-                self._con.execute(
-                    "INSERT INTO messages"
-                    " (conversation_id, seq, role, content, created_at)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    [conv_id, seq, m.get("role", "user"),
-                     m.get("content") or "", now])
-                seq += 1
-
-    async def load_messages(self, conv_id: str) -> list[dict]:
-        async with self._lock:
-            rows = self._con.execute(
-                "SELECT role, content FROM messages WHERE conversation_id = ?"
-                " ORDER BY seq", [conv_id]).fetchall()
-        return [{"role": r[0], "content": r[1]} for r in rows]
-
-    async def load_conversations(self) -> list[Conversation]:
-        """Rehydrate every persisted handle (transcripts load lazily via
-        `load_messages`). `response_ids` are NOT persisted — `previous_response_id`
-        chaining is within-process only; attach by `conversation` survives
-        restart, which is the durable path."""
-        async with self._lock:
-            rows = self._con.execute(
-                "SELECT id, backend, model, title, metadata, created_at, updated_at"
-                " FROM conversations").fetchall()
-        out: list[Conversation] = []
-        for r in rows:
-            out.append(Conversation(
-                id=r[0], backend=r[1], model=r[2], title=r[3],
-                metadata=json.loads(r[4]) if r[4] else {},
-                created_at=r[5], updated_at=r[6]))
-        return out
-
-    async def delete(self, conv_id: str) -> None:
-        async with self._lock:
-            self._con.execute("DELETE FROM messages WHERE conversation_id = ?", [conv_id])
-            self._con.execute("DELETE FROM conversations WHERE id = ?", [conv_id])
-
-
-# Lazily-created singleton (default path). Tests inject their own via
-# `monkeypatch.setattr(conversations, "_stored", StoredStore(tmp))`.
-_stored: StoredStore | None = None
-
-
-def stored_store() -> StoredStore:
-    global _stored
-    if _stored is None:
-        _stored = StoredStore()
-    return _stored
-
-
-class StoredBackend:
-    """Server-owned conversations. There's no native session to resume — woollama
-    persists the visible transcript and REPLAYS it as context each turn. Works for
-    any stateless model (ollama, recipes, cloud providers): `send_turn` loads the
-    stored history, prepends it to the new messages, runs one stateless completion,
-    then persists the new user messages + the assistant's answer."""
-
-    name = "stored"
-
-    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
-        store = stored_store()
-        # Lazy import breaks the conversations↔router import cycle (same pattern
-        # mcp_server uses for orchestrate).
-        from . import router
-        history = await store.load_messages(conv.id)
-        text = await router.complete_stateless(conv.model, history + messages)
-        conv.updated_at = _now()
-        await store.save_conversation(conv)               # upsert handle (idempotent)
-        await store.append_messages(
-            conv.id, [*messages, {"role": "assistant", "content": text}])
-        return text
-
-    async def history(self, conv: Conversation) -> list[dict]:
-        return await stored_store().load_messages(conv.id)
-
-    async def delete(self, conv: Conversation) -> None:
-        await stored_store().delete(conv.id)
-        conv.status = "dead"
-
-
-# Backend registry, keyed by the name stored on a Conversation.
-BACKENDS: dict[str, object] = {
-    ClaudeResumeBackend.name: ClaudeResumeBackend(),
-    StoredBackend.name: StoredBackend(),
-}
-
-
-async def rehydrate_stored(store: ConversationStore,
-                           stored: StoredStore | None = None) -> int:
-    """Load every persisted `stored` handle from duckdb (truth) into an in-memory
-    `ConversationStore` (the working set). Called once at startup so attach-by-
-    `conversation` survives a restart. Returns the count rehydrated. Isolated from
-    the lifespan so it's directly testable (the restart behaviour is conv-5's
-    whole point)."""
-    convs = await (stored or stored_store()).load_conversations()
-    for conv in convs:
-        store.add(conv)
-    return len(convs)
-
-
-def backend_for_model(model: str) -> str:
-    """Which stateful backend owns conversations for this `model`.
-    `claude-code/<model>` resumes a native Claude session (`claude-resume`);
-    every other model (ollama, recipes, cloud providers) has no native session,
-    so woollama owns it via the server-owned `stored` backend (transcript replay)."""
+def backend_for_model(model: str) -> str | None:
+    """Which state-owning backend (if any) backs conversations for this `model`.
+    Only `claude-code/<model>` has one in this build — `claude-resume`, where the
+    native Claude session owns the bytes. Every other model (ollama, recipes,
+    cloud providers) has NO state owner, so it has no stateful backend: those
+    conversations are stateless (`store:false`, the caller owns history).
+    woollama does not store transcripts in its own system."""
     provider = model.split("/", 1)[0]
     if provider == "claude-code":
         return ClaudeResumeBackend.name
-    return StoredBackend.name
+    return None

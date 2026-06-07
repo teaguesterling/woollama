@@ -78,7 +78,6 @@ def woollama_server(tmp_path):
         "WOOLLAMA_ADDRESS": f"127.0.0.1:{port}",
         "WOOLLAMA_CONFIG_DIR": str(tmp_path),  # forces bundled defaults
         "XDG_RUNTIME_DIR": str(tmp_path),       # don't clobber the user's real addr-file
-        "WOOLLAMA_DB": str(tmp_path / "conv.duckdb"),  # stored backend → tmp, not ~/.local
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "woollama"],
@@ -241,51 +240,21 @@ def test_responses_stateful_claude_resume_recalls_context_live(woollama_server):
         f"resumed session should recall the codeword; got {r2.output_text!r}"
 
 
-@needs_ollama
-def test_responses_stateful_stored_recalls_via_transcript_replay(woollama_server):
-    """conv-5 live gate (free, on ollama): a server-owned `stored` conversation
-    recalls a codeword across turns — not because the model has a session, but
-    because woollama persists the transcript and REPLAYS it as context. Then the
-    /v1/conversations/{id}/items endpoint serves that stored transcript."""
-    import openai
-    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
-    if not any("qwen3:14b-iq4xs" in m["id"] for m in models):
-        pytest.skip("qwen3:14b-iq4xs not available; needed for the live turn")
-    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
-    r1 = c.responses.create(
-        model="ollama/qwen3:14b-iq4xs",
-        input="Remember this codeword: banana. Reply with only: ok",
-        store=True, timeout=180)
-    assert r1.conversation is not None, "stored response must carry a conversation"
-    conv_id = r1.conversation.id
-    r2 = c.responses.create(
-        model="ollama/qwen3:14b-iq4xs",
-        input="What codeword did I ask you to remember? Reply with only that word.",
-        conversation=conv_id, timeout=180)
-    assert r2.conversation.id == conv_id
-    assert "banana" in r2.output_text.lower(), \
-        f"stored replay should recall the codeword; got {r2.output_text!r}"
-    # the transcript endpoint now serves the stored turns (4: 2 user + 2 assistant)
-    items = httpx.get(f"{woollama_server}/v1/conversations/{conv_id}/items",
-                      timeout=10).json()["data"]
-    assert len(items) == 4
-    assert items[0]["role"] == "user" and items[1]["role"] == "assistant"
-
-
-@needs_ollama
+@needs_claude_code
 def test_conversations_surface_full_journey_live(woollama_server):
     """E2E for the cosmic-fabric-facing /v1/conversations surface — the full user
-    journey against the LIVE server (stored backend, free on ollama): explicitly
-    CREATE a conversation, DISCOVER it (list + get), drive turns via the OpenAI
-    SDK attaching by id (recall proves stored replay), read the transcript ITEMS,
-    then DELETE and confirm it's gone. Covers the CRUD endpoints that were
-    otherwise only hermetically tested."""
+    journey against the LIVE server on a STATE-OWNING backend (claude-resume; the
+    Claude session owns the bytes, woollama owns nothing): explicitly CREATE a
+    conversation, DISCOVER it (list + get), drive turns via the OpenAI SDK
+    attaching by id (recall proves the resumed session), confirm the transcript
+    ITEMS endpoint defers (501 — reading a backend's transcript is the driver/
+    managed-agents slice's job), then DELETE and confirm it's gone. Covers the
+    CRUD endpoints that are otherwise only hermetically tested. @needs_claude_code
+    (real subscription cost) — non-claude models have no stateful backend now, so
+    this journey requires a state-owning one."""
     import openai
     base = woollama_server
-    model = "ollama/qwen3:14b-iq4xs"
-    models = httpx.get(f"{base}/v1/models", timeout=5).json()["data"]
-    if not any(model in m["id"] for m in models):
-        pytest.skip("qwen3:14b-iq4xs not available; needed for the live turns")
+    model = "claude-code/haiku"
 
     # 1) CREATE. woollama requires `model` to pick the backend (a superset of
     #    OpenAI's conversations.create, which has no model param) → drive via httpx.
@@ -295,7 +264,7 @@ def test_conversations_surface_full_journey_live(woollama_server):
     assert created.status_code == 201, created.text
     conv = created.json()
     cid = conv["id"]
-    assert conv["backend"] == "stored" and conv["title"] == "journey"
+    assert conv["backend"] == "claude-resume" and conv["title"] == "journey"
     assert conv["metadata"] == {"k": "v"}
 
     # 2) DISCOVER: it's in the list, and GET /{id} matches.
@@ -305,7 +274,7 @@ def test_conversations_surface_full_journey_live(woollama_server):
     assert got["id"] == cid and got["model"] == model
 
     # 3) DRIVE two turns via the OpenAI SDK, attaching by conversation id; the
-    #    recall proves the stored backend replayed the transcript.
+    #    recall proves woollama resumed the same Claude session.
     c = openai.OpenAI(base_url=f"{base}/v1", api_key="not-required")
     r1 = c.responses.create(model=model, conversation=cid,
                             input="Remember this codeword: banana. Reply only: ok",
@@ -315,12 +284,10 @@ def test_conversations_surface_full_journey_live(woollama_server):
                             input="What codeword did I ask you to remember? "
                                   "Reply with only that word.", timeout=180)
     assert "banana" in r2.output_text.lower(), \
-        f"attach-by-conversation should recall via stored replay; got {r2.output_text!r}"
+        f"attach-by-conversation should recall via the resumed session; got {r2.output_text!r}"
 
-    # 4) READ the transcript items the journey produced.
-    items = httpx.get(f"{base}/v1/conversations/{cid}/items", timeout=10).json()["data"]
-    roles = [i["role"] for i in items]
-    assert roles.count("user") >= 2 and roles.count("assistant") >= 2
+    # 4) ITEMS defers: reading the backend's transcript is the driver slice's job.
+    assert httpx.get(f"{base}/v1/conversations/{cid}/items", timeout=10).status_code == 501
 
     # 5) DELETE, then confirm it's gone (404 + absent from the list).
     deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=10).json()

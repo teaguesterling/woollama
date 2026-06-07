@@ -59,9 +59,11 @@ local CLI (tool-less, or as an **executor** that runs a recipe's allow-listed
 MCP tools itself — tool delegation). Config is file-driven (`mcp.json`,
 `recipes.toml`, `inferencers.toml`).
 
-**Stateful conversations** route *handles*; backends own the *state*:
-`claude-resume` (`claude --resume`) for `claude-code` models, and a server-owned
-duckdb `stored` backend (transcript replay) for everything else. Long-lived MCP
+**Stateful conversations** route *handles*; backends own the *state* — woollama
+never stores transcripts in its own system. Today the one state-owning backend is
+`claude-resume` (`claude --resume`, for `claude-code` models; the Claude session
+owns the bytes). Models with no state-owning backend (ollama/cloud/recipe) are
+stateless — the caller owns history (`store:false`). Long-lived MCP
 connections. Served on **both a Unix socket** (`$XDG_RUNTIME_DIR/woollama.sock`,
 mode 0600 — the default for local MCP clients) and an ephemeral loopback TCP
 port; never `0.0.0.0` without explicit opt-in.
@@ -165,10 +167,10 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
   recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
   introspection
 - **Stateful surface**: `/v1/responses` (stateless subset + stateful) and
-  `/v1/conversations` (create/list/get/delete + transcript `items`). woollama
-  routes conversation *handles*; backends own state — `claude-resume` for
-  `claude-code` models, a server-owned duckdb `stored` backend (transcript
-  replay) for the rest; handles rehydrate at startup
+  `/v1/conversations` (create/list/get/delete). woollama routes conversation
+  *handles*; backends own state (woollama never stores transcripts itself) —
+  `claude-resume` for `claude-code` models; models with no state-owning backend
+  are stateless (`store:false`)
 - Multi-backend routing by `<provider>/<model>`: ollama, anthropic, openai,
   groq, together, openrouter, `claude-code`, + any OpenAI-compatible endpoint
   via `inferencers.toml`

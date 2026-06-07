@@ -27,7 +27,8 @@ The Rust port begins when **all four** of these are true:
    - [x] Unix socket alongside HTTP loopback
    - [ ] the panel-confirm round-trip equivalent. The stateful Conversations
          surface itself IS shipped (`/v1/responses` + `/v1/conversations`,
-         claude-resume + duckdb `stored` backends); this stays open on the other
+         `claude-resume` backend — woollama routes handles, backends own state;
+         non-owning models are stateless); this stays open on the other
          half — **cosmic-fabric actually consuming it**.
 
 3. **There is a real consumer.** Cosmic-fabric panel (or another real

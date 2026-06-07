@@ -609,3 +609,34 @@ New: a live **sibling-denial** test (`test_claude_code_delegation_denies_same_
 server_sibling`) — the review's top previously-untested risk — asserts at the
 event level that an un-allow-listed same-server tool never executes. 156 hermetic
 pass; ruff clean; all three `@needs_claude_code` live gates green.
+
+## Revert — drop the duckdb `stored` backend (conv-5) (2026-06-06)
+
+conv-5 gave woollama an embedded duckdb conversation store
+(`$XDG_DATA_HOME/woollama/conversations.duckdb`) that persisted transcripts and
+replayed them for models with no native session. On reflection that's a category
+error: **woollama must never own conversation storage** — the design's own §1
+says so. It may proxy a backend's transcript, retrieve it, or create one in
+ANOTHER system; it does not become the store. Shipped 2026-06-05, reverted the
+next day.
+
+Removed in full: the `duckdb` dependency; `StoredStore` / `StoredBackend` /
+`stored_store` / `rehydrate_stored` / `_default_db_path` in `conversations.py`;
+the startup rehydration in the FastAPI lifespan; `ConversationStore.add`; and the
+`backend_for_model → "stored"` default (it returns `None` for non-claude models
+again). `complete_stateless` stays (it backs the stateless `/v1/responses` path).
+
+Replacement is a **non-decision**: a model with no state-owning backend is
+**stateless** — `/v1/responses` `store:true` and `/v1/conversations` create both
+return a clean 501 ("use `store:false`; the caller owns history"), exactly as the
+Anthropic Messages API is itself stateless. Only state-OWNING backends live in
+`BACKENDS` (today: `claude-resume`). If non-claude models ever need stateful
+conversations, the answer is a backend that DEFERS to an external owner woollama
+is a client to — a conversation-store MCP server, or **Managed Agents**
+(conversations-api-design.md §8.7, drafted this session) — never woollama's DB.
+
+Test ripple: dropped the stored unit/routing/items/rehydrate tests; restored the
+`store:true → 501` / `conversations.create non-owner → 501` assertions; the live
+e2e `/v1/conversations` journey moved off ollama+stored onto **claude-resume**
+(`@needs_claude_code`) and now asserts `items → 501` (transcript-read is the
+driver/managed-agents slice's job). 151 hermetic pass; ruff clean; no DB leak.

@@ -71,15 +71,6 @@ async def lifespan(app: FastAPI):
         registry.add(ServerManager(name, cfg["command"], cfg["args"]))
     await registry.start_all()
     log.info("registry ready: %s", registry.all_tool_names())
-    # Rehydrate `stored` conversation handles from duckdb (truth) into the
-    # in-memory working set, so attach-by-`conversation` survives a restart.
-    # (response_ids aren't persisted, so previous_response_id chaining is
-    # within-process only — the durable path is attach-by-conversation.)
-    try:
-        n = await conversations.rehydrate_stored(conversation_store)
-        log.info("rehydrated %d stored conversation(s)", n)
-    except Exception as e:                       # a bad/locked DB must not block startup
-        log.warning("stored conversation rehydration skipped: %s", e)
     # Downstream tools are known now → re-export them onto the MCP surface
     # (same dynamic registration the stdio path does in build_server's lifespan).
     register_reexported_tools(_mcp, registry)
@@ -209,9 +200,14 @@ async def _responses_stateful(body: dict, model: str,
         if conv is None:
             return _error(f"unknown previous_response_id '{prev}'", "not_found", 404)
     else:
-        # Every model has a stateful backend: claude-code → claude-resume (native
-        # session), everything else → stored (woollama-owned transcript replay).
         backend = conversations.backend_for_model(model)
+        if backend is None:
+            return _error(
+                f"no stateful backend for model '{model}': only claude-code models "
+                "have a state-owning backend (claude-resume) in this build. woollama "
+                "does not store conversations in its own system — use `store:false` "
+                "(the caller owns history) for ollama/recipe/cloud models.",
+                "not_implemented", 501)
         conv = conversation_store.create(backend, model)
 
     backend_impl = conversations.BACKENDS[conv.backend]
@@ -222,11 +218,6 @@ async def _responses_stateful(body: dict, model: str,
         except claude_code.ClaudeCodeError as e:
             conv.status = "idle"
             return _error(f"{conv.backend} backend: {e}", "server_error", 502)
-        except OrchestrationError as e:          # stored backend replays via complete_stateless
-            conv.status = "idle"
-            if e.payload is not None:
-                return JSONResponse(e.payload, status_code=e.status)
-            return _error(e.message, e.kind, e.status)
         conv.status = "idle"
 
     resp_id = responses.new_id("resp")
@@ -250,9 +241,10 @@ async def conversations_create(request: Request) -> Response:
     backend = body.get("backend") or conversations.backend_for_model(model)
     if backend is None or backend not in conversations.BACKENDS:
         return _error(
-            f"no stateful backend for model '{model}': claude-code models use the "
-            "claude-resume backend; ollama/recipe conversations need the "
-            "server-owned `stored` backend (a later slice).", "not_implemented", 501)
+            f"no state-owning backend for model '{model}': only claude-code models "
+            "have one (claude-resume) in this build. woollama does not store "
+            "conversations in its own system — ollama/recipe/cloud models are "
+            "stateless (use `store:false`).", "not_implemented", 501)
     conv = conversation_store.create(backend, model,
                                      metadata=body.get("metadata") or {},
                                      title=body.get("title"))
@@ -322,8 +314,8 @@ async def complete_stateless(model: str, messages: list[dict]) -> str:
     """Run one stateless turn, return the assistant text. Routes by `model`
     exactly like /v1/chat/completions (woollama/<recipe> → orchestrate; a known
     inferencer → passthrough), raising OrchestrationError for the error cases so
-    the caller maps them onto the response surface. Public because the `stored`
-    conversation backend replays its transcript through this same path."""
+    the caller maps them onto the response surface. Backs the stateless
+    `/v1/responses` path (conv-1a)."""
     if model.startswith("woollama/"):
         name = model[len("woollama/"):]
         recipe = recipes.get(name)

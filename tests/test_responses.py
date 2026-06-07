@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from woollama import conversations, recipes, responses, router
+from woollama import recipes, responses, router
 from woollama.manager import Registry
 
 # ---------------------------------------------------------------------------
@@ -109,26 +109,19 @@ async def test_responses_stateless_passthrough_provider(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Stateful opt-in routes to a backend (claude-resume or stored) — conv-1b/conv-5
+# Stateful opt-in: claude-code routes to a backend; non-owners are 501 (conv-1b)
 # ---------------------------------------------------------------------------
 
-async def test_responses_store_true_routes_to_stored(monkeypatch, tmp_path):
-    """store:true on a non-claude model now creates a server-owned `stored`
-    conversation (conv-5) — no longer a 501."""
-    monkeypatch.setattr(router, "conversation_store", conversations.ConversationStore())
-    monkeypatch.setattr(conversations, "_stored",
-                        conversations.StoredStore(str(tmp_path / "c.duckdb")))
-
-    async def fake_complete(model, messages):
-        return "hi back"
-    monkeypatch.setattr(router, "complete_stateless", fake_complete)
-
+async def test_responses_store_true_non_owner_is_501():
+    """store:true on a non-claude model is a 501: woollama owns no conversation
+    storage, so a model with no state-owning backend has no stateful path — the
+    caller owns history (store:false)."""
     resp = await router.responses_create(FakeRequest({
         "model": "ollama/x", "input": "hi", "store": True}))
-    assert resp.status_code == 200
+    assert resp.status_code == 501
     body = json.loads(resp.body)
-    assert body["conversation"]["id"].startswith("conv_")
-    assert body["output"][0]["content"][0]["text"] == "hi back"
+    assert body["error"]["type"] == "not_implemented"
+    assert "store:false" in body["error"]["message"]
 
 
 async def test_responses_attach_unknown_conversation_is_404():

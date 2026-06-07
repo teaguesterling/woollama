@@ -49,26 +49,6 @@ def fresh_store(monkeypatch):
     return store
 
 
-def fresh_stored(monkeypatch, tmp_path):
-    """A `stored` backend on its own tmp duckdb file (the module singleton)."""
-    store = conversations.StoredStore(str(tmp_path / "conv.duckdb"))
-    monkeypatch.setattr(conversations, "_stored", store)
-    return store
-
-
-def fake_completion(monkeypatch, reply: str = "ok"):
-    """Patch the stateless completion the `stored` backend replays through; record
-    the (model, messages) it was called with so tests can assert replay."""
-    seen: list[tuple[str, list[dict]]] = []
-
-    async def fake(model, messages):
-        seen.append((model, list(messages)))
-        return reply
-
-    monkeypatch.setattr(router, "complete_stateless", fake)
-    return seen
-
-
 # ---------------------------------------------------------------------------
 # Handle table (unit)
 # ---------------------------------------------------------------------------
@@ -85,9 +65,9 @@ def test_store_create_get_and_response_mapping():
 
 def test_backend_for_model():
     assert conversations.backend_for_model("claude-code/haiku") == "claude-resume"
-    # Every other model has no native session → server-owned `stored` backend.
-    assert conversations.backend_for_model("ollama/x") == "stored"
-    assert conversations.backend_for_model("woollama/streamer") == "stored"
+    # No state-owning backend for these → None (stateless only; woollama owns no state).
+    assert conversations.backend_for_model("ollama/x") is None
+    assert conversations.backend_for_model("woollama/streamer") is None
 
 
 # ---------------------------------------------------------------------------
@@ -148,37 +128,15 @@ async def test_stateful_response_parses_in_openai_sdk(monkeypatch):
 # Routing errors
 # ---------------------------------------------------------------------------
 
-async def test_stateful_non_claude_model_routes_to_stored(monkeypatch, tmp_path):
-    """A non-claude model with store:true now gets a server-owned `stored`
-    conversation (no more 501) — and woollama replays its transcript each turn."""
+async def test_stateful_non_claude_model_is_501(monkeypatch):
+    """A non-claude model with store:true has NO state-owning backend — woollama
+    doesn't store conversations in its own system, so it's a clean 501 (use
+    store:false / own the history) rather than woollama faking a store."""
     fresh_store(monkeypatch)
-    fresh_stored(monkeypatch, tmp_path)
-    seen = fake_completion(monkeypatch, reply="banana")
-
-    r1 = await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "remember banana", "store": True}))
-    b1 = json.loads(r1.body)
-    conv_id = b1["conversation"]["id"]
-    assert b1["output"][0]["content"][0]["text"] == "banana"
-    # turn 1 replayed just the new user message (empty history)
-    assert [m["content"] for m in seen[0][1]] == ["remember banana"]
-
-    # turn 2 attaches by conversation → history (turn 1 user + assistant) replays.
-    r2 = await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "what?", "conversation": conv_id}))
-    assert json.loads(r2.body)["conversation"]["id"] == conv_id
-    assert [m["content"] for m in seen[1][1]] == [
-        "remember banana", "banana", "what?"]
-
-
-async def test_stored_backend_error_surfaces_orchestration_error(monkeypatch, tmp_path):
-    """A bad model name on a stored turn raises OrchestrationError inside the
-    backend; the stateful path maps it (here a 400), not a 500."""
-    fresh_store(monkeypatch)
-    fresh_stored(monkeypatch, tmp_path)
     r = await router.responses_create(FakeRequest({
-        "model": "bogusprovider/x", "input": "hi", "store": True}))
-    assert r.status_code == 400
+        "model": "ollama/qwen3", "input": "hi", "store": True}))
+    assert r.status_code == 501
+    assert "store:false" in json.loads(r.body)["error"]["message"]
 
 
 async def test_stateful_prev_response_belonging_to_other_conversation_is_400(monkeypatch):
@@ -242,12 +200,12 @@ async def test_conversations_create_requires_model(monkeypatch):
     assert r.status_code == 400
 
 
-async def test_conversations_create_non_claude_model_uses_stored(monkeypatch, tmp_path):
+async def test_conversations_create_non_stateful_model_is_501(monkeypatch):
+    """No state-owning backend for ollama → 501 (woollama owns no conversation
+    storage; those conversations are stateless)."""
     fresh_store(monkeypatch)
-    fresh_stored(monkeypatch, tmp_path)
     r = await router.conversations_create(FakeRequest({"model": "ollama/qwen3"}))
-    assert r.status_code == 201
-    assert json.loads(r.body)["backend"] == "stored"
+    assert r.status_code == 501
 
 
 async def test_conversations_get_unknown_is_404(monkeypatch):
@@ -300,72 +258,3 @@ async def test_create_via_endpoint_then_continue_via_responses(monkeypatch):
     assert conv.response_ids == [resp_id]
     assert store.by_response(resp_id) is conv
     assert json.loads((await router.conversations_get(cid)).body)["status"] == "idle"
-
-
-# ---------------------------------------------------------------------------
-# stored backend — transcript items, delete, rehydration (conv-5)
-# ---------------------------------------------------------------------------
-
-async def test_stored_items_returns_transcript(monkeypatch, tmp_path):
-    fresh_store(monkeypatch)
-    fresh_stored(monkeypatch, tmp_path)
-    fake_completion(monkeypatch, reply="pong")
-    cid = json.loads((await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "ping", "store": True}))).body)["conversation"]["id"]
-
-    r = await router.conversations_items(cid)
-    assert r.status_code == 200
-    data = json.loads(r.body)["data"]
-    assert [(i["role"], i["content"][0]["text"]) for i in data] == [
-        ("user", "ping"), ("assistant", "pong")]
-    # part types follow the role (input_text vs output_text)
-    assert data[0]["content"][0]["type"] == "input_text"
-    assert data[1]["content"][0]["type"] == "output_text"
-
-
-async def test_stored_delete_clears_persistence(monkeypatch, tmp_path):
-    store = fresh_store(monkeypatch)
-    stored = fresh_stored(monkeypatch, tmp_path)
-    fake_completion(monkeypatch, reply="x")
-    cid = json.loads((await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "hi", "store": True}))).body)["conversation"]["id"]
-    assert await stored.load_messages(cid)          # persisted
-
-    r = await router.conversations_delete(cid)
-    assert json.loads(r.body)["deleted"] is True
-    assert store.get(cid) is None                    # handle forgotten
-    assert await stored.load_messages(cid) == []     # rows gone from duckdb
-
-
-async def test_stored_conversations_rehydrate(monkeypatch, tmp_path):
-    """conv-5's headline behaviour: a stored conversation persisted by one
-    ConversationStore is recovered into a fresh one by `rehydrate_stored` — the
-    exact glue the lifespan runs at startup, so attach survives a restart."""
-    fresh_store(monkeypatch)
-    stored = fresh_stored(monkeypatch, tmp_path)
-    fake_completion(monkeypatch, reply="y")
-    cid = json.loads((await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "hi", "store": True}))).body)["conversation"]["id"]
-
-    # Simulate a restart: brand-new in-memory store, same duckdb file, run the
-    # real startup helper (not a hand-rolled loop) against it.
-    revived = conversations.ConversationStore()
-    n = await conversations.rehydrate_stored(revived, stored)
-    assert n == 1
-    assert revived.get(cid) is not None
-    assert revived.get(cid).backend == "stored"
-    # and the rehydrated handle still reads its transcript from duckdb
-    assert await stored.load_messages(cid)
-
-
-async def test_stored_items_validate_as_openai_conversation_item_list(monkeypatch, tmp_path):
-    """The items wire shape is held to the same SDK bar as the rest of conv-* —
-    a stored transcript parses as the SDK's ConversationItemList."""
-    from openai.types.conversations import ConversationItemList
-    fresh_store(monkeypatch)
-    fresh_stored(monkeypatch, tmp_path)
-    fake_completion(monkeypatch, reply="pong")
-    cid = json.loads((await router.responses_create(FakeRequest({
-        "model": "ollama/qwen3", "input": "ping", "store": True}))).body)["conversation"]["id"]
-    body = json.loads((await router.conversations_items(cid)).body)
-    ConversationItemList.model_validate(body)        # real SDK parse
