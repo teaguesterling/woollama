@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased — prototype progress since v0.1.0
+## v0.2.0 — 2026-06-07
 
-Still the Python prototype (version not yet bumped); these are committed,
-slice-by-slice (see `docs/build-log.md`). This resolves essentially every
-"queued for v0.2" limitation listed under v0.1.0 below. Authoritative live
-status is `docs/roadmap.md`.
+Still the Python prototype (v1.0 is the Rust rewrite — see
+`docs/rust-transition.md`); these are committed slice-by-slice (see
+`docs/build-log.md`). This resolves essentially every "queued for v0.2"
+limitation listed under v0.1.0 below. Authoritative live status is
+`docs/roadmap.md`.
 
 ### Surfaces
 
@@ -56,6 +57,8 @@ status is `docs/roadmap.md`.
   loop AND in delegation).
 - **CI**: GitHub Actions runs `ruff check` + the hermetic suite on Python
   3.11/3.12; opt-in pre-commit hook mirrors the lint gate.
+- **Documentation site**: MkDocs (Material) over the existing Markdown docs,
+  published on ReadTheDocs at <https://woollama.readthedocs.io/>.
 
 ## v0.1.0 — 2026-05-31
 
