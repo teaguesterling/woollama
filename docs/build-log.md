@@ -725,3 +725,29 @@ Live acceptance (2026-06-07): `test_ollama_num_ctx_honored_via_native_endpoint`
 drove a `num_ctx=16384` chat-completion through a live woollama → ollama, then
 asserted ollama's `/api/ps` reports `context_length=16384` for the loaded model
 (the issue's exact bar). Green in 12.3s.
+
+## issue #2 — design slice: store-only backend for non-claude models (2026-06-07)
+
+A DESIGN slice (no code), by decision — to avoid a second conv-5-style revert on
+the "woollama never owns the store" principle. Read both cosmic-fabric primary
+sources first (`cosmic-fabric#1`, `doc/woollama-coordination.md`): the agreed
+architecture is woollama-as-inference-backbone, fabric-behind-woollama, and
+cosmic-fabricd thinning toward a desktop-session daemon.
+
+Findings that reshaped it: (1) Managed Agents (conv-6) can't satisfy #2 — it pins
+inference to a Claude model, so it can't run `ollama/<model>`. (2) ollama has NO
+server-side sessions (verified, 0.24.0): `/api/chat` is stateless; the
+`/api/generate` `context` token-id array is caller-held, generate-only, opaque,
+reload-fragile — not a state owner.
+
+Decision (user's call, it touches the principle): **defer the transcript to
+fabric / the cosmic-fabricd session daemon, behind a PLUGGABLE conversation-store
+seam** — consistent with how claude-resume defers to Claude's JSONL and
+managed-agents to Anthropic. Design doc gained §3.1 (two backend kinds —
+native-loop vs store-only/BYO-inference — sharing the "never the store"
+invariant), §8 item 8, and a full §10 (the store-provider protocol
+`create/get/append/delete`, the store-only `send_turn` assembly+inference loop,
+fabric as first provider, MCP-store / JSONL as future pluggable providers).
+
+Status: impl BLOCKED pending the fabric read/append contract (cosmic-fabric side).
+Tracked as issue #2 / roadmap conv-7. No src/test changes this slice.

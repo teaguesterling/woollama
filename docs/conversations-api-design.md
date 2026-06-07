@@ -120,6 +120,31 @@ answer(id, answer | control_key) -> Response   # resolve requires_action / send 
 delete(id)
 ```
 
+### 3.1 Two backend kinds — and the one invariant they share
+
+Every state-owning backend **defers the transcript bytes to an external owner**;
+woollama only holds the `conv_id → {backend, native_id}` handle. They split by
+*who runs the inference loop*:
+
+- **Native-loop backends** — the owner runs the loop AND inference, so `send_turn`
+  delegates the whole turn and woollama just routes the handle:
+  - `claude-resume` — owner = the Claude CLI session (bytes in `~/.claude`'s JSONL).
+  - `managed-agents` — owner = Anthropic's hosted session (conv-6).
+  - `claude-tmux` (future) — owner = the live Claude TUI via the Rust driver.
+
+- **Store-only (BYO-inference) backends** — the owner holds the bytes but does NOT
+  run inference, so woollama does the **assembly + inference** itself:
+  `history ← store.get(native_id)` → prepend to the new input → call the
+  **stateless** inferencer (e.g. `ollama/<model>`, honoring `num_ctx` via the
+  native path) → `store.append(native_id, turn)`. This is the family that makes
+  non-claude models stateful (issue #2) — see §10.
+
+The invariant in both: **woollama is never the store.** A store-only backend is
+parameterized by a pluggable *conversation-store provider* (§10); fabric is the
+first provider, but the seam is provider-agnostic so an MCP conversation-store, or
+even a JSONL reader mirroring claude-resume's model, can drop in later without
+woollama ever owning bytes.
+
 ## 4. The session driver (separate Rust package)
 
 Owns everything fragile. Exposed to woollama as a **local HTTP service with SSE**
@@ -306,6 +331,16 @@ plain terminal before building the claude-tmux backend:
    agent_toolset session that proves the handle-routing + retrieve-transcript +
    requires_action path end-to-end.
 
+8. **Store-only backend for non-claude models (issue #2)** — **DESIGNED
+   2026-06-07; impl pending cosmic-fabric coordination.** The first BYO-inference
+   backend (§3.1, §10): makes `ollama/<model>` (and recipes) stateful by deferring
+   the transcript to fabric's session store (the first pluggable store provider)
+   and doing assembly + stateless inference woollama-side. Decision: **defer to
+   fabric / the cosmic-fabricd session daemon now, behind a provider-agnostic
+   store seam** so an MCP conversation-store or a JSONL reader can drop in later.
+   Approach is *design-slice-first* (this section) to avoid a second wrong-guess
+   revert on the no-store principle. See §10 for the full design.
+
 ## 9. Risk flags
 
 - The TUI driver is the fragile part — isolated in Rust on purpose; treat its
@@ -317,3 +352,85 @@ plain terminal before building the claude-tmux backend:
   routing map. (conv-5 briefly broke this with an embedded duckdb; reverted.)
 - Don't half-implement the Responses spec — minimal subset only (create /
   continue / read / fork / requires_action).
+
+## 10. Pluggable conversation stores — the BYO-inference family (issue #2)
+
+**Goal.** Make `ollama/<model>` (and recipe) conversations stateful through
+`/v1/responses` + `/v1/conversations`, so cosmic-fabric can route its session
+chat path through woollama instead of bifurcating (claude→woollama,
+local→fabric). The agreed target architecture: *woollama is the inference
+backbone; fabric sits behind woollama as a pattern source; cosmic-fabricd thins
+toward a desktop-session daemon.*
+
+**Why the obvious candidates don't fit.**
+- *Managed Agents* (conv-6) pins inference to a **Claude** model — it cannot run
+  a local ollama model, so it can't make an ollama session stateful.
+- *Ollama itself* has **no server-side sessions** (verified, ollama 0.24.0):
+  `/api/chat` is stateless; the `/api/generate` `context` token-id array is
+  caller-held, generate-only, opaque (not a readable transcript), and reload-
+  fragile — so ollama is not a state owner.
+- *An embedded woollama store* is the conv-5 violation — out by principle.
+
+**The decision (2026-06-07).** Defer the transcript to **fabric / the
+cosmic-fabricd session daemon** (where these sessions' bytes already live), behind
+a **provider-agnostic conversation-store seam** so the choice of owner is
+pluggable. woollama stays a router/client to the store; it never holds bytes.
+
+### 10.1 The store-provider seam
+
+A small protocol woollama is a *client* to (mirrors how claude-resume is a client
+to Claude's JSONL and managed-agents to Anthropic's session API):
+
+```
+ConversationStore (provider):
+    create()                  -> thread_id        # owner mints the thread
+    get(thread_id)            -> [messages]       # the transcript (woollama RETRIEVES)
+    append(thread_id, turn)   -> None             # user + assistant messages of one turn
+    delete(thread_id)         -> None
+```
+
+A **store-only `ConversationBackend`** (§3.1) composes a store provider with a
+stateless inferencer:
+
+```
+send_turn(conv, input):
+    prior   = store.get(conv.native_id)           # bytes owned by the provider
+    msgs    = prior + [input]                      # ASSEMBLY (woollama)
+    answer  = inferencer.complete(conv.model, msgs)# stateless ollama call (num_ctx honored)
+    store.append(conv.native_id, [input, answer])  # write back to the owner
+    return answer
+history(conv): return store.get(conv.native_id)   # /items works for free
+```
+
+`native_id` = the provider's thread key (a fabric `sessionName`). `create()` maps
+a woollama `conv_id` → a provider thread. One writer per conversation (existing
+per-conv lock). This reuses conv-6's handle-table scaffolding verbatim — only the
+owner of the bytes differs.
+
+### 10.2 First provider: fabric / cosmic-fabricd
+
+`backend_for_model("ollama/<model>")` → a `fabric-session` backend whose store
+provider is the fabric/daemon session API. **Coordination needed (cosmic-fabric
+side):** fabric must expose, to woollama, a session **read** (transcript by
+`sessionName`) and **append** (one turn) — today fabric owns `sessionName`
+sessions but the read/append surface woollama would consume needs to be agreed
+(transport: the same owner-only UDS woollama already serves on, or a fabric-side
+endpoint woollama calls). cosmic-fabric then maps a cosmic session name → a
+woollama `conversation_id` and drives turns via `/v1/responses`
+(`store:true`/`conversation`).
+
+### 10.3 Future providers (pluggable, not now)
+
+- **MCP conversation-store** — woollama as an MCP client to a server exposing
+  get/append/create/delete (most general; works for any provider). The seam above
+  is deliberately shaped so this is a drop-in.
+- **JSONL reader** — read a claude-resume-style on-disk transcript as a provider
+  (read-only history for a native-loop owner).
+
+### 10.4 Scope / status
+
+Design slice only (per the chosen approach). **Not codeable to completion today**
+— it's entangled with the last v1.0 gate (cosmic-fabric consuming the surface)
+and needs the fabric read/append contract agreed first. Deliberately deferred so
+we don't repeat the conv-5 revert by guessing the owner. Tracked as issue #2;
+build-sequence item §8.8.
