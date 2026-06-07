@@ -1,0 +1,67 @@
+site_name: woollama
+site_description: >-
+  Web Over Ollama (and Llamas) — an MCP + OpenAI router for AI desktops.
+site_url: https://woollama.readthedocs.io/
+repo_url: https://github.com/teaguesterling/woollama
+repo_name: teaguesterling/woollama
+edit_uri: edit/main/docs/
+docs_dir: docs
+copyright: MIT — Teague Sterling
+
+theme:
+  name: material
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Concepts:
+      - Architecture: architecture.md
+      - Naming: naming.md
+  - Design:
+      - Conversations API: conversations-api-design.md
+      - Rust transition: rust-transition.md
+  - Project:
+      - Roadmap: roadmap.md
+      - Build log: build-log.md
+      - Changelog: changelog.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - toc:
+      permalink: true
+
+plugins:
+  - search

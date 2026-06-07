@@ -1,0 +1,4 @@
+# Docs-site build dependencies (used by ReadTheDocs and `mkdocs serve` locally).
+# Deliberately slim: building the docs does NOT need the woollama package or its
+# runtime deps (fastapi/uvicorn/mcp) — only the static-site generator.
+mkdocs-material>=9.5
