@@ -273,6 +273,64 @@ def test_responses_stateful_stored_recalls_via_transcript_replay(woollama_server
 
 
 @needs_ollama
+def test_conversations_surface_full_journey_live(woollama_server):
+    """E2E for the cosmic-fabric-facing /v1/conversations surface — the full user
+    journey against the LIVE server (stored backend, free on ollama): explicitly
+    CREATE a conversation, DISCOVER it (list + get), drive turns via the OpenAI
+    SDK attaching by id (recall proves stored replay), read the transcript ITEMS,
+    then DELETE and confirm it's gone. Covers the CRUD endpoints that were
+    otherwise only hermetically tested."""
+    import openai
+    base = woollama_server
+    model = "ollama/qwen3:14b-iq4xs"
+    models = httpx.get(f"{base}/v1/models", timeout=5).json()["data"]
+    if not any(model in m["id"] for m in models):
+        pytest.skip("qwen3:14b-iq4xs not available; needed for the live turns")
+
+    # 1) CREATE. woollama requires `model` to pick the backend (a superset of
+    #    OpenAI's conversations.create, which has no model param) → drive via httpx.
+    created = httpx.post(f"{base}/v1/conversations",
+                         json={"model": model, "title": "journey",
+                               "metadata": {"k": "v"}}, timeout=10)
+    assert created.status_code == 201, created.text
+    conv = created.json()
+    cid = conv["id"]
+    assert conv["backend"] == "stored" and conv["title"] == "journey"
+    assert conv["metadata"] == {"k": "v"}
+
+    # 2) DISCOVER: it's in the list, and GET /{id} matches.
+    listing = httpx.get(f"{base}/v1/conversations", timeout=10).json()["data"]
+    assert cid in [c["id"] for c in listing]
+    got = httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).json()
+    assert got["id"] == cid and got["model"] == model
+
+    # 3) DRIVE two turns via the OpenAI SDK, attaching by conversation id; the
+    #    recall proves the stored backend replayed the transcript.
+    c = openai.OpenAI(base_url=f"{base}/v1", api_key="not-required")
+    r1 = c.responses.create(model=model, conversation=cid,
+                            input="Remember this codeword: banana. Reply only: ok",
+                            timeout=180)
+    assert r1.conversation.id == cid
+    r2 = c.responses.create(model=model, conversation=cid,
+                            input="What codeword did I ask you to remember? "
+                                  "Reply with only that word.", timeout=180)
+    assert "banana" in r2.output_text.lower(), \
+        f"attach-by-conversation should recall via stored replay; got {r2.output_text!r}"
+
+    # 4) READ the transcript items the journey produced.
+    items = httpx.get(f"{base}/v1/conversations/{cid}/items", timeout=10).json()["data"]
+    roles = [i["role"] for i in items]
+    assert roles.count("user") >= 2 and roles.count("assistant") >= 2
+
+    # 5) DELETE, then confirm it's gone (404 + absent from the list).
+    deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=10).json()
+    assert deleted["deleted"] is True
+    assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
+    listing2 = httpx.get(f"{base}/v1/conversations", timeout=10).json()["data"]
+    assert cid not in [c["id"] for c in listing2]
+
+
+@needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to
     — two different downstream MCP servers. One chat drives the model to use
