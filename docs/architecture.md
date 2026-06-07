@@ -27,6 +27,11 @@ full intended shape; much of it is built and some is still aspirational.
 > - The **executor axis** now includes **tool delegation to Claude Code** (a
 >   `claude-code` recipe with tools → Claude runs the loop), in addition to the
 >   provider-prefix inferencer choice described below.
+> - A **stateful conversations surface** (`/v1/responses` + `/v1/conversations`)
+>   was added after this doc was written and has its own design —
+>   [`conversations-api-design.md`](conversations-api-design.md). woollama routes
+>   conversation *handles*; backends own the state (`claude-resume` today),
+>   never woollama's own store.
 
 ## What it is
 

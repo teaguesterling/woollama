@@ -56,7 +56,7 @@ cosmic-fabric / OpenAI client
         ├─▶ claude-tmux        (delegated, LIVE + interactive) ──HTTP/SSE──▶ session driver (Rust)
         │                                                          owns: tmux, send-keys (Esc/Enter),
         │                                                          jsonl tail, turn/pending detection
-        └─▶ stored             (server-owned; duckdb thread)   [later]
+        └─▶ managed-agents     (Anthropic-hosted; /v1/sessions)  [later, §8.7]
 ```
 
 ## 1. External API — `/v1/responses`
@@ -95,7 +95,7 @@ This is what cosmic-fabric binds to: list existing conversations, pick one,
 drive it.
 
 ```
-POST   /v1/conversations            { "backend": "claude-tmux" | "claude-resume" | "stored",
+POST   /v1/conversations            { "backend": "claude-resume" | "claude-tmux" | "managed-agents",
                                        "model": "...", "metadata": {...} }   -> {id, status}
 GET    /v1/conversations            -> [ {id, backend, status, title, updated_at}, ... ]
 GET    /v1/conversations/{id}        -> {id, backend, status, ...}
@@ -187,7 +187,7 @@ plain terminal before building the claude-tmux backend:
 | OpenAI Responses | woollama | backing |
 |---|---|---|
 | `response.id` | a turn | a turn in the session |
-| `conversation` | routable handle | tmux session / `--resume` id / duckdb thread |
+| `conversation` | routable handle | tmux session / `--resume` id / managed-agents session |
 | `previous_response_id` | chain / fork point | append vs. fork a new session |
 | `store: false` | stateless | none (caller owns history) |
 | `status: requires_action` | awaiting_input | Claude paused on AskUserQuestion |
