@@ -40,7 +40,7 @@ woollama = "woollama.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/teaguesterling/woollama"
-Documentation = "https://github.com/teaguesterling/woollama/tree/main/docs"
+Documentation = "https://woollama.readthedocs.io/"
 Issues = "https://github.com/teaguesterling/woollama/issues"
 
 [build-system]

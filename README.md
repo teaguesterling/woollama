@@ -2,6 +2,8 @@
 
 **Web Over Ollama (and Llamas).** An MCP + OpenAI router for AI desktops.
 
+📖 **Documentation: [woollama.readthedocs.io](https://woollama.readthedocs.io/)**
+
 woollama sits between AI clients (Cursor, the OpenAI SDK, Claude Desktop,
 cosmic-fabric, anything that speaks OpenAI or MCP) and AI backends (Ollama,
 Anthropic, fabric, lackpy, filesystem MCPs, anything that speaks OpenAI or
