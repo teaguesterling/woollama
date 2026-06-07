@@ -640,3 +640,9 @@ Test ripple: dropped the stored unit/routing/items/rehydrate tests; restored the
 e2e `/v1/conversations` journey moved off ollama+stored onto **claude-resume**
 (`@needs_claude_code`) and now asserts `items → 501` (transcript-read is the
 driver/managed-agents slice's job). 151 hermetic pass; ruff clean; no DB leak.
+
+Live confirmation (2026-06-07): ran `test_conversations_surface_full_journey_live`
+end-to-end against the real `claude-resume` backend (`claude-code/haiku`) — full
+CRUD + discover, two-turn recall proving the resumed Claude session owns the
+state, `items → 501`, delete → 404. Green in 17.2s. (The revert commit `2d45f23`
+predates this run and flags the journey as "not yet run live"; it now is.)

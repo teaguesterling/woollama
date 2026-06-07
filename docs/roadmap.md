@@ -81,7 +81,9 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      `claude-resume` backend + `store:true` / `conversation` /
      `previous_response_id` routing. Live-verified (create → resume → recall).
    - [x] **conv-2** — `/v1/conversations` create / list / get / delete (the
-     discovery + attach + teardown surface). Live CRUD verified.
+     discovery + attach + teardown surface). Live CRUD verified; the full e2e
+     journey (create → discover → two-turn recall → `items` 501 → delete) is
+     live-green against `claude-resume` post-revert (2026-06-07, 17s).
    - [~] **conv-5** — duckdb `stored` backend: SHIPPED 2026-06-05, **REVERTED
      2026-06-06**. It made woollama own conversation storage (embedded duckdb),
      contradicting the design principle (woollama routes handles, never owns
