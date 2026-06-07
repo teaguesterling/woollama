@@ -685,10 +685,14 @@ and the 502 mapping. 161 hermetic pass; ruff clean.
 
 Honesty: the hermetic tests prove woollama's WIRING, not the Managed Agents API
 contract — the bindings come from the claude-api skill docs against
-`anthropic==0.107.1`, so the `@needs_anthropic` live gate
-(`test_managed_agents_conversation_journey_live`) is the only thing that proves
-them real. It is **PAID** and creates persistent account objects, so it is
-written-but-NOT-run-live. Known limit (documented, not solved): the in-memory
+`anthropic==0.107.1`. Known limit (documented, not solved): the in-memory
 handle table means a restart orphans live (billed) sessions, and each fresh
 process re-creates its per-model agent — the `ant`-YAML / reuse-by-name control
 plane is the eventual fix.
+
+Live confirmation (2026-06-07): ran `test_managed_agents_conversation_journey_live`
+against the real Managed Agents API (`claude-agent/haiku`) — CREATE (backend
+`managed-agents`) → discover → two-turn recall proving Anthropic resumed the
+hosted session → **`/items` 200 serving the transcript** (the capability win
+over claude-resume's 501) → session delete → 404. Green in 15.0s. (Commit
+`0552661` predates this run and flags the gate as "not run live"; it now is.)
