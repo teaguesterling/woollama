@@ -150,6 +150,41 @@ def test_passthrough_ollama_chat(woollama_server):
 
 
 @needs_ollama
+def test_ollama_num_ctx_honored_via_native_endpoint(woollama_server):
+    """Issue #1 acceptance: a chat-completions request through woollama asking
+    for num_ctx=16384 actually loads the ollama model at that context — proving
+    woollama routed to the native /api/chat (which honors num_ctx; /v1 ignores
+    it). Verified by ollama's /api/ps reporting context_length=16384 for the run,
+    AND that the translated response still parses as an OpenAI chat.completion."""
+    import openai
+    ollama_url = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
+    num_ctx = 16384
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    ids = [m["id"][len("ollama/"):] for m in models if m["id"].startswith("ollama/")]
+    if not ids:
+        pytest.skip("no Ollama models available")
+    model = ids[0]
+
+    c = openai.OpenAI(base_url=f"{woollama_server}/v1", api_key="not-required")
+    r = c.chat.completions.create(
+        model=f"ollama/{model}",
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body={"options": {"num_ctx": num_ctx, "num_predict": 8}},
+        timeout=180,
+    )
+    # The translated native response still parses as a normal chat completion.
+    assert r.choices[0].message.role == "assistant"
+
+    # The load-bearing assertion: ollama loaded the model at the requested ctx.
+    ps = httpx.get(f"{ollama_url}/api/ps", timeout=5).json()["models"]
+    loaded = {m["model"]: m.get("context_length") for m in ps}
+    ctx = loaded.get(model) or next(
+        (v for k, v in loaded.items() if k.split(":")[0] == model.split(":")[0]),
+        None)
+    assert ctx == num_ctx, f"expected context_length {num_ctx}; /api/ps shows {loaded}"
+
+
+@needs_ollama
 def test_orchestrated_recipe_hides_tool_loop_from_client(woollama_server):
     """The streamer recipe runs a chat-loop internally; the OpenAI client
     should see only the final answer, not the tool_calls."""

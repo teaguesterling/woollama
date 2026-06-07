@@ -30,6 +30,7 @@ from . import (
     conversations,
     inferencers,
     managed_agents,
+    ollama_native,
     recipes,
     responses,
 )
@@ -371,12 +372,72 @@ async def _passthrough(body: dict) -> Response:
         headers = inf.headers()
     except inferencers.InferencerError as e:
         return _error(str(e), "invalid_request_error", 400)
+    # Ollama ignores `num_ctx` on its OpenAI-compat /v1 endpoint — honor it by
+    # routing to the native /api/chat when a context size is requested (#1).
+    if provider == "ollama" and ollama_native.wants_native(body):
+        return await _passthrough_ollama_native(inf, body, headers)
     if body.get("stream"):
         return await _passthrough_stream(inf, body, headers)
     body["stream"] = False
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(inf.chat_url(), json=body, headers=headers)
         return JSONResponse(r.json(), status_code=r.status_code)
+
+
+# Large num_ctx means a long prompt-eval before the first byte (and that's
+# correlated with exactly the requests that take this path), so the native
+# endpoint gets a generous read timeout, not the /v1 path's 180s.
+_OLLAMA_NATIVE_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+
+
+async def _passthrough_ollama_native(inf: inferencers.Inferencer, body: dict,
+                                     headers: dict) -> Response:
+    """Issue #1: route an ollama request that asks for a context size to the
+    NATIVE /api/chat (which honors options.num_ctx), translating the request to
+    native shape and the response back to the OpenAI chat-completions shape."""
+    url = ollama_native.native_chat_url(inf.base_url)
+    req = ollama_native.to_native_request(body)
+    if body.get("stream"):
+        return await _ollama_native_stream(url, req, headers, body["model"])
+    async with httpx.AsyncClient(timeout=_OLLAMA_NATIVE_TIMEOUT) as c:
+        r = await c.post(url, json=req, headers=headers)
+        if r.status_code >= 400:
+            try:
+                return JSONResponse(r.json(), status_code=r.status_code)
+            except (ValueError, TypeError):
+                return _error(r.text or "ollama error", "server_error", r.status_code)
+        return JSONResponse(ollama_native.from_native_response(r.json(), body["model"]))
+
+
+async def _ollama_native_stream(url: str, req: dict, headers: dict,
+                                model: str) -> Response:
+    """Stream native NDJSON from /api/chat and translate each frame to OpenAI
+    SSE. Mirrors `_passthrough_stream`'s status-check-before-streaming structure
+    (an upstream 4xx must surface as JSON, not an empty 200)."""
+    client = httpx.AsyncClient(timeout=_OLLAMA_NATIVE_TIMEOUT)
+    cm = client.stream("POST", url, json=req, headers=headers)
+    r = await cm.__aenter__()
+    if r.status_code >= 400:
+        raw = await r.aread()
+        await cm.__aexit__(None, None, None)
+        await client.aclose()
+        try:
+            return JSONResponse(json.loads(raw), status_code=r.status_code)
+        except (ValueError, TypeError):
+            return _error(raw.decode("utf-8", "replace") or "ollama error",
+                          "server_error", r.status_code)
+    translate = ollama_native.sse_translator(model)
+
+    async def relay():
+        try:
+            async for line in r.aiter_lines():
+                for chunk in translate(line):
+                    yield chunk
+        finally:
+            await cm.__aexit__(None, None, None)
+            await client.aclose()
+
+    return StreamingResponse(relay(), media_type="text/event-stream")
 
 
 async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,

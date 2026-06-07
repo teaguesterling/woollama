@@ -111,6 +111,11 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
 Smaller follow-ons (not blocking):
+- ~~**Honor `num_ctx` for ollama**~~ (#1) — ✅ DONE 2026-06-07. `ollama/<model>`
+  passthrough with `options.num_ctx` routes to ollama's native `/api/chat`
+  (which honors it; `/v1` ignores it), translating request + response (stream +
+  non-stream) back to the OpenAI shape (`ollama_native.py`). Live-verified via
+  `/api/ps` (context_length=16384). Tools + num_ctx stay on `/v1` (documented).
 - Config-file-driven inferencers shipped; could add more built-in clouds
   (deepseek/xai/mistral) — but config already covers them.
 - ~~A pre-commit / CI hook so `ruff` actually gates~~ — ✅ DONE. GitHub Actions

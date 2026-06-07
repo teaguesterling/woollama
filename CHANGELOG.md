@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Ollama `num_ctx` honored** (#1): `ollama/<model>` passthrough requests that
+  ask for a context size (`options.num_ctx`) now route to ollama's native
+  `/api/chat` (which honors it) instead of the OpenAI-compat `/v1` endpoint
+  (which silently ignores it), translating the request and the response (stream
+  + non-stream) back to the OpenAI shape. Requests without `num_ctx`, and those
+  with `tools`, stay on `/v1` unchanged. Live-verified: `/api/ps` reports the
+  requested context.
+
 ## v0.2.0 — 2026-06-07
 
 Still the Python prototype (v1.0 is the Rust rewrite — see

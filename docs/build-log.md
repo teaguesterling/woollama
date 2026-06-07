@@ -696,3 +696,32 @@ against the real Managed Agents API (`claude-agent/haiku`) — CREATE (backend
 hosted session → **`/items` 200 serving the transcript** (the capability win
 over claude-resume's 501) → session delete → 404. Green in 15.0s. (Commit
 `0552661` predates this run and flags the gate as "not run live"; it now is.)
+
+## issue #1 — honor `num_ctx` for the ollama provider (2026-06-07)
+
+Bug: `ollama/<model>` passthrough forwards the client body to ollama's
+OpenAI-compat `/v1/chat/completions`, which **ignores `num_ctx`** (even nested as
+`options.num_ctx`) — long inputs silently loaded at the 4096 default and
+truncated. ollama only honors `num_ctx` on its NATIVE `/api/chat`.
+
+Fix (`ollama_native.py` + router): when an ollama passthrough request asks for a
+context size (`options.num_ctx`) and carries no `tools`, route it to `/api/chat`,
+translating the request to ollama's native shape and the response BACK to the
+OpenAI chat-completions shape (both non-stream → `chat.completion`, and stream →
+`chat.completion.chunk` SSE, NDJSON-per-line → OpenAI deltas + `[DONE]`). The
+native wire shapes were captured live from ollama first (not recalled);
+`created_at` is an RFC3339 string so OpenAI `created` uses our own
+`int(time.time())`. Requests without `num_ctx`, and those WITH `tools`, stay on
+the unchanged `/v1` path (we don't half-translate tool_calls; documented). Native
+endpoint gets a 600s read timeout — large num_ctx means a long prompt-eval before
+the first byte, correlated with exactly these requests.
+
+Tests: `tests/test_ollama_native.py` (11) — the pure translators against the
+captured shapes + router wiring (mocked httpx) asserting num_ctx routes to
+`/api/chat` intact, no-ctx and ctx+tools stay on `/v1`, and the stream translator
+emits OpenAI SSE. 172 hermetic pass; ruff clean.
+
+Live acceptance (2026-06-07): `test_ollama_num_ctx_honored_via_native_endpoint`
+drove a `num_ctx=16384` chat-completion through a live woollama → ollama, then
+asserted ollama's `/api/ps` reports `context_length=16384` for the loaded model
+(the issue's exact bar). Green in 12.3s.
