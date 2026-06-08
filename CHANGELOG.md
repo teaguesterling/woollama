@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-06-07
+
+Still the Python prototype (v1.0 is the Rust rewrite). Conversation-surface
+release: a second state-owning backend (Managed Agents), the interactive
+pause/answer path, streaming `/v1/responses`, ollama context-window control, and
+the woollama side of a pluggable store backend. Authoritative live status is
+`docs/roadmap.md`.
 
 - **Streaming `/v1/responses`** (conv-1a streaming): a stateless `stream:true`
   turn now emits OpenAI **Responses SSE** (`response.created` →
