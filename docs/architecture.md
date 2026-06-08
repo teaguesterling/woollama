@@ -1,15 +1,18 @@
 # A model, tool, executor router — architecture
 
-Status: **the target design.** Co-designed 2026-05-31 (validated then by a
-throwaway probe, since obsolete); now the implemented project lives in this repo
-as **woollama** (naming settled — see `naming.md`). This document describes the
-full intended shape; much of it is built and some is still aspirational.
+Status: **the original design vision** (co-designed 2026-05-31). This document is
+the *shape we set out to build* and the reasoning behind it — kept for that
+rationale, not as a description of current behavior. Much has shipped (often in a
+simpler form); several sections below are still **aspirational** and are flagged
+inline as **(FUTURE)**. The implemented project lives in this repo as **woollama**
+(naming settled — see `naming.md`).
 
-> **Implementation status:** for what's actually built vs. still planned, see
-> [`roadmap.md`](roadmap.md); for the slice-by-slice history, see
-> [`build-log.md`](build-log.md). Treat code + `roadmap.md` as authoritative
-> where they differ. Specifics that the prototype realized **differently** from
-> the sketch below:
+> **For what actually exists today**, read these instead: the **[Configuration
+> reference](configuration.md)**, **[Conversations API](conversations-api-design.md)**,
+> and the authoritative **[Roadmap](roadmap.md)** scorecard (+ slice history in
+> [`build-log.md`](build-log.md)). Treat code + `roadmap.md` as authoritative
+> where they differ from this doc. The biggest ways the prototype realized things
+> **differently** from the sketch below:
 > - The recipe namespace shipped as **`woollama/<recipe>`** (the doc's `cosmic/`
 >   examples are pre-naming). Of the "four model kinds," only **raw passthrough
 >   (`<provider>/<model>`)** and **recipes (`woollama/<recipe>`)** exist; the
@@ -119,6 +122,11 @@ anything.
 
 ## Four kinds of model — one namespace
 
+> **(PARTLY BUILT)** Today only two kinds exist: raw pass-through
+> (`<provider>/<model>`) and recipes (`woollama/<recipe>`). The `fabric/<pattern>`
+> and `cosmic/<variant>` kinds below are aspirational. (The addressing-scheme idea
+> — one `model` field for all kinds — is the part that shipped.)
+
 ```
 model: "ollama/qwen3:14b-iq4xs"     raw inferencer — pass-through
 model: "anthropic/claude-opus-4-7"  raw inferencer — pass-through
@@ -165,6 +173,9 @@ composition through that surface.
 
 ## Built-in tools (TL.0 — router-native)
 
+> **(FUTURE)** woollama has **no in-process tools today** — all tools come from
+> downstream MCP servers. This router-native tool set is aspirational.
+
 The router ships a small set of in-process tools, distinct from MCP-discovered
 tools. The current set:
 
@@ -182,6 +193,9 @@ same way (`cosmic.http_get_wikipedia` if we want to be fully consistent —
 TBD).
 
 ## Bidirectional MCP (TL.3)
+
+> **(FUTURE)** Not built — woollama is an MCP client to downstream servers and an
+> MCP server to its clients, but the symmetric `roles` handling below is a sketch.
 
 When a handler we're calling needs to invoke our tools (e.g., lackpy's
 program calls our `read_file`), the model is: **two MCP connections,
@@ -203,6 +217,12 @@ approximation. Real client filters land when the panel and at least one
 sub-inferencer are named entries.
 
 ## Configuration
+
+> **(SUPERSEDED)** This is the original single-file sketch (with `policy.toml`,
+> `roles`, `features`). The prototype shipped **three separate files** —
+> `mcp.json`, `recipes.toml`, `inferencers.toml` — and there is no `policy.toml`
+> or `roles`/`features` handling. See the **[Configuration reference](configuration.md)**
+> for the actual shapes.
 
 Configuration mirrors Claude Code's `.mcp.json` shape for familiarity, with
 extensions for our specific needs:
@@ -237,6 +257,9 @@ Plus a separate `policy.toml` for recipes, variants, tool instances, and
 per-pattern metadata.
 
 ## Vendored MCP servers (the bundle)
+
+> **(FUTURE)** Today the bundle is the **`hello` + `textops` example servers**,
+> not the fabric-mcp/lackpy set described below.
 
 The router ships with a curated bundle of MCP servers:
 
