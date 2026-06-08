@@ -15,7 +15,7 @@ Status at a glance (decisions locked 2026-06-02):
 | conv-9 | streaming `/v1/responses` (Responses SSE) | §1 | shipped |
 | conv-6 | `managed-agents` backend (Anthropic-hosted) | §3.1, §8.7 | shipped |
 | conv-8 | interactive `requires_action` (ask_user) | §5 | shipped |
-| conv-7 | `store-backed` (non-claude) — woollama side | §3.1, §10 | shipped, **un-wired** (fabric provider pending) |
+| conv-7 | `store-backed` (non-claude) + reference MCP store provider | §3.1, §10 | shipped — wired via `WOOLLAMA_CONVSTORE_SERVER` (fabric provider still pending) |
 | conv-5 | duckdb `stored` backend | §8.5 | **reverted** — woollama must never be the store |
 | conv-3/4 | Rust driver + claude-tmux backend | §4, §6 | pending (spike-gated) |
 
@@ -379,17 +379,18 @@ plain terminal before building the claude-tmux backend:
    `ask_user`), so plain Q&A provisions no container.
 
 8. **Store-only backend for non-claude models (issue #2)** — woollama-side
-   mechanism implemented behind an un-wired seam; fabric provider + contract
-   pending. The first BYO-inference backend (§3.1, §10): makes
-   `ollama/<model>` (and recipes) stateful by deferring the transcript to an
-   external store provider and doing assembly + stateless inference woollama-side.
+   mechanism implemented AND wired via a reference MCP store provider (§10.3).
+   The first BYO-inference backend (§3.1, §10): makes `ollama/<model>` (and
+   recipes/cloud) stateful by deferring the transcript to an external store
+   provider and doing assembly + stateless inference woollama-side.
    `ConversationStoreProvider` protocol + `StoreBackedBackend` + routing gate +
-   clean error path shipped and tested; no provider ships by default (non-claude
-   models stay stateless). Decision: **defer to fabric / the cosmic-fabricd
-   session daemon, behind a provider-agnostic store seam** so an MCP
-   conversation-store or a JSONL reader can drop in later. The protocol shape is a
-   *provisional proposal* fed back to cosmic-fabric (issue #2), not a settled
-   contract. See §10.
+   clean error path shipped and tested; `McpStoreProvider` + the reference
+   `examples/mcp-convstore` server make it live today via
+   `WOOLLAMA_CONVSTORE_SERVER` (hermetic + live round-trip tests). No provider
+   ships baked in, so unset ⇒ non-claude models stay stateless. Decision:
+   **provider-agnostic store seam** — fabric / the cosmic-fabricd session daemon
+   (its contract still pending, §10.2) becomes one more provider; a JSONL reader
+   another. See §10.
 
 ## 9. Risk flags
 
@@ -488,23 +489,52 @@ cosmic-fabric maps a cosmic session name → a woollama `conversation_id` and dr
 turns via `/v1/responses` (`store:true`/`conversation`). The proposal has been
 fed back to cosmic-fabric (issue #2) as the "confirm" step.
 
-### 10.3 Future providers (pluggable, not now)
+### 10.3 Reference provider: MCP conversation-store — IMPLEMENTED
 
-- **MCP conversation-store** — woollama as an MCP client to a server exposing
-  get/append/create/delete (most general; works for any provider). The seam above
-  is deliberately shaped so this is a drop-in.
+The first *real* provider is an **MCP conversation-store**: woollama as an MCP
+client to a server that exposes `create_thread` / `get_thread` / `append_turn` /
+`delete_thread` and owns the transcript bytes in its own process. This is the
+most general owner (works for any model) and proves the seam end-to-end on
+woollama's side alone, without waiting on the fabric contract (10.2).
+
+- **`conversations.McpStoreProvider`** — a `ConversationStoreProvider` whose four
+  ops are each one MCP tool call via an injected `call(tool, args)` (injected so
+  the module never imports `manager`/`router`). Holds no bytes.
+- **Router wiring** — `WOOLLAMA_CONVSTORE_SERVER` names a server in `mcp.json`;
+  at startup the lifespan builds `_mcp_store_call(mgr)` (invoke → parse the MCP
+  text block's `json.dumps` string → wrap any transport/parse failure as
+  `OrchestrationError(502)` so a flaky store is a clean gateway error, never a
+  500) and calls `register_store_backend(McpStoreProvider(...),
+  complete_stateless)`. Absent/missing server ⇒ warned + stays stateless.
+- **Reference server** — `examples/mcp-convstore/server.py` (fastmcp; in-process
+  dict; tools return explicit `json.dumps(...)` strings). A real deployment backs
+  it with sqlite/postgres/a file.
+- **Tested** — hermetic provider + wrapper tests (`tests/test_mcp_store_provider.py`:
+  the op→tool mapping, the grounded result-parse, and that a flaky store → 502
+  not 500) **and** a live round-trip (`tests/test_integration.py::
+  test_store_backed_conversation_journey_live`: real convstore + real ollama,
+  two turns, cross-turn recall, `/items` served from the store, delete).
+
+This closes issue #2 **woollama-side**: a non-claude model is now genuinely
+stateful end-to-end with an external store, woollama never owning bytes. The
+fabric provider (10.2) becomes one more implementation of the same seam.
+
+### 10.4 Future providers (pluggable, not now)
+
 - **JSONL reader** — read a claude-resume-style on-disk transcript as a provider
   (read-only history for a native-loop owner).
+- **fabric / cosmic-fabricd** — the pending cross-repo contract (10.2); a thin
+  adapter once agreed.
 
-### 10.4 Scope / status
+### 10.5 Scope / status
 
-**Woollama-side mechanism implemented + hermetically tested, behind an un-wired
-seam.** The protocol, the `StoreBackedBackend`, the routing gate, and
-the clean error path all exist and pass; no provider ships, so runtime behavior is
-unchanged (non-claude models stay stateless). What remains is cross-repo and
-deliberately not guessed: (1) **the contract** — the `create/get/append/delete`
-shape is woollama's *proposal* to fabric, not an agreed contract; (2) **the fabric
-provider** — a thin adapter once that's settled; (3) **cosmic-fabric wiring**
-(part of the last v1.0 gate). This stages #2 as a *visible proposal that invites
-correction* rather than a silent guess baked into a hard-to-revert backend.
-Tracked as issue #2 / roadmap conv-7; build-sequence item §8.8.
+**Woollama-side mechanism implemented + tested, AND wired through a reference MCP
+store provider (10.3).** The protocol, the `StoreBackedBackend`, the routing
+gate, the clean error path, and a working MCP-store provider all exist and pass,
+hermetically and live. Setting `WOOLLAMA_CONVSTORE_SERVER` makes non-claude
+models stateful today; unset, they stay stateless (the default — no provider
+ships baked in). What remains is cross-repo and deliberately not guessed: (1)
+**the fabric contract** — the `create/get/append/delete` shape is woollama's
+*proposal* to fabric, not yet agreed (10.2); (2) **the fabric provider** — a thin
+adapter once that's settled; (3) **cosmic-fabric wiring** (part of the last v1.0
+gate). Tracked as issue #2 / roadmap conv-7; build-sequence item §8.8.

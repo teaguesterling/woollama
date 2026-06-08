@@ -40,6 +40,34 @@ Shape matches Claude Code's `mcpServers` block:
 woollama starts one long-lived connection per server and aggregates their tools
 (namespaced `<server>.<tool>`).
 
+### Using an MCP server as the conversation store
+
+One MCP server can additionally serve as the **conversation store** — the
+external owner of transcript bytes that makes non-claude models stateful
+(issue #2; woollama stays a client). Register the server here as usual, then
+name it with [`WOOLLAMA_CONVSTORE_SERVER`](environment.md). The server must
+expose the `create_thread` / `get_thread` / `append_turn` / `delete_thread`
+tools; the reference implementation is `examples/mcp-convstore/server.py`:
+
+```json
+{
+  "mcpServers": {
+    "convstore": {
+      "command": "python",
+      "args": ["${WOOLLAMA_EXAMPLES_DIR}/mcp-convstore/server.py"]
+    }
+  }
+}
+```
+
+```sh
+WOOLLAMA_CONVSTORE_SERVER=convstore woollama
+```
+
+Once wired, **every** non-claude model (`ollama/*`, cloud providers, and
+`woollama/<recipe>`) becomes stateful on `/v1/responses` + `/v1/conversations`.
+See the [Conversations design](conversations-api-design.md) §10 for the contract.
+
 ## `recipes.toml`
 
 A recipe binds a system prompt + an allow-listed tool set + an inferencer into a

@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -68,17 +69,19 @@ def _free_port() -> int:
         s.close()
 
 
-@pytest.fixture
-def woollama_server(tmp_path):
-    """Spawn `woollama` with a clean WOOLLAMA_CONFIG_DIR (so bundled defaults
-    load) on a fresh ephemeral port. Yields the base URL. Tears down on exit.
-    """
+@contextmanager
+def _spawn_woollama(tmp_path, *, extra_env=None):
+    """Spawn `woollama` with WOOLLAMA_CONFIG_DIR=tmp_path on a fresh ephemeral
+    port; yield the base URL; tear down on exit. `extra_env` overlays the child's
+    environment (e.g. WOOLLAMA_CONVSTORE_SERVER). Pre-populate tmp_path with a
+    config file (e.g. mcp.json) BEFORE calling to override the bundled defaults."""
     port = _free_port()
     env = {
         **os.environ,
         "WOOLLAMA_ADDRESS": f"127.0.0.1:{port}",
-        "WOOLLAMA_CONFIG_DIR": str(tmp_path),  # forces bundled defaults
+        "WOOLLAMA_CONFIG_DIR": str(tmp_path),  # empty dir → bundled defaults
         "XDG_RUNTIME_DIR": str(tmp_path),       # don't clobber the user's real addr-file
+        **(extra_env or {}),
     }
     proc = subprocess.Popen(
         [sys.executable, "-m", "woollama"],
@@ -108,6 +111,31 @@ def woollama_server(tmp_path):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+@pytest.fixture
+def woollama_server(tmp_path):
+    """A live `woollama` on bundled defaults (clean WOOLLAMA_CONFIG_DIR)."""
+    with _spawn_woollama(tmp_path) as base_url:
+        yield base_url
+
+
+@pytest.fixture
+def woollama_server_convstore(tmp_path):
+    """A live `woollama` wired to the reference MCP conversation-store
+    (examples/mcp-convstore) as the state owner for non-claude models — so
+    /v1/responses is stateful for ollama. Writes an mcp.json registering the
+    convstore server and sets WOOLLAMA_CONVSTORE_SERVER to name it. (This mcp.json
+    REPLACES the bundled hello/textops servers, which this journey doesn't need.)"""
+    server_path = REPO_ROOT / "examples" / "mcp-convstore" / "server.py"
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "mcpServers": {
+            "convstore": {"command": sys.executable, "args": [str(server_path)]}
+        }
+    }))
+    with _spawn_woollama(
+            tmp_path, extra_env={"WOOLLAMA_CONVSTORE_SERVER": "convstore"}) as base_url:
+        yield base_url
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +478,58 @@ def test_responses_streaming_live(woollama_server):
     assert events[0] == "response.created" and events[-1] == "response.completed"
     assert "response.output_text.delta" in events
     assert "".join(deltas) == completed_text and completed_text
+
+
+@needs_ollama
+def test_store_backed_conversation_journey_live(woollama_server_convstore):
+    """conv-7 / issue #2 E2E: with the reference MCP conversation-store wired in,
+    a NON-claude model (ollama) becomes stateful — the store (its own process)
+    owns the transcript bytes, woollama stays a client. Proves: create a stateful
+    conversation, recall across two turns (the store-held prior is reassembled
+    into turn 2's stateless inference), and /items SERVES the transcript from the
+    external store. This is the first non-claude stateful journey — keyless, no
+    cloud spend (real ollama + the in-process example store)."""
+    import openai
+    base = woollama_server_convstore
+    models = httpx.get(f"{base}/v1/models", timeout=5).json()["data"]
+    ids = [m["id"][len("ollama/"):] for m in models if m["id"].startswith("ollama/")]
+    if not ids:
+        pytest.skip("no Ollama models available")
+    model = f"ollama/{ids[0]}"
+
+    # 1) CREATE a stateful conversation on a non-claude model — only possible
+    #    because a store provider is wired (else backend_for_model → None).
+    created = httpx.post(f"{base}/v1/conversations",
+                         json={"model": model, "title": "store-journey"}, timeout=15)
+    assert created.status_code == 201, created.text
+    conv = created.json()
+    cid = conv["id"]
+    assert conv["backend"] == "store-backed"
+
+    # 2) DRIVE two turns attaching by id; recall proves the store-held prior was
+    #    reassembled into the second turn's stateless inference.
+    c = openai.OpenAI(base_url=f"{base}/v1", api_key="not-required")
+    c.responses.create(model=model, conversation=cid,
+                       input="Remember this codeword: banana. Reply with only: ok",
+                       timeout=180)
+    r2 = c.responses.create(model=model, conversation=cid,
+                            input="What codeword did I ask you to remember? "
+                                  "Reply with only that word.", timeout=180)
+    assert r2.conversation.id == cid
+    assert "banana" in r2.output_text.lower(), \
+        f"store-backed reassembly should recall the codeword; got {r2.output_text!r}"
+
+    # 3) /items SERVES the transcript — read back from the external store (the
+    #    store-backed backend implements history, unlike claude-resume's 501).
+    items = httpx.get(f"{base}/v1/conversations/{cid}/items", timeout=15)
+    assert items.status_code == 200, items.text
+    roles = [it["role"] for it in items.json()["data"]]
+    assert roles.count("user") >= 2 and "assistant" in roles
+
+    # 4) DELETE removes it (and tells the store to drop the thread), then gone.
+    deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=15).json()
+    assert deleted["deleted"] is True
+    assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
 
 
 @needs_anthropic

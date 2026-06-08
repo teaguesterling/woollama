@@ -16,9 +16,11 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
@@ -75,6 +77,24 @@ _mcp = build_server(registry, manage_registry=False)
 _mcp_app = _mcp.http_app(path="/", transport="http")
 
 
+def _mcp_store_call(mgr: ServerManager) -> conversations.StoreCallFn:
+    """Build the injected `call(tool, args)` for an `McpStoreProvider` over an MCP
+    convstore server. Invokes the tool, parses its JSON text block(s) (the server
+    returns explicit `json.dumps(...)` strings — see examples/mcp-convstore), and
+    wraps ANY transport/parse failure in `OrchestrationError(..., 502)` so a flaky
+    store surfaces as a gateway error through `_responses_stateful`, not a 500."""
+    async def call(tool: str, args: dict) -> Any:
+        try:
+            result = await mgr.call_tool(tool, args)
+            text = "".join(c.text for c in result.content if hasattr(c, "text"))
+            return json.loads(text)
+        except Exception as e:
+            raise OrchestrationError(
+                f"conversation store '{mgr.name}' failed on '{tool}': {e}",
+                "upstream_error", 502) from e
+    return call
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Server bundle from mcp.json (user config or bundled defaults).
@@ -85,6 +105,26 @@ async def lifespan(app: FastAPI):
     # Downstream tools are known now → re-export them onto the MCP surface
     # (same dynamic registration the stdio path does in build_server's lifespan).
     register_reexported_tools(_mcp, registry)
+    # Optional: wire an external MCP conversation-store as the state owner for
+    # NON-claude models (issue #2). Named by $WOOLLAMA_CONVSTORE_SERVER, which
+    # must be a server key in mcp.json. Once wired, EVERY non-claude model
+    # (ollama, cloud providers, AND woollama/<recipe>) becomes stateful on
+    # /v1/responses + /v1/conversations — the store, not woollama, owns the
+    # transcript bytes (woollama stays a client).
+    if store_server := os.environ.get("WOOLLAMA_CONVSTORE_SERVER"):
+        mgr = registry.servers.get(store_server)
+        if mgr is None:
+            log.warning(
+                "WOOLLAMA_CONVSTORE_SERVER=%r names no configured MCP server "
+                "(have: %s); non-claude models stay stateless",
+                store_server, list(registry.servers))
+        else:
+            conversations.register_store_backend(
+                conversations.McpStoreProvider(_mcp_store_call(mgr)),
+                complete_stateless)
+            log.info("conversation store wired: '%s' backs non-claude models "
+                     "(stateful /v1/responses for ollama/cloud/recipes)",
+                     store_server)
     # Run the mounted MCP app's own lifespan (Streamable HTTP session manager)
     # for the duration of the server, then tear the registry down.
     async with _mcp_app.lifespan(app):

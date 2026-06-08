@@ -34,6 +34,7 @@ Required only to *use* (or live-`discover`) the matching cloud provider.
 | `XDG_CONFIG_HOME` | `~/.config` | Base for the default config dir (above). |
 | `WOOLLAMA_OLLAMA_URL` | `http://localhost:11434` | The local Ollama endpoint (the `ollama/` provider's base + its `/v1/models` discovery). |
 | `WOOLLAMA_CLAUDE_BIN` | `claude` (on `PATH`) | Path to the Claude Code CLI for `claude-code/<model>` (inference, delegation, and the `claude-resume` conversation backend). |
+| `WOOLLAMA_CONVSTORE_SERVER` | *(unset)* | Name of an MCP server in `mcp.json` to use as the **conversation store** (issue #2). When set and the server is present, **every non-claude model** — `ollama/*`, cloud providers, and `woollama/<recipe>` — becomes stateful on `/v1/responses` + `/v1/conversations`: the store owns the transcript, woollama stays a client. Unset (the default) ⇒ those models are stateless. A name that matches no configured server is logged as a warning and ignored. See [Conversations](conversations-api-design.md) §10 and the reference store at `examples/mcp-convstore`. |
 
 ## Claude Code child process
 

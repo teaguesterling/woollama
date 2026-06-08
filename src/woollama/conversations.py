@@ -50,7 +50,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from . import claude_code, managed_agents, responses
 
@@ -333,6 +333,48 @@ def register_store_backend(store: ConversationStoreProvider, complete: CompleteF
     provider ships by default. The router passes `complete_stateless` as the
     inference fn."""
     BACKENDS[name] = StoreBackedBackend(name, store, complete)
+
+
+# An injected MCP call: (tool_name, args) -> the already-parsed JSON value the
+# convstore server returned. The router supplies a wrapper that invokes the
+# server via `ServerManager.call_tool`, parses its text blocks, and converts any
+# transport/parse failure into a clean `OrchestrationError(..., 502)` — so a
+# flaky store surfaces as a gateway error through `_responses_stateful`, never a
+# 500. Injected (not imported) so this module never imports `manager`/`router`.
+StoreCallFn = Callable[..., Awaitable[Any]]
+
+
+class McpStoreProvider:
+    """A `ConversationStoreProvider` backed by an MCP conversation-store server
+    (the reference implementation is `examples/mcp-convstore/server.py`). Holds
+    NO transcript bytes itself — every operation is one MCP tool call to the
+    external server, which owns the state. This keeps woollama a *client* to the
+    store, the core principle of the conversations design.
+
+    The tool contract (the server returns explicit `json.dumps(...)` strings):
+      - `create_thread()`                  -> thread_id (str)
+      - `get_thread(thread_id)`            -> list[message dict]  ([] when fresh)
+      - `append_turn(thread_id, messages)` -> {"ok", "count"}
+      - `delete_thread(thread_id)`         -> {"ok": True}
+
+    The injected `call` returns the already-parsed value and raises
+    `OrchestrationError` on transport/parse failure (built by the router; see
+    `_mcp_store_call`)."""
+
+    def __init__(self, call: StoreCallFn):
+        self._call = call
+
+    async def create(self) -> str:
+        return await self._call("create_thread", {})
+
+    async def get(self, thread_id: str) -> list[dict]:
+        return await self._call("get_thread", {"thread_id": thread_id})
+
+    async def append(self, thread_id: str, messages: list[dict]) -> None:
+        await self._call("append_turn", {"thread_id": thread_id, "messages": messages})
+
+    async def delete(self, thread_id: str) -> None:
+        await self._call("delete_thread", {"thread_id": thread_id})
 
 
 def backend_for_model(model: str) -> str | None:
