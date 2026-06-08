@@ -171,16 +171,18 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 - OpenAI surface: `/v1/models`, `/v1/chat/completions` (pass-through +
   recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
   introspection
-- **Stateful surface**: `/v1/responses` (stateless subset + stateful) and
-  `/v1/conversations` (create/list/get/delete, plus `items` where the backend
-  exposes its transcript). woollama routes conversation *handles*; backends own
-  state (woollama never stores transcripts itself) — `claude-resume` for
-  `claude-code` models, `managed-agents` (Anthropic Managed Agents) for
-  `claude-agent` models; models with no state-owning backend are stateless
-  (`store:false`)
-- Multi-backend routing by `<provider>/<model>`: ollama, anthropic, openai,
-  groq, together, openrouter, `claude-code`, + any OpenAI-compatible endpoint
-  via `inferencers.toml`
+- **Stateful surface**: `/v1/responses` (stateless subset, incl. `stream:true` →
+  OpenAI Responses SSE, + stateful) and `/v1/conversations` (create/list/get/
+  delete, plus `items` where the backend exposes its transcript). woollama routes
+  conversation *handles*; backends own state (woollama never stores transcripts
+  itself) — `claude-resume` for `claude-code` models, `managed-agents` (Anthropic
+  Managed Agents) for `claude-agent` models, with an interactive
+  `requires_action` pause/answer path; models with no state-owning backend are
+  stateless (`store:false`)
+- Multi-backend routing by `<provider>/<model>`: ollama (incl. `num_ctx` honored
+  via ollama's native `/api/chat`), anthropic, openai, groq, together,
+  openrouter, `claude-code`, + any OpenAI-compatible endpoint via
+  `inferencers.toml`
 - **Tool delegation**: a `claude-code` recipe with tools runs as an *executor* —
   Claude owns the agentic loop and calls the recipe's allow-listed MCP tools
   itself (per-recipe `--mcp-config` + `--allowedTools` containment)
@@ -197,8 +199,11 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 ## Not yet (next on the roadmap)
 
 - The live, interactive Claude-in-tmux session backend (a separate Rust session
-  driver) and the interactive `requires_action` path — gated on spikes that need
-  a real terminal
+  driver) — gated on spikes that need a real terminal. (The interactive
+  `requires_action` path itself already works via the managed-agents backend.)
+- A `store-backed` conversations provider for non-claude models — the woollama
+  side is built behind an un-wired seam; it's pending the fabric session
+  read/append contract (cross-repo)
 - cosmic-fabric actually consuming the conversations surface (the last v1.0 gate)
 - The Rust v1.0 port
 

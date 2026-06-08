@@ -12,11 +12,12 @@ shipped 2026-06-04**: `/v1/conversations` create/list/get/delete. **conv-5
 (duckdb `stored` backend) shipped 2026-06-05 then REVERTED 2026-06-06** — it made
 woollama OWN conversation storage (an embedded duckdb), which violates the
 principle below; woollama must never be the store. Models with no state-owning
-backend are now stateless (`store:false`); see §8 item 5. Still to do from §8:
-a state-owning backend for non-claude models that DEFERS to an external owner —
-the leading candidate is **Managed Agents** (§8 item 7, Anthropic owns the
-session); plus the Rust driver + claude-tmux backend (gated on §6 spikes), the
-interactive `requires_action` path, and cosmic-fabric wiring.
+backend are now stateless (`store:false`); see §8 item 5. **Shipped since:**
+`managed-agents` (conv-6, §8 item 7 — Anthropic owns the session), the interactive
+`requires_action` path (conv-8, §5), streaming `/v1/responses` (conv-9, §1), and
+the woollama-side `store-backed` mechanism (conv-7, §10 — un-wired pending the
+fabric provider). **Still to do:** the fabric store provider + its contract; the
+Rust driver + claude-tmux backend (gated on §6 spikes); cosmic-fabric wiring.
 
 ## The principle
 
@@ -253,7 +254,7 @@ plain terminal before building the claude-tmux backend:
      context, returns the SAME `session_id`. **Load-bearing gotcha the live test
      caught:** Claude scopes sessions BY PROJECT (cwd), so all turns of a
      conversation MUST run in the same dir — each conversation pins a stable
-     `workdir` (a fresh empty temp dir, cleaned on delete in a later slice).
+     `workdir` (a fresh empty temp dir, removed on `DELETE` by the backend).
      `--resume` continues from the session TIP (no fork-from-earlier-turn
      primitive), so `previous_response_id` CHAINS off the conversation; true
      forking is later. Handle table is in-memory → a restart loses sid mappings.

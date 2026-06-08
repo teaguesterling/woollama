@@ -1,7 +1,7 @@
 # woollama roadmap & status
 
 Single source of truth for *what's built, what's next, and in what order.*
-Updated 2026-06-03. Detailed history: [`build-log.md`](build-log.md). Target
+Updated 2026-06-07. Detailed history: [`build-log.md`](build-log.md). Target
 design: [`architecture.md`](architecture.md). v1.0 gate:
 [`rust-transition.md`](rust-transition.md).
 
@@ -36,6 +36,10 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
 | **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras) | `router.py`, `conversations.py` | conv-2 |
 | **`managed-agents` backend** — `claude-agent/<model>` → Anthropic Managed Agents (hosted session owns state); implements `history` so `/items` serves the transcript | `managed_agents.py`, `conversations.py` | conv-6 |
+| **`store-backed` backend** — store-only/BYO-inference for non-claude models, behind an un-wired provider seam (none ships → stateless by default) | `conversations.py` | conv-7 |
+| **Interactive `requires_action`** — managed-agents `ask_user` custom tool → pause/answer via the Responses primitive | `managed_agents.py`, `router.py` | conv-8 |
+| **Streaming `/v1/responses`** — stateless `stream:true` → OpenAI Responses SSE (recipe or inferencer deltas) | `router.py` | conv-9 |
+| **Ollama `num_ctx` honored** — `ollama/<model>` with `options.num_ctx` routes to native `/api/chat` (passthrough + stateful) | `ollama_native.py`, `router.py` | #1 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
