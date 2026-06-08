@@ -139,6 +139,57 @@ def woollama_server_convstore(tmp_path):
         yield base_url
 
 
+@contextmanager
+def _spawn_rest_convstore(store_dir):
+    """Spawn the reference REST file-store (examples/rest-convstore) on a free
+    port; yield its base URL. Bytes persist as JSON files under `store_dir`."""
+    port = _free_port()
+    server_path = REPO_ROOT / "examples" / "rest-convstore" / "server.py"
+    proc = subprocess.Popen(
+        [sys.executable, str(server_path), "--port", str(port)],
+        cwd=REPO_ROOT,
+        env={**os.environ, "CONVSTORE_DIR": str(store_dir)},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                # GET on any id returns 200 [] once the app is serving.
+                if httpx.get(f"{base}/threads/_ping", timeout=0.5).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        else:
+            proc.terminate()
+            raise RuntimeError(f"rest-convstore didn't come up on {base}")
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture
+def woollama_server_http_convstore(tmp_path):
+    """A live `woollama` wired to the reference REST file-store
+    (examples/rest-convstore) via the typed `{type:http}` conversationStore form.
+    Yields `(base_url, store_dir)` — store_dir lets a test assert the transcript
+    was persisted to disk by the external store."""
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with _spawn_rest_convstore(store_dir) as store_url:
+        (tmp_path / "mcp.json").write_text(json.dumps({
+            "conversationStore": {"type": "http", "url": store_url},
+            "mcpServers": {},
+        }))
+        with _spawn_woollama(tmp_path) as base_url:
+            yield base_url, store_dir
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -481,17 +532,12 @@ def test_responses_streaming_live(woollama_server):
     assert "".join(deltas) == completed_text and completed_text
 
 
-@needs_ollama
-def test_store_backed_conversation_journey_live(woollama_server_convstore):
-    """conv-7 / issue #2 E2E: with the reference MCP conversation-store wired in,
-    a NON-claude model (ollama) becomes stateful — the store (its own process)
-    owns the transcript bytes, woollama stays a client. Proves: create a stateful
-    conversation, recall across two turns (the store-held prior is reassembled
-    into turn 2's stateless inference), and /items SERVES the transcript from the
-    external store. This is the first non-claude stateful journey — keyless, no
-    cloud spend (real ollama + the in-process example store)."""
+def _store_journey_through_items(base):
+    """Drive the store-backed stateful journey on a non-claude model and return
+    its conversation id, having verified create → two-turn recall → /items. Shared
+    by both store providers (MCP and HTTP) — only the wiring differs, the surface
+    behavior must be identical. Skips if no Ollama model is available."""
     import openai
-    base = woollama_server_convstore
     models = httpx.get(f"{base}/v1/models", timeout=5).json()["data"]
     ids = [m["id"][len("ollama/"):] for m in models if m["id"].startswith("ollama/")]
     if not ids:
@@ -526,11 +572,47 @@ def test_store_backed_conversation_journey_live(woollama_server_convstore):
     assert items.status_code == 200, items.text
     roles = [it["role"] for it in items.json()["data"]]
     assert roles.count("user") >= 2 and "assistant" in roles
+    return cid
 
-    # 4) DELETE removes it (and tells the store to drop the thread), then gone.
+
+@needs_ollama
+def test_store_backed_conversation_journey_live(woollama_server_convstore):
+    """conv-7 / issue #2 E2E with the reference MCP conversation-store: a NON-claude
+    model (ollama) becomes stateful — the store (its own process) owns the
+    transcript bytes, woollama stays a client. Create → two-turn recall (store-held
+    prior reassembled into turn 2's stateless inference) → /items served from the
+    store → delete. The first non-claude stateful journey; keyless, no cloud spend."""
+    base = woollama_server_convstore
+    cid = _store_journey_through_items(base)
+    # DELETE removes it (and tells the store to drop the thread), then gone.
     deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=15).json()
     assert deleted["deleted"] is True
     assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
+
+
+@needs_ollama
+def test_http_store_backed_conversation_journey_live(woollama_server_http_convstore):
+    """Same journey as above but over the REST file-store (examples/rest-convstore)
+    via the typed `{type:http}` conversationStore — proving the ConversationStore
+    seam is transport-agnostic (HTTP as well as MCP). Additionally asserts the
+    transcript was PERSISTED to disk by the external store (a file the store owns,
+    that woollama never wrote), and that DELETE removes it."""
+    base, store_dir = woollama_server_http_convstore
+    cid = _store_journey_through_items(base)
+
+    # Persistence proof: the external store wrote the transcript to its own file —
+    # woollama holds only the handle. The codeword lives on disk under store_dir.
+    files = list(store_dir.glob("*.json"))
+    assert files, "expected the REST store to persist a thread file"
+    assert any("banana" in f.read_text().lower() for f in files), \
+        "the persisted transcript should contain the recalled codeword"
+
+    # DELETE removes the conversation and the store's file.
+    deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=15).json()
+    assert deleted["deleted"] is True
+    assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
+    assert not list(store_dir.glob("*.json")), \
+        "delete should have removed the store's thread file"
 
 
 @needs_anthropic

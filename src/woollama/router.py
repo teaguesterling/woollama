@@ -94,6 +94,28 @@ def _mcp_store_call(mgr: ServerManager) -> conversations.StoreCallFn:
     return call
 
 
+def _http_store_call(base_url: str) -> conversations.StoreCallFn:
+    """Build the injected `call(method, path, body)` for an `HttpStoreProvider`
+    over a REST conversation-store endpoint. Issues the request, returns parsed
+    JSON (None for an empty/204 body), and wraps any non-2xx / transport failure
+    as `OrchestrationError(502)` — the same clean-gateway guarantee as the MCP
+    path, so a flaky store surfaces through `_responses_stateful`, not as a 500."""
+    base = base_url.rstrip("/")
+    async def call(method: str, path: str, body: Any = None) -> Any:
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.request(method, f"{base}{path}", json=body)
+                r.raise_for_status()
+                if r.status_code == 204 or not r.content:
+                    return None
+                return r.json()
+        except Exception as e:
+            raise OrchestrationError(
+                f"conversation store (http {base}) failed on {method} {path}: {e}",
+                "upstream_error", 502) from e
+    return call
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Server bundle from mcp.json (user config or bundled defaults).
@@ -104,26 +126,35 @@ async def lifespan(app: FastAPI):
     # Downstream tools are known now → re-export them onto the MCP surface
     # (same dynamic registration the stdio path does in build_server's lifespan).
     register_reexported_tools(_mcp, registry)
-    # Optional: wire an external MCP conversation-store as the state owner for
-    # NON-claude models (issue #2). Named by the `conversationStore` key in
-    # mcp.json, which must be a server key in `mcpServers`. Once wired, EVERY
-    # non-claude model (ollama, cloud providers, AND woollama/<recipe>) becomes
-    # stateful on /v1/responses + /v1/conversations — the store, not woollama,
-    # owns the transcript bytes (woollama stays a client).
-    if store_server := config.load_conversation_store_name():
-        mgr = registry.servers.get(store_server)
+    # Optional: wire an external conversation store as the state owner for
+    # NON-claude models (issue #2), from the `conversationStore` key in mcp.json
+    # (an MCP server name or a typed {mcp|http} descriptor — see
+    # config.load_conversation_store). Once wired, EVERY non-claude model (ollama,
+    # cloud providers, AND woollama/<recipe>) becomes stateful on /v1/responses +
+    # /v1/conversations — the store, not woollama, owns the transcript bytes
+    # (woollama stays a client over MCP or HTTP).
+    store_cfg = config.load_conversation_store()
+    if store_cfg and store_cfg["type"] == "mcp":
+        mgr = registry.servers.get(store_cfg["server"])
         if mgr is None:
             log.warning(
-                "mcp.json conversationStore=%r names no configured MCP server "
+                "mcp.json conversationStore mcp server %r is not in mcpServers "
                 "(have: %s); non-claude models stay stateless",
-                store_server, list(registry.servers))
+                store_cfg["server"], list(registry.servers))
         else:
             conversations.register_store_backend(
                 conversations.McpStoreProvider(_mcp_store_call(mgr)),
                 complete_stateless)
-            log.info("conversation store wired: '%s' backs non-claude models "
-                     "(stateful /v1/responses for ollama/cloud/recipes)",
-                     store_server)
+            log.info("conversation store wired: mcp server '%s' backs non-claude "
+                     "models (stateful /v1/responses for ollama/cloud/recipes)",
+                     store_cfg["server"])
+    elif store_cfg and store_cfg["type"] == "http":
+        conversations.register_store_backend(
+            conversations.HttpStoreProvider(_http_store_call(store_cfg["url"])),
+            complete_stateless)
+        log.info("conversation store wired: http %s backs non-claude models "
+                 "(stateful /v1/responses for ollama/cloud/recipes)",
+                 store_cfg["url"])
     # Run the mounted MCP app's own lifespan (Streamable HTTP session manager)
     # for the duration of the server, then tear the registry down.
     async with _mcp_app.lifespan(app):

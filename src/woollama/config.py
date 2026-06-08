@@ -95,24 +95,48 @@ def load_mcp_servers() -> dict[str, dict]:
     return out
 
 
-def load_conversation_store_name() -> str | None:
-    """The MCP server to use as the conversation store (issue #2), from the
-    top-level `conversationStore` key in `mcp.json` — a sibling of `mcpServers`
-    naming one of its keys. `None` (the default) ⇒ non-claude models stay
-    stateless. The named server must also appear in `mcpServers`; the router
-    warns and stays stateless if it doesn't. (Config-driven, not an env var, so
-    the wiring lives with the rest of woollama's file config.)"""
+def load_conversation_store() -> dict | None:
+    """The conversation store to use (issue #2), from the top-level
+    `conversationStore` key in `mcp.json`. Returns a typed descriptor or `None`
+    (the default ⇒ non-claude models stay stateless). Accepted forms:
+
+      - `"convstore"`                         → `{"type": "mcp", "server": "convstore"}`
+        (string shorthand: names an `mcpServers` entry)
+      - `{"type": "mcp", "server": "name"}`   → an MCP conversation-store server
+      - `{"type": "http", "url": "http://…"}` → a REST conversation-store endpoint
+
+    The router validates that an `mcp` server actually exists in `mcpServers` (it
+    warns + stays stateless if not). Config-driven, not an env var, so the wiring
+    lives with the rest of woollama's file config."""
     source, text = _read_user_or_default("mcp.json")
     text = _expand_env(text)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         raise ValueError(f"mcp.json parse error in {source}: {e}") from e
-    name = data.get("conversationStore")
-    if name is not None and not isinstance(name, str):
+    raw = data.get("conversationStore")
+    if raw is None:
+        return None
+    if isinstance(raw, str):                       # shorthand → mcp server name
+        return {"type": "mcp", "server": raw}
+    if not isinstance(raw, dict):
         raise ValueError(f"mcp.json {source}: 'conversationStore' must be a "
-                         f"string (an mcpServers key)")
-    return name
+                         f"string or an object with a 'type'")
+    kind = raw.get("type")
+    if kind == "mcp":
+        server = raw.get("server")
+        if not isinstance(server, str):
+            raise ValueError(f"mcp.json {source}: conversationStore type 'mcp' "
+                             f"needs a string 'server' (an mcpServers key)")
+        return {"type": "mcp", "server": server}
+    if kind == "http":
+        url = raw.get("url")
+        if not isinstance(url, str):
+            raise ValueError(f"mcp.json {source}: conversationStore type 'http' "
+                             f"needs a string 'url'")
+        return {"type": "http", "url": url}
+    raise ValueError(f"mcp.json {source}: unknown conversationStore type "
+                     f"{kind!r} (expected 'mcp' or 'http')")
 
 
 # ----- recipes.toml loading -------------------------------------------------

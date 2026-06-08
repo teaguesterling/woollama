@@ -48,6 +48,7 @@ import asyncio
 import shutil
 import tempfile
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -375,6 +376,43 @@ class McpStoreProvider:
 
     async def delete(self, thread_id: str) -> None:
         await self._call("delete_thread", {"thread_id": thread_id})
+
+
+class HttpStoreProvider:
+    """A `ConversationStoreProvider` backed by a REST conversation-store endpoint
+    (the reference implementation is `examples/rest-convstore/server.py`). Sibling
+    to `McpStoreProvider` — the same four ops, plain HTTP instead of MCP; holds no
+    transcript bytes. Two reference providers over one transport-agnostic seam.
+
+    The provider mints the thread id (a UUID) and `PUT`s it, so the store needs no
+    id-minting logic and create is idempotent. The injected `call(method, path,
+    body)` (built by the router; see `_http_store_call`) issues the request,
+    returns parsed JSON (or None for an empty/204 body), and raises
+    `OrchestrationError(502)` on any non-2xx / transport failure.
+
+    REST mapping (`examples/rest-convstore/server.py`):
+      - create  -> `PUT    /threads/{uuid}`  (provider mints the uuid)
+      - get     -> `GET    /threads/{id}`    -> list[message dict]  ([] when fresh)
+      - append  -> `PATCH  /threads/{id}`    (body = the new messages)
+      - delete  -> `DELETE /threads/{id}`
+    """
+
+    def __init__(self, call: StoreCallFn):
+        self._call = call
+
+    async def create(self) -> str:
+        thread_id = uuid.uuid4().hex
+        await self._call("PUT", f"/threads/{thread_id}", None)
+        return thread_id
+
+    async def get(self, thread_id: str) -> list[dict]:
+        return await self._call("GET", f"/threads/{thread_id}", None) or []
+
+    async def append(self, thread_id: str, messages: list[dict]) -> None:
+        await self._call("PATCH", f"/threads/{thread_id}", messages)
+
+    async def delete(self, thread_id: str) -> None:
+        await self._call("DELETE", f"/threads/{thread_id}", None)
 
 
 def backend_for_model(model: str) -> str | None:

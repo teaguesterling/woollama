@@ -37,7 +37,8 @@ Required only to *use* (or live-`discover`) the matching cloud provider.
 
 > The **conversation store** (issue #2) that makes non-claude models stateful is
 > selected in config, not by an env var — the top-level `conversationStore` key
-> in [`mcp.json`](configuration.md#using-an-mcp-server-as-the-conversation-store).
+> in [`mcp.json`](configuration.md#selecting-a-conversation-store) (an MCP server
+> or an HTTP endpoint).
 
 ## Claude Code child process
 

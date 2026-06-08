@@ -40,19 +40,20 @@ Shape matches Claude Code's `mcpServers` block:
 woollama starts one long-lived connection per server and aggregates their tools
 (namespaced `<server>.<tool>`).
 
-### Using an MCP server as the conversation store
+### Selecting a conversation store
 
-One MCP server can additionally serve as the **conversation store** — the
-external owner of transcript bytes that makes non-claude models stateful
-(issue #2; woollama stays a client). Register the server in `mcpServers` as
-usual, then name it with a top-level `conversationStore` key (a sibling of
-`mcpServers`). The server must expose the `create_thread` / `get_thread` /
-`append_turn` / `delete_thread` tools; the reference implementation is
-`examples/mcp-convstore/server.py`:
+An **external** conversation store makes non-claude models stateful (issue #2) —
+it owns the transcript bytes while woollama stays a client. Select one with the
+top-level `conversationStore` key (a sibling of `mcpServers`). woollama ships two
+reference stores and the seam is transport-agnostic, so the key takes two typed
+forms:
+
+**MCP store** — a server in `mcpServers` exposing `create_thread` / `get_thread` /
+`append_turn` / `delete_thread` (reference: `examples/mcp-convstore`):
 
 ```json
 {
-  "conversationStore": "convstore",
+  "conversationStore": { "type": "mcp", "server": "convstore" },
   "mcpServers": {
     "convstore": {
       "command": "python",
@@ -62,9 +63,21 @@ usual, then name it with a top-level `conversationStore` key (a sibling of
 }
 ```
 
+A bare string is shorthand for the MCP form: `"conversationStore": "convstore"`
+≡ `{ "type": "mcp", "server": "convstore" }`.
+
+**HTTP store** — a REST endpoint with `PUT`/`GET`/`PATCH`/`DELETE /threads/{id}`
+(reference: `examples/rest-convstore`, file-backed so transcripts persist):
+
+```json
+{
+  "conversationStore": { "type": "http", "url": "http://127.0.0.1:9000" }
+}
+```
+
 | Field | Required | Description |
 |---|---|---|
-| `conversationStore` | — | Name of an `mcpServers` entry to use as the conversation store. Omitted (the default) ⇒ non-claude models are stateless. A name with no matching server is warned and ignored. |
+| `conversationStore` | — | The store to use. A string (= MCP server name), `{type:"mcp", server}`, or `{type:"http", url}`. Omitted (the default) ⇒ non-claude models are stateless. An `mcp` server not present in `mcpServers` is warned and ignored. |
 
 Once set, **every** non-claude model (`ollama/*`, cloud providers, and
 `woollama/<recipe>`) becomes stateful on `/v1/responses` + `/v1/conversations`.

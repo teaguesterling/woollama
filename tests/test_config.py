@@ -108,32 +108,64 @@ def test_server_missing_command_raises(monkeypatch, tmp_path):
 
 # --- conversation store selection (issue #2; config-driven, not an env var) ---
 
-def test_conversation_store_name_default_none(monkeypatch, tmp_path):
+def test_conversation_store_default_none(monkeypatch, tmp_path):
     # Bundled defaults name no store → non-claude models stay stateless.
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     from woollama import config
-    assert config.load_conversation_store_name() is None
+    assert config.load_conversation_store() is None
 
 
-def test_conversation_store_name_from_mcp_json(monkeypatch, tmp_path):
+def test_conversation_store_string_is_mcp_shorthand(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "mcp.json").write_text(json.dumps({
         "conversationStore": "convstore",
         "mcpServers": {"convstore": {"command": "python", "args": ["s.py"]}},
     }))
     from woollama import config
-    assert config.load_conversation_store_name() == "convstore"
+    assert config.load_conversation_store() == {"type": "mcp", "server": "convstore"}
 
 
-def test_conversation_store_name_not_string_raises(monkeypatch, tmp_path):
+def test_conversation_store_typed_mcp(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "mcp.json").write_text(json.dumps({
-        "conversationStore": ["convstore"],   # must be a string
+        "conversationStore": {"type": "mcp", "server": "convstore"},
+        "mcpServers": {"convstore": {"command": "python", "args": ["s.py"]}},
+    }))
+    from woollama import config
+    assert config.load_conversation_store() == {"type": "mcp", "server": "convstore"}
+
+
+def test_conversation_store_typed_http(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": {"type": "http", "url": "http://127.0.0.1:9000"},
         "mcpServers": {},
     }))
     from woollama import config
-    with pytest.raises(ValueError, match="'conversationStore' must be a"):
-        config.load_conversation_store_name()
+    assert config.load_conversation_store() == {
+        "type": "http", "url": "http://127.0.0.1:9000"}
+
+
+def test_conversation_store_http_missing_url_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": {"type": "http"},   # no url
+        "mcpServers": {},
+    }))
+    from woollama import config
+    with pytest.raises(ValueError, match="type 'http' needs a string 'url'"):
+        config.load_conversation_store()
+
+
+def test_conversation_store_unknown_type_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": {"type": "smoke-signals"},
+        "mcpServers": {},
+    }))
+    from woollama import config
+    with pytest.raises(ValueError, match="unknown conversationStore type"):
+        config.load_conversation_store()
 
 
 # --- type guards: each malformed-shape contract has its own clear error ------

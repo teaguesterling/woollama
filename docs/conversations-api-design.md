@@ -15,7 +15,7 @@ Status at a glance (decisions locked 2026-06-02):
 | conv-9 | streaming `/v1/responses` (Responses SSE) | §1 | shipped |
 | conv-6 | `managed-agents` backend (Anthropic-hosted) | §3.1, §8.7 | shipped |
 | conv-8 | interactive `requires_action` (ask_user) | §5 | shipped |
-| conv-7 | `store-backed` (non-claude) + reference MCP store provider | §3.1, §10 | shipped — wired via mcp.json's `conversationStore` (fabric provider still pending) |
+| conv-7 | `store-backed` (non-claude) + two reference store providers (MCP + HTTP) | §3.1, §10 | shipped — wired via mcp.json's `conversationStore` (fabric provider still pending) |
 | conv-5 | duckdb `stored` backend | §8.5 | **reverted** — woollama must never be the store |
 | conv-3/4 | Rust driver + claude-tmux backend | §4, §6 | pending (spike-gated) |
 
@@ -379,18 +379,18 @@ plain terminal before building the claude-tmux backend:
    `ask_user`), so plain Q&A provisions no container.
 
 8. **Store-only backend for non-claude models (issue #2)** — woollama-side
-   mechanism implemented AND wired via a reference MCP store provider (§10.3).
+   mechanism implemented AND wired via two reference store providers (§10.3).
    The first BYO-inference backend (§3.1, §10): makes `ollama/<model>` (and
    recipes/cloud) stateful by deferring the transcript to an external store
    provider and doing assembly + stateless inference woollama-side.
    `ConversationStoreProvider` protocol + `StoreBackedBackend` + routing gate +
-   clean error path shipped and tested; `McpStoreProvider` + the reference
-   `examples/mcp-convstore` server make it live today via mcp.json's
-   `conversationStore` key (hermetic + live round-trip tests). No provider ships
-   baked in, so unset ⇒ non-claude models stay stateless. Decision:
-   **provider-agnostic store seam** — fabric / the cosmic-fabricd session daemon
-   (its contract still pending, §10.2) becomes one more provider; a JSONL reader
-   another. See §10.
+   clean error path shipped and tested; `McpStoreProvider` (`examples/mcp-convstore`)
+   and `HttpStoreProvider` (`examples/rest-convstore`, file-backed) make it live
+   today via mcp.json's `conversationStore` key (hermetic + two live round-trip
+   tests). No provider ships baked in, so unset ⇒ non-claude models stay stateless.
+   Decision: **provider-agnostic store seam** — fabric / the cosmic-fabricd session
+   daemon (its contract still pending, §10.2) becomes one more provider; a JSONL
+   reader another. See §10.
 
 ## 9. Risk flags
 
@@ -489,32 +489,39 @@ cosmic-fabric maps a cosmic session name → a woollama `conversation_id` and dr
 turns via `/v1/responses` (`store:true`/`conversation`). The proposal has been
 fed back to cosmic-fabric (issue #2) as the "confirm" step.
 
-### 10.3 Reference provider: MCP conversation-store — IMPLEMENTED
+### 10.3 Reference providers — IMPLEMENTED (two, over one transport-agnostic seam)
 
-The first *real* provider is an **MCP conversation-store**: woollama as an MCP
-client to a server that exposes `create_thread` / `get_thread` / `append_turn` /
-`delete_thread` and owns the transcript bytes in its own process. This is the
-most general owner (works for any model) and proves the seam end-to-end on
-woollama's side alone, without waiting on the fabric contract (10.2).
+The seam ships with **two** real providers, deliberately on different transports
+to prove `ConversationStoreProvider` is transport-agnostic. Either one makes a
+non-claude model stateful end-to-end on woollama's side alone, without waiting on
+the fabric contract (10.2). Both hold **no** bytes; both are paired with a
+router-built injected `call` that wraps any transport/parse failure as
+`OrchestrationError(502)` (a flaky store → clean gateway error, never a 500).
 
-- **`conversations.McpStoreProvider`** — a `ConversationStoreProvider` whose four
-  ops are each one MCP tool call via an injected `call(tool, args)` (injected so
-  the module never imports `manager`/`router`). Holds no bytes.
-- **Router wiring** — the top-level `conversationStore` key in `mcp.json` names a
-  server in `mcpServers` (config-driven, not an env var); at startup the lifespan
-  builds `_mcp_store_call(mgr)` (invoke → parse the MCP text block's `json.dumps`
-  string → wrap any transport/parse failure as `OrchestrationError(502)` so a
-  flaky store is a clean gateway error, never a 500) and calls
-  `register_store_backend(McpStoreProvider(...), complete_stateless)`.
-  Absent/missing server ⇒ warned + stays stateless.
-- **Reference server** — `examples/mcp-convstore/server.py` (fastmcp; in-process
-  dict; tools return explicit `json.dumps(...)` strings). A real deployment backs
-  it with sqlite/postgres/a file.
-- **Tested** — hermetic provider + wrapper tests (`tests/test_mcp_store_provider.py`:
-  the op→tool mapping, the grounded result-parse, and that a flaky store → 502
-  not 500) **and** a live round-trip (`tests/test_integration.py::
-  test_store_backed_conversation_journey_live`: real convstore + real ollama,
-  two turns, cross-turn recall, `/items` served from the store, delete).
+- **`conversations.McpStoreProvider`** — woollama as an MCP client to a server
+  exposing `create_thread` / `get_thread` / `append_turn` / `delete_thread`. Each
+  op is one MCP tool call via injected `call(tool, args)`; `_mcp_store_call`
+  invokes the tool and parses the MCP text block's `json.dumps` string. Reference
+  server: `examples/mcp-convstore/server.py` (fastmcp; in-process dict).
+- **`conversations.HttpStoreProvider`** — woollama as an HTTP client to a REST
+  endpoint: `PUT /threads/{uuid}` (the provider mints the id → idempotent create),
+  `GET` (→ messages), `PATCH` (append), `DELETE`. Each op is one request via
+  injected `call(method, path, body)`; `_http_store_call` issues it and treats
+  204/empty as `None`. Reference server: `examples/rest-convstore/server.py`
+  (FastAPI; **file-backed**, one JSON file per thread → transcripts persist
+  across restarts).
+- **Selection** — the top-level `conversationStore` key in `mcp.json`
+  (config-driven, not an env var): a string or `{type:"mcp", server}` →
+  `McpStoreProvider`; `{type:"http", url}` → `HttpStoreProvider`. The lifespan
+  registers the chosen one with `register_store_backend(..., complete_stateless)`.
+  An `mcp` server absent from `mcpServers` ⇒ warned + stays stateless.
+- **Tested** — hermetic per provider (`tests/test_mcp_store_provider.py`,
+  `tests/test_http_store_provider.py`: op→call mapping, grounded result-parse,
+  flaky store → 502 not 500) + typed-config tests (`tests/test_config.py`) **and**
+  two live round-trips (`tests/test_integration.py`: real ollama + each reference
+  store — two turns, cross-turn recall, `/items` served; the HTTP one additionally
+  asserts the transcript was persisted to a file the store owns and that delete
+  removes it).
 
 This closes issue #2 **woollama-side**: a non-claude model is now genuinely
 stateful end-to-end with an external store, woollama never owning bytes. The

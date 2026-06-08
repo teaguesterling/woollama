@@ -36,7 +36,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
 | **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras) | `router.py`, `conversations.py` | conv-2 |
 | **`managed-agents` backend** — `claude-agent/<model>` → Anthropic Managed Agents (hosted session owns state); implements `history` so `/items` serves the transcript | `managed_agents.py`, `conversations.py` | conv-6 |
-| **`store-backed` backend + reference MCP store provider** — store-only/BYO-inference makes non-claude models stateful; `McpStoreProvider` + `examples/mcp-convstore` wire it via mcp.json's `conversationStore` key (live round-trip tested). No provider ships baked in → stateless by default | `conversations.py`, `router.py` | conv-7 |
+| **`store-backed` backend + two reference store providers** — store-only/BYO-inference makes non-claude models stateful; `McpStoreProvider` (`examples/mcp-convstore`) + `HttpStoreProvider` (`examples/rest-convstore`, file-backed) wire it via mcp.json's `conversationStore` key (both live round-trip tested). No provider ships baked in → stateless by default | `conversations.py`, `router.py` | conv-7 |
 | **Interactive `requires_action`** — managed-agents `ask_user` custom tool → pause/answer via the Responses primitive | `managed_agents.py`, `router.py` | conv-8 |
 | **Streaming `/v1/responses`** — stateless `stream:true` → OpenAI Responses SSE (recipe or inferencer deltas) | `router.py` | conv-9 |
 | **Ollama `num_ctx` honored** — `ollama/<model>` with `options.num_ctx` routes to native `/api/chat` (passthrough + stateful) | `ollama_native.py`, `router.py` | #1 |
@@ -131,19 +131,22 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      managed-agents); cosmic-fabric wiring.
    - [~] **conv-7 — store-only backend for non-claude models** (issue #2):
      woollama-side mechanism IMPLEMENTED 2026-06-07 (design-doc §10) AND WIRED via
-     a reference MCP store provider 2026-06-08 (§10.3). `ConversationStoreProvider`
+     TWO reference store providers 2026-06-08 (§10.3). `ConversationStoreProvider`
      protocol + `StoreBackedBackend` (assemble prior history → stateless inference
      → append turn) + routing gate + clean error path, hermetically tested
-     (`tests/test_store_backend.py`). `McpStoreProvider` + the reference
-     `examples/mcp-convstore` server make it live via mcp.json's `conversationStore`
-     — hermetic (`tests/test_mcp_store_provider.py`: op→tool map, result-parse,
-     flaky-store→502) + a LIVE round-trip (`test_store_backed_conversation_journey_live`:
-     real convstore + real ollama, two turns, cross-turn recall, `/items` served,
-     delete). No provider ships baked in, so unset ⇒ non-claude models stay
-     stateless (the `ollama→501` test is the no-regression gate). The **#1↔#2 seam
-     is CLOSED**: request `options` (num_ctx) thread through
-     `send_turn`→`complete_stateless`, which routes ollama native — so stateful
-     ollama turns size their context. This closes #2 woollama-side.
+     (`tests/test_store_backend.py`). Two providers over one transport-agnostic
+     seam: `McpStoreProvider` (`examples/mcp-convstore`) and `HttpStoreProvider`
+     (`examples/rest-convstore`, file-backed → persistent), selected via mcp.json's
+     `conversationStore` key — hermetic (`tests/test_mcp_store_provider.py`,
+     `tests/test_http_store_provider.py`: op→call map, result-parse, flaky-store→502;
+     `tests/test_config.py`: typed descriptor) + two LIVE round-trips
+     (`test_store_backed_conversation_journey_live`, `test_http_store_backed_conversation_journey_live`:
+     real ollama, two turns, cross-turn recall, `/items` served; HTTP also asserts
+     on-disk persistence + delete-removes-file). No provider ships baked in, so
+     unset ⇒ non-claude models stay stateless (the `ollama→501` test is the
+     no-regression gate). The **#1↔#2 seam is CLOSED**: request `options` (num_ctx)
+     thread through `send_turn`→`complete_stateless`, which routes ollama native —
+     so stateful ollama turns size their context. This closes #2 woollama-side.
      Managed Agents was ruled out (pins inference to Claude); ollama has no native
      sessions (verified). Remaining (cross-repo, not guessed): the fabric
      read/append contract — woollama's `create/get/append/delete` proposal was fed
