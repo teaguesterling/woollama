@@ -1,23 +1,26 @@
 # Conversations & Responses — design (stateful surface for woollama)
 
-Status: **in progress.** Decisions locked 2026-06-02. **conv-1a shipped
-2026-06-04**: `POST /v1/responses` stateless subset (`store:false`) — a
-Responses-shaped superset of /v1/chat/completions, routed by `model` identically
-(`router.py:responses_create`, shaping in `responses.py`), verified against the
-real `openai` SDK (`.responses.create` → `.output_text`). **conv-1b shipped
-2026-06-04**: in-memory handle table + the `claude-resume` backend + `store:true`
-/ `conversation` / `previous_response_id` routing (`conversations.py`,
-`router._responses_stateful`), live-verified via the `openai` SDK. **conv-2
-shipped 2026-06-04**: `/v1/conversations` create/list/get/delete. **conv-5
-(duckdb `stored` backend) shipped 2026-06-05 then REVERTED 2026-06-06** — it made
-woollama OWN conversation storage (an embedded duckdb), which violates the
-principle below; woollama must never be the store. Models with no state-owning
-backend are now stateless (`store:false`); see §8 item 5. **Shipped since:**
-`managed-agents` (conv-6, §8 item 7 — Anthropic owns the session), the interactive
-`requires_action` path (conv-8, §5), streaming `/v1/responses` (conv-9, §1), and
-the woollama-side `store-backed` mechanism (conv-7, §10 — un-wired pending the
-fabric provider). **Still to do:** the fabric store provider + its contract; the
-Rust driver + claude-tmux backend (gated on §6 spikes); cosmic-fabric wiring.
+This is the **design** for woollama's stateful surface — the shapes, the
+principle, and the build sequence. **Live ship status is tracked in
+[`roadmap.md`](roadmap.md)** (the single source of truth) and narrated in
+[`build-log.md`](build-log.md); this doc carries design intent, not dates.
+
+Status at a glance (decisions locked 2026-06-02):
+
+| Slice | What | Where (this doc) | Status |
+|---|---|---|---|
+| conv-1a | `/v1/responses` stateless subset (`store:false`) | §1 | shipped |
+| conv-1b | handle table + `claude-resume` backend | §3, §3.1 | shipped |
+| conv-2 | `/v1/conversations` CRUD | §2 | shipped |
+| conv-9 | streaming `/v1/responses` (Responses SSE) | §1 | shipped |
+| conv-6 | `managed-agents` backend (Anthropic-hosted) | §3.1, §8.7 | shipped |
+| conv-8 | interactive `requires_action` (ask_user) | §5 | shipped |
+| conv-7 | `store-backed` (non-claude) — woollama side | §3.1, §10 | shipped, **un-wired** (fabric provider pending) |
+| conv-5 | duckdb `stored` backend | §8.5 | **reverted** — woollama must never be the store |
+| conv-3/4 | Rust driver + claude-tmux backend | §4, §6 | pending (spike-gated) |
+
+**Still to do:** the fabric store provider + its contract; the Rust session
+driver + claude-tmux backend; cosmic-fabric consuming the surface.
 
 ## The principle
 
@@ -90,7 +93,7 @@ Response:
 `store: false` and no `conversation` → behaves exactly like chat-completions
 (stateless passthrough), so the surface is a superset.
 
-**Streaming (SHIPPED 2026-06-07).** `stream: true` on a stateless turn emits
+**Streaming.** `stream: true` on a stateless turn emits
 OpenAI **Responses SSE** — named `event:` lines for `response.created` →
 `response.output_item.added` → `response.content_part.added` →
 `response.output_text.delta`* → `response.output_text.done` →
@@ -193,7 +196,7 @@ independently of woollama.
 
 ## 5. Interactive turns — pending questions
 
-**SHIPPED 2026-06-07 via the managed-agents backend** (ahead of the tmux driver).
+Implemented **via the managed-agents backend** (ahead of the tmux driver).
 A hosted CMA session pauses when the model calls a client-side custom tool
 (`ask_user`, declared on the agent): `agent.custom_tool_use` fires and the session
 idles with `stop_reason.type == "requires_action"`. woollama maps that to the
@@ -242,7 +245,7 @@ plain terminal before building the claude-tmux backend:
    the Responses shape against the EASY (non-interactive) backend. No tmux.
    - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
      Responses wire shape, SDK-verified. No backend/handle table yet.
-   - [x] **conv-1b SHIPPED 2026-06-04** — in-memory handle table
+   - [x] **conv-1b** — in-memory handle table
      (`conversations.py`: `conv_id → {backend, native_id, workdir}`; resp_id is
      the chain key; one `asyncio.Lock` writer per conversation) + `claude-resume`
      backend + `store:true` / `conversation` / `previous_response_id` routing in
@@ -259,7 +262,7 @@ plain terminal before building the claude-tmux backend:
      primitive), so `previous_response_id` CHAINS off the conversation; true
      forking is later. Handle table is in-memory → a restart loses sid mappings.
 2. **`/v1/conversations` listing + delete** — discovery/attach surface.
-   **conv-2 SHIPPED 2026-06-04**: `POST` (create handle; backend derived from
+   **conv-2**: `POST` (create handle; backend derived from
    `model`), `GET` (list), `GET /{id}`, `DELETE /{id}` (backend teardown +
    forget handle), all over the in-memory handle table; objects parse as OpenAI
    Conversation + woollama routing extras (`backend`/`status`/`title`). Live
@@ -267,11 +270,11 @@ plain terminal before building the claude-tmux backend:
    backend's transcript is the session-driver's job (slice 3+).
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.
-4. **`requires_action` / interactive answer path** — §5. **SHIPPED 2026-06-07 via
-   the managed-agents backend** (the `ask_user` custom tool); the claude-tmux
-   driver will reuse the same Responses primitive.
-5. **duckdb `stored` backend** — **SHIPPED 2026-06-05 (conv-5), then REVERTED
-   2026-06-06.** It made woollama OWN conversation storage: an embedded duckdb at
+4. **`requires_action` / interactive answer path** — §5. Implemented **via the
+   managed-agents backend** (the `ask_user` custom tool); the claude-tmux driver
+   will reuse the same Responses primitive.
+5. **duckdb `stored` backend** — **conv-5: shipped, then REVERTED** (dates in
+   build-log). It made woollama OWN conversation storage: an embedded duckdb at
    `$XDG_DATA_HOME/woollama/conversations.duckdb` that persisted the transcript
    and replayed it through `complete_stateless`. That directly contradicts §1 —
    *woollama must never be the store.* Reverted in full (the duckdb dep,
@@ -285,8 +288,8 @@ plain terminal before building the claude-tmux backend:
    *client* to — e.g. a "conversation store" MCP server, or Managed Agents
    (item 7) — never woollama's own embedded DB.
 6. **cosmic-fabric wiring** — when that UX returns.
-7. **`managed-agents` backend (Claude-hosted stateful sessions)** — **SHIPPED
-   2026-06-07 (conv-6).** A `ConversationBackend` that defers conversation state
+7. **`managed-agents` backend (Claude-hosted stateful sessions)** — conv-6. A
+   `ConversationBackend` that defers conversation state
    to **Anthropic's Managed Agents** API (`/v1/agents` + `/v1/sessions`, beta
    `managed-agents-2026-04-01`).
 
@@ -345,7 +348,7 @@ plain terminal before building the claude-tmux backend:
    also a richer **executor** than claude-code delegation (Anthropic hosts the
    tool sandbox).
 
-   *Interactive `requires_action` — SHIPPED 2026-06-07 (§5).* The agent carries
+   *Interactive `requires_action` (§5).* The agent carries
    one client-side custom tool, `ask_user`; when the model calls it the session
    idles with `stop_reason: requires_action`, woollama returns a Responses
    `requires_action` (the tool input is the question), and a continuing turn
@@ -359,9 +362,9 @@ plain terminal before building the claude-tmux backend:
    MCP, recipe→agent MCP mapping. The shipped agent is otherwise tool-less (just
    `ask_user`), so plain Q&A provisions no container.
 
-8. **Store-only backend for non-claude models (issue #2)** — **woollama-side
-   mechanism IMPLEMENTED 2026-06-07 behind an un-wired seam; fabric provider +
-   contract pending.** The first BYO-inference backend (§3.1, §10): makes
+8. **Store-only backend for non-claude models (issue #2)** — woollama-side
+   mechanism implemented behind an un-wired seam; fabric provider + contract
+   pending. The first BYO-inference backend (§3.1, §10): makes
    `ollama/<model>` (and recipes) stateful by deferring the transcript to an
    external store provider and doing assembly + stateless inference woollama-side.
    `ConversationStoreProvider` protocol + `StoreBackedBackend` + routing gate +
@@ -402,7 +405,7 @@ toward a desktop-session daemon.*
   fragile — so ollama is not a state owner.
 - *An embedded woollama store* is the conv-5 violation — out by principle.
 
-**The decision (2026-06-07).** Defer the transcript to **fabric / the
+**The decision.** Defer the transcript to **fabric / the
 cosmic-fabricd session daemon** (where these sessions' bytes already live), behind
 a **provider-agnostic conversation-store seam** so the choice of owner is
 pluggable. woollama stays a router/client to the store; it never holds bytes.
@@ -447,7 +450,7 @@ the no-regression gate). Hermetically tested with an in-memory fake provider
 reassembly, `/items`, delete, the routing gate, and that an inference failure
 surfaces cleanly (not a 500).
 
-**#1 ↔ #2 seam — CLOSED (2026-06-07):** the `/v1/responses` request's `options`
+**#1 ↔ #2 seam — closed:** the `/v1/responses` request's `options`
 (e.g. `num_ctx`) are threaded through `send_turn` → the injected
 `complete_stateless`, which now routes ollama through the native `/api/chat` when
 `num_ctx` is present — so a store-backed (and plain stateless) ollama turn sizes
@@ -479,8 +482,8 @@ fed back to cosmic-fabric (issue #2) as the "confirm" step.
 
 ### 10.4 Scope / status
 
-**Woollama-side mechanism IMPLEMENTED + hermetically tested (2026-06-07), behind
-an un-wired seam.** The protocol, the `StoreBackedBackend`, the routing gate, and
+**Woollama-side mechanism implemented + hermetically tested, behind an un-wired
+seam.** The protocol, the `StoreBackedBackend`, the routing gate, and
 the clean error path all exist and pass; no provider ships, so runtime behavior is
 unchanged (non-claude models stay stateless). What remains is cross-repo and
 deliberately not guessed: (1) **the contract** — the `create/get/append/delete`
