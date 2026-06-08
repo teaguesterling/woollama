@@ -117,19 +117,21 @@ discover. The `<port>` above is that ephemeral port. Same pattern as a local
 ## Install (development)
 
 ```sh
-git clone https://github.com/<you>/woollama
+git clone https://github.com/teaguesterling/woollama
 cd woollama
 uv sync                           # creates .venv and installs deps
 uv run woollama                   # starts the router; prints its address
 ```
 
-In a second shell:
+On startup woollama prints its `OpenAI base_url` (e.g.
+`http://127.0.0.1:<port>/v1`) — copy that into your OpenAI client. (It's also
+written to `$XDG_RUNTIME_DIR/woollama.addr` for programmatic discovery.)
 
-```sh
-# Discover the address
-cat "${XDG_RUNTIME_DIR:-/tmp}/woollama.addr"
-# Then point an OpenAI client at it (see Quick taste above).
-```
+> **Prerequisite for the examples below:** they use `ollama/qwen3:14b-iq4xs`, so
+> install [Ollama](https://ollama.ai), `ollama serve`, and
+> `ollama pull qwen3:14b-iq4xs`. **No Ollama?** Use the keyless Claude path
+> instead — `model="claude-code/haiku"` (needs the `claude` CLI logged in) — or
+> any cloud model with its key set (see [Configuration](docs/configuration.md)).
 
 ### Tests & lint
 
