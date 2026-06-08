@@ -43,6 +43,10 @@ nav:
   - Concepts:
       - Architecture: architecture.md
       - Naming: naming.md
+  - Reference:
+      - Configuration: configuration.md
+      - Environment variables: environment.md
+      - Security model: security.md
   - Design:
       - Conversations API: conversations-api-design.md
       - Rust transition: rust-transition.md
