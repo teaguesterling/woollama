@@ -183,6 +183,30 @@ async def test_passthrough_num_ctx_with_tools_stays_on_v1(monkeypatch):
     assert posts[-1][0].endswith("/v1/chat/completions")  # tools win; native skipped
 
 
+async def test_complete_stateless_routes_num_ctx_native(monkeypatch):
+    """complete_stateless (backs /v1/responses + the store-backed path) honors
+    num_ctx for ollama by going native — closing the #1↔#2 seam."""
+    posts: list = []
+    _mock_httpx(monkeypatch, posts,
+                native_payload={"message": {"content": "ok"}, "done": True})
+    out = await router.complete_stateless(
+        "ollama/qwen3", [{"role": "user", "content": "hi"}],
+        options={"num_ctx": 16384})
+    assert out == "ok"
+    url, sent = posts[-1]
+    assert url.endswith("/api/chat") and sent["options"]["num_ctx"] == 16384
+
+
+async def test_complete_stateless_without_num_ctx_uses_v1(monkeypatch):
+    posts: list = []
+    _mock_httpx(monkeypatch, posts,
+                native_payload={"choices": [{"message": {"content": "x"}}]})
+    out = await router.complete_stateless(
+        "ollama/qwen3", [{"role": "user", "content": "hi"}])
+    assert out == "x"
+    assert posts[-1][0].endswith("/v1/chat/completions")
+
+
 async def test_native_stream_translates_ndjson_to_sse(monkeypatch):
     sent: dict = {}
     frames = [

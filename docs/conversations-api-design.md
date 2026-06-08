@@ -419,10 +419,12 @@ the no-regression gate). Hermetically tested with an in-memory fake provider
 reassembly, `/items`, delete, the routing gate, and that an inference failure
 surfaces cleanly (not a 500).
 
-**Known seam (#1 ↔ #2):** the injected `complete_stateless` routes ollama through
-its `/v1` endpoint, which ignores `num_ctx` — so a store-backed ollama turn does
-NOT yet honor a requested context size (issue #1's native `/api/chat` path is
-passthrough-only). Documented follow-on.
+**#1 ↔ #2 seam — CLOSED (2026-06-07):** the `/v1/responses` request's `options`
+(e.g. `num_ctx`) are threaded through `send_turn` → the injected
+`complete_stateless`, which now routes ollama through the native `/api/chat` when
+`num_ctx` is present — so a store-backed (and plain stateless) ollama turn sizes
+its context too. (`complete_stateless`'s recipe/orchestrate branch is unaffected;
+num_ctx applies to direct ollama models.)
 
 ### 10.2 First provider: fabric / cosmic-fabricd — PENDING (the contract proposal)
 

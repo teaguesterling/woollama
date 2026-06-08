@@ -176,7 +176,7 @@ async def responses_create(request: Request) -> Response:
 
     # Stateless (conv-1a): a Responses-shaped /v1/chat/completions.
     try:
-        text = await complete_stateless(model, messages)
+        text = await complete_stateless(model, messages, options=body.get("options"))
     except OrchestrationError as e:
         if e.payload is not None:
             return JSONResponse(e.payload, status_code=e.status)
@@ -225,7 +225,7 @@ async def _responses_stateful(body: dict, model: str,
     async with conv.lock:                       # one writer per conversation
         conv.status = "busy"
         try:
-            text = await backend_impl.send_turn(conv, messages)
+            text = await backend_impl.send_turn(conv, messages, options=body.get("options"))
         except (claude_code.ClaudeCodeError, managed_agents.ManagedAgentsError) as e:
             conv.status = "idle"
             return _error(f"{conv.backend} backend: {e}", "server_error", 502)
@@ -331,12 +331,18 @@ async def conversations_delete(conv_id: str) -> Response:
                          "deleted": True})
 
 
-async def complete_stateless(model: str, messages: list[dict]) -> str:
+async def complete_stateless(model: str, messages: list[dict], *,
+                             options: dict | None = None) -> str:
     """Run one stateless turn, return the assistant text. Routes by `model`
     exactly like /v1/chat/completions (woollama/<recipe> → orchestrate; a known
     inferencer → passthrough), raising OrchestrationError for the error cases so
     the caller maps them onto the response surface. Backs the stateless
-    `/v1/responses` path (conv-1a)."""
+    `/v1/responses` path (conv-1a) and the store-backed stateful path (conv-7).
+
+    `options` carries ollama-native knobs (e.g. `num_ctx`); when present for the
+    ollama provider the turn goes through the native /api/chat (which honors them)
+    — the same routing as the chat-completions passthrough (#1), closing the
+    #1↔#2 seam so a stateful ollama turn sizes its context too."""
     if model.startswith("woollama/"):
         name = model[len("woollama/"):]
         recipe = recipes.get(name)
@@ -357,10 +363,25 @@ async def complete_stateless(model: str, messages: list[dict]) -> str:
         headers = inf.headers()
     except inferencers.InferencerError as e:
         raise OrchestrationError(str(e), "invalid_request_error", 400) from e
+
+    # Ollama honors num_ctx only on its native /api/chat (#1) — route there when a
+    # context size is requested, translating the native reply back to text.
+    if provider == "ollama" and options and options.get("num_ctx") is not None:
+        req = ollama_native.to_native_request(
+            {"model": bare, "messages": messages, "options": options, "stream": False})
+        async with httpx.AsyncClient(timeout=_OLLAMA_NATIVE_TIMEOUT) as c:
+            r = await c.post(ollama_native.native_chat_url(inf.base_url),
+                             json=req, headers=headers)
+            data = r.json()
+        if "message" not in data:
+            raise OrchestrationError("inferencer error", "server_error", 502, payload=data)
+        return (data.get("message") or {}).get("content") or ""
+
+    body = {"model": bare, "messages": messages, "stream": False}
+    if options:
+        body["options"] = options
     async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(inf.chat_url(),
-                         json={"model": bare, "messages": messages, "stream": False},
-                         headers=headers)
+        r = await c.post(inf.chat_url(), json=body, headers=headers)
         data = r.json()
     if "choices" not in data:
         raise OrchestrationError("inferencer error", "server_error", 502, payload=data)

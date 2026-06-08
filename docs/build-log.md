@@ -786,3 +786,25 @@ Framing (per the chosen design→confirm→implement plan): the protocol is a VI
 proposal, not a settled contract — fed back to cosmic-fabric on issue #2 as the
 "confirm" step. #2 stays open: the fabric provider + the agreed contract + the
 cosmic-fabric wiring remain.
+
+## #1 ↔ #2 seam closed — num_ctx in stateful turns (2026-06-07)
+
+The store-backed slice shipped with a documented seam: `complete_stateless` sent
+ollama via /v1, so a stateful ollama turn ignored `num_ctx` (issue #1's native
+path was passthrough-only). Closed it: `complete_stateless` gained an
+`options` kwarg and routes ollama through the native /api/chat when `num_ctx` is
+present (reusing the #1 `ollama_native` translators); the `/v1/responses`
+`options` thread through `_responses_stateful` → `send_turn(..., options=)` → the
+injected completer. The three backends' `send_turn` took a keyword-only `options`
+(claude-resume / managed-agents ignore it — Claude/Anthropic own inference;
+store-backed forwards it). `CompleteFn` relaxed to `Callable[..., Awaitable[str]]`
+for the kwarg.
+
+Tests: +3 — `complete_stateless` routes num_ctx native / falls back to /v1
+(`test_ollama_native.py`), and a store-backed ollama turn threads num_ctx to
+/api/chat end-to-end with the REAL `complete_stateless` (`test_store_backend.py`).
+183 hermetic pass; ruff clean. Live: `test_responses_stateless_ollama_honors_
+num_ctx` drove a stateless /v1/responses turn with num_ctx=8192 → /api/ps shows
+8192. Green in 10.1s. (The store-backed path uses the same completer; it's
+hermetic-only since no provider is wired.) Recipe/orchestrate path unaffected —
+num_ctx applies to direct ollama models.

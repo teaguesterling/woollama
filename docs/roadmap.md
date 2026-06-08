@@ -113,8 +113,12 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      UN-WIRED seam; fabric provider + contract pending. `ConversationStoreProvider`
      protocol + `StoreBackedBackend` (assemble prior history → stateless inference
      → append turn) + routing gate + clean error path, hermetically tested
-     (`tests/test_store_backend.py`, 8). No provider ships by default, so non-claude
-     models stay stateless (the `ollama→501` test is the no-regression gate).
+     (`tests/test_store_backend.py`, 9). No provider ships by default, so non-claude
+     models stay stateless (the `ollama→501` test is the no-regression gate). The
+     **#1↔#2 seam is CLOSED**: request `options` (num_ctx) thread through
+     `send_turn`→`complete_stateless`, which routes ollama native — so stateful
+     ollama turns size their context (live-verified on the stateless /v1/responses
+     path; /api/ps shows the requested ctx).
      Managed Agents was ruled out (pins inference to Claude); ollama has no native
      sessions (verified). Remaining (cross-repo, not guessed): the fabric
      read/append contract — woollama's `create/get/append/delete` proposal was fed

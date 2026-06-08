@@ -9,7 +9,10 @@
   woollama-side — woollama never owns the bytes. Ships behind an **un-wired seam**
   (no provider by default, so those models stay stateless until one is
   registered); the provider contract is a *provisional proposal* to fabric. See
-  `docs/conversations-api-design.md` §10.
+  `docs/conversations-api-design.md` §10. Stateful/store-backed ollama turns
+  honor `num_ctx` too (request `options` thread through to `complete_stateless`,
+  which routes ollama native — the #1↔#2 seam, closed and live-verified on the
+  stateless `/v1/responses` path).
 - **Ollama `num_ctx` honored** (#1): `ollama/<model>` passthrough requests that
   ask for a context size (`options.num_ctx`) now route to ollama's native
   `/api/chat` (which honors it) instead of the OpenAI-compat `/v1` endpoint

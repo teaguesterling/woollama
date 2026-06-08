@@ -125,7 +125,9 @@ class ClaudeResumeBackend:
 
     name = "claude-resume"
 
-    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
+    async def send_turn(self, conv: Conversation, messages: list[dict],
+                        *, options: dict | None = None) -> str:
+        # `options` (e.g. ollama num_ctx) is inert here — Claude has no such knob.
         # A STABLE, neutral working dir per conversation — Claude scopes sessions
         # by project dir, so every turn must --resume from the same cwd. It's a
         # fresh empty temp dir (no host CLAUDE.md/settings inherited), reused for
@@ -191,7 +193,9 @@ class ManagedAgentsBackend:
                     name=f"woollama:{full}", model=full, system="")
         return self._agents[full], self._env_id
 
-    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
+    async def send_turn(self, conv: Conversation, messages: list[dict],
+                        *, options: dict | None = None) -> str:
+        # `options` is inert here — Anthropic owns inference for the hosted session.
         # The session (Anthropic's, holding the transcript) is created lazily on
         # the first turn; later turns reuse it via its native session_id.
         if conv.native_id is None:
@@ -233,10 +237,11 @@ class ConversationStoreProvider(Protocol):
     async def delete(self, thread_id: str) -> None: ...
 
 
-# Inference callable injected into a StoreBackedBackend: (model, messages) ->
-# assistant text. Injected (not imported) so this module never imports `router`
-# (which owns inferencer routing) — avoids a conversations↔router cycle.
-CompleteFn = Callable[[str, list[dict]], Awaitable[str]]
+# Inference callable injected into a StoreBackedBackend: (model, messages, *,
+# options) -> assistant text. Injected (not imported) so this module never imports
+# `router` (which owns inferencer routing) — avoids a conversations↔router cycle.
+# (Loosely typed because of the keyword-only `options`.)
+CompleteFn = Callable[..., Awaitable[str]]
 
 
 class StoreBackedBackend:
@@ -246,21 +251,22 @@ class StoreBackedBackend:
     non-claude models (ollama, cloud, recipes) stateful WITHOUT woollama ever
     owning the bytes.
 
-    Known seam (#1 ↔ #2): the injected `complete` routes ollama through its /v1
-    endpoint, which IGNORES `num_ctx` — so a store-backed ollama turn does NOT yet
-    honor a requested context size (issue #1's native /api/chat path is
-    passthrough-only). A documented follow-on, not a silent regression."""
+    `options` (e.g. ollama `num_ctx`) is forwarded to the injected `complete`, so a
+    store-backed ollama turn DOES honor a requested context size — the router's
+    `complete_stateless` routes ollama natively when `num_ctx` is present (the
+    #1↔#2 seam is closed)."""
 
     def __init__(self, name: str, store: ConversationStoreProvider, complete: CompleteFn):
         self.name = name
         self._store = store
         self._complete = complete
 
-    async def send_turn(self, conv: Conversation, messages: list[dict]) -> str:
+    async def send_turn(self, conv: Conversation, messages: list[dict],
+                        *, options: dict | None = None) -> str:
         if conv.native_id is None:
             conv.native_id = await self._store.create()    # store mints the thread
         prior = await self._store.get(conv.native_id)      # bytes owned by the store
-        answer = await self._complete(conv.model, prior + messages)
+        answer = await self._complete(conv.model, prior + messages, options=options)
         await self._store.append(                          # write the turn back
             conv.native_id, list(messages) + [{"role": "assistant", "content": answer}])
         return answer

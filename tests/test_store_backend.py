@@ -43,10 +43,10 @@ class FakeStore:
 
 
 def make_completer(seen: list):
-    """A fake inferencer: records (model, messages) it's asked to complete and
-    echoes the last user message so recall is observable."""
-    async def complete(model: str, messages: list[dict]) -> str:
-        seen.append((model, list(messages)))
+    """A fake inferencer: records (model, messages, options) it's asked to complete
+    and echoes the last user message so recall is observable."""
+    async def complete(model: str, messages: list[dict], *, options=None) -> str:
+        seen.append((model, list(messages), options))
         last = messages[-1].get("content", "") if messages else ""
         return f"echo:{last}"
     return complete
@@ -109,7 +109,7 @@ async def test_send_turn_assembles_completes_appends(monkeypatch):
     assert out == "echo:hi"
     assert conv.native_id == "thread_1"           # store minted the thread
     # The completer saw exactly the new turn (no prior history on turn 1).
-    assert seen[-1] == ("ollama/qwen3", [{"role": "user", "content": "hi"}])
+    assert seen[-1] == ("ollama/qwen3", [{"role": "user", "content": "hi"}], None)
     # The turn (user + assistant) was written back to the store.
     assert store.threads["thread_1"] == [
         {"role": "user", "content": "hi"},
@@ -125,7 +125,7 @@ async def test_recall_across_turns_via_reassembly(monkeypatch):
     await backend.send_turn(conv, [{"role": "user", "content": "second"}])
     # Turn 2's completion was given the FULL prior transcript + the new input —
     # that reassembly is how a stateless inferencer "remembers".
-    model, msgs = seen[-1]
+    model, msgs, _ = seen[-1]
     assert [m["content"] for m in msgs] == ["first", "echo:first", "second"]
     # Same thread reused (not re-created).
     assert conv.native_id == "thread_1" and len(store.threads) == 1
@@ -172,11 +172,49 @@ async def test_conversations_items_served_for_store_backend(monkeypatch):
     assert data[0]["content"][0]["text"] == "ping"
 
 
+async def test_store_backed_ollama_turn_honors_num_ctx(monkeypatch):
+    """The #1↔#2 seam closed: a stateful store-backed ollama turn threads
+    options.num_ctx through send_turn → complete_stateless → the native /api/chat
+    (which honors num_ctx). Registers the REAL complete_stateless and mocks httpx
+    to capture where the inference call lands."""
+    import httpx
+
+    store = FakeStore()
+    monkeypatch.setattr(router, "conversation_store", conversations.ConversationStore())
+    backend = conversations.StoreBackedBackend(
+        conversations.STORE_BACKEND_NAME, store, router.complete_stateless)
+    monkeypatch.setattr(conversations, "BACKENDS",
+                        {**conversations.BACKENDS,
+                         conversations.STORE_BACKEND_NAME: backend})
+
+    posts: list = []
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def post(self, url, json=None, **k):
+            posts.append((url, json))
+            # native /api/chat reply shape
+            return type("R", (), {"status_code": 200,
+                                  "json": lambda self: {"message": {"content": "ok"},
+                                                        "done": True}})()
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    r = await router.responses_create(FakeRequest({
+        "model": "ollama/qwen3", "input": "hi", "store": True,
+        "options": {"num_ctx": 16384}}))
+    assert json.loads(r.body)["output"][0]["content"][0]["text"] == "ok"
+    url, sent = posts[-1]
+    assert url.endswith("/api/chat")                 # native, not /v1
+    assert sent["options"]["num_ctx"] == 16384
+
+
 async def test_inference_failure_surfaces_cleanly_not_500(monkeypatch):
     """A store-backed turn runs inference via complete_stateless, which raises
     OrchestrationError. _responses_stateful must surface it (here 502 with the
     upstream payload), not let it escape as an unhandled 500."""
-    async def boom(model, messages):
+    async def boom(model, messages, *, options=None):
         raise router.OrchestrationError("inferencer down", "server_error", 502,
                                         payload={"error": "down"})
     setup(monkeypatch, complete=boom)

@@ -185,6 +185,32 @@ def test_ollama_num_ctx_honored_via_native_endpoint(woollama_server):
 
 
 @needs_ollama
+def test_responses_stateless_ollama_honors_num_ctx(woollama_server):
+    """The #1↔#2 seam closed on the /v1/responses path: a stateless Responses
+    turn (no store) with options.num_ctx routes ollama through complete_stateless
+    → the native /api/chat. Verified by /api/ps reporting the requested context."""
+    ollama_url = os.environ.get("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
+    num_ctx = 8192        # a DIFFERENT size than the chat test, so it's distinguishable
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    ids = [m["id"][len("ollama/"):] for m in models if m["id"].startswith("ollama/")]
+    if not ids:
+        pytest.skip("no Ollama models available")
+    model = ids[0]
+
+    r = httpx.post(f"{woollama_server}/v1/responses", json={
+        "model": f"ollama/{model}", "input": "hi",
+        "options": {"num_ctx": num_ctx, "num_predict": 8}}, timeout=180)
+    assert r.status_code == 200, r.text
+    assert r.json()["output"][0]["content"][0]["text"] is not None
+
+    ps = httpx.get(f"{ollama_url}/api/ps", timeout=5).json()["models"]
+    loaded = {m["model"]: m.get("context_length") for m in ps}
+    ctx = loaded.get(model) or next(
+        (v for k, v in loaded.items() if k.split(":")[0] == model.split(":")[0]), None)
+    assert ctx == num_ctx, f"expected context_length {num_ctx}; /api/ps shows {loaded}"
+
+
+@needs_ollama
 def test_orchestrated_recipe_hides_tool_loop_from_client(woollama_server):
     """The streamer recipe runs a chat-loop internally; the OpenAI client
     should see only the final answer, not the tool_calls."""
