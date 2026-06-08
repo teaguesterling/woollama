@@ -40,8 +40,9 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
 orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
-subset + stateful via the `claude-resume` and `managed-agents` backends — OpenAI
-Responses shape; non-claude models are stateless-only, `store:false`),
+subset — incl. `stream:true` → Responses SSE — + stateful via the `claude-resume`
+and `managed-agents` backends — OpenAI Responses shape; non-claude models are
+stateless-only, `store:false`),
 `/v1/conversations` (create/list/get/delete + `items` for managed-agents),
 `/v1/models`,
 `/v1/tools`, `/mcp` (Streamable HTTP),
@@ -112,6 +113,13 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      turn resumes via `user.custom_tool_result`. Hermetic round-trip (pause→answer,
      exact tool_use_id, the answer/send_turn routing discriminator); live gate is
      best-effort (the model must choose to call ask_user) — paid, written-not-run.
+   - [x] **conv-9 — streaming `/v1/responses`** SHIPPED 2026-06-07 (design-doc §1):
+     a stateless `stream:true` turn emits OpenAI Responses SSE (`response.created`
+     → `output_text.delta`* → `response.completed`), deltas from a recipe
+     (`orchestrate_events`) or a plain inferencer's chat SSE; frames validate
+     against the `openai` SDK event models. Live-verified vs ollama. Stateful
+     streaming still 400 (claude-resume can't token-stream; managed-agents native
+     stream is a later slice).
    - [ ] conv-3/4 — the Rust session driver + claude-tmux backend (gated on the
      §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`); maps the
      LIVE-TUI pause onto the same `requires_action` primitive (now shipped via

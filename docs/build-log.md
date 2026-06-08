@@ -855,3 +855,34 @@ no multi-pending). Hermetic is the contract proof; the live gate
 (`test_managed_agents_requires_action_round_trip_live`, @needs_anthropic) is PAID
 and BEST-EFFORT — it SKIPS if the model answers directly instead of calling
 ask_user (nondeterministic) — and is written-but-NOT-run.
+
+## conv-9 — streaming /v1/responses (2026-06-07)
+
+`/v1/responses` previously 400'd on `stream:true`; now a STATELESS turn emits
+OpenAI Responses SSE. Grounded the event shapes in the installed `openai` SDK
+first (required fields per event) so the sequence is real, not guessed.
+
+- router.py: `complete_stream(model, messages)` — an async generator of TEXT
+  DELTAS: recipes via `orchestrate_events(stream=True)` (tool turns hidden), a
+  plain inferencer via its chat-completions SSE (parse `choices[0].delta.content`).
+  `_responses_stream(...)` wraps deltas in the canonical Responses event sequence
+  (`response.created → output_item.added → content_part.added → output_text.delta*
+  → output_text.done → content_part.done → output_item.done → response.completed`),
+  emitted as named `event:` + JSON `data:` frames with monotonic
+  `sequence_number`s. Primes the delta source before returning the
+  StreamingResponse, so a setup error (unknown model/recipe, missing key, upstream
+  4xx) maps to an HTTP status not an empty 200 stream (mirrors the chat streamers).
+  `responses_create` now streams the stateless path; STATEFUL `stream:true` stays
+  a 400 (claude-resume can't token-stream; managed-agents native streaming is a
+  later slice).
+
+Tests: `tests/test_responses_stream.py` (6) — the full event sequence + accumulated
+text for an inferencer stream and a recipe stream, the emitted frames validated
+against `openai`'s `ResponseCreatedEvent`/`ResponseTextDeltaEvent`/
+`ResponseCompletedEvent`, stateful→400, and setup errors (unknown model→400,
+unknown recipe→404) surfacing as HTTP not a stream. Repointed the old
+`test_responses_stream_true_is_400` at the stateful case. 191 hermetic pass; ruff
+clean. Live: `test_responses_streaming_live` drove a real ollama stream — events
+`created…delta…completed`, deltas concatenating to the completed text. Green in
+~15s. (#1↔#2 note: streaming uses the inferencer's /v1 SSE, so `num_ctx`-native is
+non-stream-only for now — documented follow-on.)

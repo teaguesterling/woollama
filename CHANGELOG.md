@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Streaming `/v1/responses`** (conv-1a streaming): a stateless `stream:true`
+  turn now emits OpenAI **Responses SSE** (`response.created` →
+  `output_text.delta`* → `response.completed`), sourcing deltas from a recipe
+  (`orchestrate_events`, tool turns hidden) or a plain inferencer's chat SSE. The
+  emitted frames validate against the `openai` SDK event models. Stateful
+  streaming stays deferred (400). See `docs/conversations-api-design.md` §1.
 - **Interactive `requires_action` path** (conv-8) via the managed-agents backend
   — without the tmux driver. The hosted agent carries an `ask_user` custom tool;
   when it's called the session pauses, woollama returns a Responses

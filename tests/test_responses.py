@@ -137,9 +137,11 @@ async def test_responses_unknown_previous_response_id_is_404():
     assert resp.status_code == 404
 
 
-async def test_responses_stream_true_is_400():
+async def test_responses_stateful_stream_is_400():
+    """Stateless `stream:true` now streams Responses SSE (see
+    test_responses_stream.py); STATEFUL streaming is the still-deferred case → 400."""
     resp = await router.responses_create(FakeRequest({
-        "model": "ollama/x", "input": "hi", "stream": True}))
+        "model": "claude-code/haiku", "input": "hi", "stream": True, "store": True}))
     assert resp.status_code == 400
     assert json.loads(resp.body)["error"]["type"] == "invalid_request_error"
 

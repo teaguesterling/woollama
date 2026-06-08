@@ -160,18 +160,27 @@ async def responses_create(request: Request) -> Response:
     body = await request.json()
     model = body.get("model", "")
 
-    if body.get("stream"):
-        return _error("streaming is not yet supported on /v1/responses "
-                      "(use /v1/chat/completions for SSE; a Responses streaming "
-                      "shape is a later slice)", "invalid_request_error", 400)
-
     try:
         messages = responses.parse_input(body.get("input", ""))
     except ValueError as e:
         return _error(str(e), "invalid_request_error", 400)
 
+    stateful = bool(body.get("store") or body.get("conversation")
+                    or body.get("previous_response_id"))
+
+    if body.get("stream"):
+        if stateful:
+            # Stateful streaming (claude-resume can't token-stream; managed-agents
+            # could) is a later slice — the stateless stream works today.
+            return _error(
+                "streaming is not yet supported for STATEFUL /v1/responses "
+                "conversations; use stream:true without store/conversation/"
+                "previous_response_id, or omit stream for a stateful turn.",
+                "invalid_request_error", 400)
+        return await _responses_stream(model, messages)
+
     # Stateful opt-in (conv-1b): a backing conversation is involved.
-    if body.get("store") or body.get("conversation") or body.get("previous_response_id"):
+    if stateful:
         return await _responses_stateful(body, model, messages)
 
     # Stateless (conv-1a): a Responses-shaped /v1/chat/completions.
@@ -406,6 +415,159 @@ async def complete_stateless(model: str, messages: list[dict], *,
     if "choices" not in data:
         raise OrchestrationError("inferencer error", "server_error", 502, payload=data)
     return data["choices"][0]["message"].get("content") or ""
+
+
+async def complete_stream(model: str, messages: list[dict]):
+    """Yield assistant TEXT DELTAS for a stateless turn — the source for
+    /v1/responses streaming. Recipes stream via `orchestrate_events` (tool turns
+    stay hidden); a plain inferencer streams its chat-completions SSE, from which
+    we extract `choices[0].delta.content`. Raises OrchestrationError before the
+    first yield for the setup error cases (so the caller maps to an HTTP status).
+
+    (Streaming uses the inferencer's /v1 SSE; `num_ctx`-native routing is
+    non-stream only for now — a documented follow-on.)"""
+    if model.startswith("woollama/"):
+        name = model[len("woollama/"):]
+        recipe = recipes.get(name)
+        if recipe is None:
+            raise OrchestrationError(f"unknown recipe '{name}'", "not_found", 404)
+        async for ev in orchestrate_events(recipe, messages, registry, stream=True):
+            if ev["type"] == "delta":
+                yield ev["content"]
+        return
+
+    provider = model.split("/", 1)[0]
+    inf = inferencers.get(provider)
+    if inf is None:
+        raise OrchestrationError(
+            f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
+            f"'<provider>/<model>' for a known inferencer "
+            f"({', '.join(inferencers.names())}).", "invalid_request_error", 400)
+    bare = model.split("/", 1)[1] if "/" in model else ""
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
+    req = {"model": bare, "messages": messages, "stream": True}
+    client = httpx.AsyncClient(timeout=180)
+    cm = client.stream("POST", inf.chat_url(), json=req, headers=headers)
+    r = await cm.__aenter__()
+    if r.status_code >= 400:
+        raw = await r.aread()
+        await cm.__aexit__(None, None, None)
+        await client.aclose()
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = None
+        raise OrchestrationError("inferencer error", "server_error",
+                                 r.status_code, payload=payload)
+    try:
+        async for line in r.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: "):]
+            if data.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
+            if delta:
+                yield delta
+    finally:
+        await cm.__aexit__(None, None, None)
+        await client.aclose()
+
+
+def _msg_item(item_id: str, text: str, *, done: bool) -> dict:
+    """A Responses output message item — empty content while in progress, the
+    output_text part once done."""
+    return {
+        "type": "message", "id": item_id,
+        "status": "completed" if done else "in_progress",
+        "role": "assistant",
+        "content": ([{"type": "output_text", "text": text, "annotations": []}]
+                    if done else []),
+    }
+
+
+async def _responses_stream(model: str, messages: list[dict], *,
+                            conversation: str | None = None) -> Response:
+    """Stream a stateless /v1/responses turn as OpenAI Responses SSE: the
+    canonical `response.created → output_item.added → content_part.added →
+    output_text.delta* → output_text.done → content_part.done → output_item.done
+    → response.completed` sequence (named `event:` lines + JSON `data:`). Primes
+    the delta source before returning a StreamingResponse so a setup error maps to
+    an HTTP status, not an empty 200 stream (mirrors the chat-completions
+    streamers)."""
+    source = complete_stream(model, messages)
+    try:
+        first = await source.__anext__()
+        exhausted = False
+    except StopAsyncIteration:
+        first, exhausted = None, True
+    except OrchestrationError as e:
+        await source.aclose()
+        if e.payload is not None:
+            return JSONResponse(e.payload, status_code=e.status)
+        return _error(e.message, e.kind, e.status)
+
+    resp_id = responses.new_id("resp")
+    item_id = responses.new_id("msg")
+    created = int(time.time())
+
+    async def sse():
+        seq = 0
+
+        def ev(type_: str, payload: dict) -> str:
+            nonlocal seq
+            frame = {"type": type_, "sequence_number": seq, **payload}
+            seq += 1
+            return f"event: {type_}\ndata: {json.dumps(frame)}\n\n"
+
+        yield ev("response.created", {"response": responses.build_response(
+            resp_id, model, "", conversation=conversation, status="in_progress",
+            created_at=created)})
+        yield ev("response.output_item.added",
+                 {"output_index": 0, "item": _msg_item(item_id, "", done=False)})
+        yield ev("response.content_part.added",
+                 {"item_id": item_id, "output_index": 0, "content_index": 0,
+                  "part": {"type": "output_text", "text": "", "annotations": []}})
+
+        chunks: list[str] = []
+
+        def delta_frame(piece: str) -> str:
+            chunks.append(piece)
+            return ev("response.output_text.delta",
+                      {"item_id": item_id, "output_index": 0, "content_index": 0,
+                       "logprobs": [], "delta": piece})
+
+        try:
+            if first is not None:
+                yield delta_frame(first)
+            if not exhausted:
+                async for piece in source:
+                    yield delta_frame(piece)
+        except OrchestrationError as e:
+            # Streaming has begun; status can't change — best-effort error frame.
+            yield ev("error", {"message": e.message, "code": e.kind})
+
+        full = "".join(chunks)
+        yield ev("response.output_text.done",
+                 {"item_id": item_id, "output_index": 0, "content_index": 0,
+                  "logprobs": [], "text": full})
+        yield ev("response.content_part.done",
+                 {"item_id": item_id, "output_index": 0, "content_index": 0,
+                  "part": {"type": "output_text", "text": full, "annotations": []}})
+        yield ev("response.output_item.done",
+                 {"output_index": 0, "item": _msg_item(item_id, full, done=True)})
+        yield ev("response.completed", {"response": responses.build_response(
+            resp_id, model, full, conversation=conversation, status="completed",
+            created_at=created)})
+
+    return StreamingResponse(sse(), media_type="text/event-stream")
 
 
 async def _passthrough(body: dict) -> Response:

@@ -89,6 +89,17 @@ Response:
 `store: false` and no `conversation` → behaves exactly like chat-completions
 (stateless passthrough), so the surface is a superset.
 
+**Streaming (SHIPPED 2026-06-07).** `stream: true` on a stateless turn emits
+OpenAI **Responses SSE** — named `event:` lines for `response.created` →
+`response.output_item.added` → `response.content_part.added` →
+`response.output_text.delta`* → `response.output_text.done` →
+`response.content_part.done` → `response.output_item.done` →
+`response.completed`. Deltas come from a recipe (`orchestrate_events`, tool turns
+hidden) or a plain inferencer's chat SSE; the frames validate against the `openai`
+SDK event models. STATEFUL streaming (a backing conversation) is still deferred →
+400 (claude-resume can't token-stream; a managed-agents native-stream slice is
+later). Live-verified against ollama.
+
 ## 2. External API — `/v1/conversations` (discovery + attach)
 
 This is what cosmic-fabric binds to: list existing conversations, pick one,

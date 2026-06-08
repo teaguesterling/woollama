@@ -12,6 +12,7 @@ Each test spawns its own woollama process on a random ephemeral port,
 verifies the behavior end-to-end via the OpenAI Python SDK, then tears down."""
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -416,6 +417,39 @@ def test_managed_agents_conversation_journey_live(woollama_server):
     deleted = httpx.delete(f"{base}/v1/conversations/{cid}", timeout=30).json()
     assert deleted["deleted"] is True
     assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
+
+
+@needs_ollama
+def test_responses_streaming_live(woollama_server):
+    """Stateless /v1/responses with stream:true emits Responses SSE end-to-end
+    against real ollama: response.created … output_text.delta … response.completed,
+    with the deltas concatenating to the completed response's text."""
+    models = httpx.get(f"{woollama_server}/v1/models", timeout=5).json()["data"]
+    ids = [m["id"][len("ollama/"):] for m in models if m["id"].startswith("ollama/")]
+    if not ids:
+        pytest.skip("no Ollama models available")
+    model = f"ollama/{ids[0]}"
+
+    events, deltas, completed_text = [], [], None
+    with httpx.stream("POST", f"{woollama_server}/v1/responses",
+                      json={"model": model, "input": "Reply with: pong",
+                            "stream": True}, timeout=180) as r:
+        assert r.status_code == 200
+        cur = None
+        for line in r.iter_lines():
+            if line.startswith("event: "):
+                cur = line[len("event: "):]
+                events.append(cur)
+            elif line.startswith("data: "):
+                d = json.loads(line[len("data: "):])
+                if cur == "response.output_text.delta":
+                    deltas.append(d["delta"])
+                elif cur == "response.completed":
+                    completed_text = d["response"]["output"][0]["content"][0]["text"]
+
+    assert events[0] == "response.created" and events[-1] == "response.completed"
+    assert "response.output_text.delta" in events
+    assert "".join(deltas) == completed_text and completed_text
 
 
 @needs_anthropic
