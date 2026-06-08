@@ -16,7 +16,6 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -106,16 +105,16 @@ async def lifespan(app: FastAPI):
     # (same dynamic registration the stdio path does in build_server's lifespan).
     register_reexported_tools(_mcp, registry)
     # Optional: wire an external MCP conversation-store as the state owner for
-    # NON-claude models (issue #2). Named by $WOOLLAMA_CONVSTORE_SERVER, which
-    # must be a server key in mcp.json. Once wired, EVERY non-claude model
-    # (ollama, cloud providers, AND woollama/<recipe>) becomes stateful on
-    # /v1/responses + /v1/conversations — the store, not woollama, owns the
-    # transcript bytes (woollama stays a client).
-    if store_server := os.environ.get("WOOLLAMA_CONVSTORE_SERVER"):
+    # NON-claude models (issue #2). Named by the `conversationStore` key in
+    # mcp.json, which must be a server key in `mcpServers`. Once wired, EVERY
+    # non-claude model (ollama, cloud providers, AND woollama/<recipe>) becomes
+    # stateful on /v1/responses + /v1/conversations — the store, not woollama,
+    # owns the transcript bytes (woollama stays a client).
+    if store_server := config.load_conversation_store_name():
         mgr = registry.servers.get(store_server)
         if mgr is None:
             log.warning(
-                "WOOLLAMA_CONVSTORE_SERVER=%r names no configured MCP server "
+                "mcp.json conversationStore=%r names no configured MCP server "
                 "(have: %s); non-claude models stay stateless",
                 store_server, list(registry.servers))
         else:

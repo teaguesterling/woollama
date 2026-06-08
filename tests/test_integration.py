@@ -73,8 +73,8 @@ def _free_port() -> int:
 def _spawn_woollama(tmp_path, *, extra_env=None):
     """Spawn `woollama` with WOOLLAMA_CONFIG_DIR=tmp_path on a fresh ephemeral
     port; yield the base URL; tear down on exit. `extra_env` overlays the child's
-    environment (e.g. WOOLLAMA_CONVSTORE_SERVER). Pre-populate tmp_path with a
-    config file (e.g. mcp.json) BEFORE calling to override the bundled defaults."""
+    environment. Pre-populate tmp_path with a config file (e.g. mcp.json) BEFORE
+    calling to override the bundled defaults."""
     port = _free_port()
     env = {
         **os.environ,
@@ -125,16 +125,17 @@ def woollama_server_convstore(tmp_path):
     """A live `woollama` wired to the reference MCP conversation-store
     (examples/mcp-convstore) as the state owner for non-claude models — so
     /v1/responses is stateful for ollama. Writes an mcp.json registering the
-    convstore server and sets WOOLLAMA_CONVSTORE_SERVER to name it. (This mcp.json
-    REPLACES the bundled hello/textops servers, which this journey doesn't need.)"""
+    convstore server AND naming it via the top-level `conversationStore` key.
+    (This mcp.json REPLACES the bundled hello/textops servers, which this journey
+    doesn't need.)"""
     server_path = REPO_ROOT / "examples" / "mcp-convstore" / "server.py"
     (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": "convstore",
         "mcpServers": {
             "convstore": {"command": sys.executable, "args": [str(server_path)]}
         }
     }))
-    with _spawn_woollama(
-            tmp_path, extra_env={"WOOLLAMA_CONVSTORE_SERVER": "convstore"}) as base_url:
+    with _spawn_woollama(tmp_path) as base_url:
         yield base_url
 
 

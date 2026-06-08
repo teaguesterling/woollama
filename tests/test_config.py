@@ -106,6 +106,36 @@ def test_server_missing_command_raises(monkeypatch, tmp_path):
         config.load_mcp_servers()
 
 
+# --- conversation store selection (issue #2; config-driven, not an env var) ---
+
+def test_conversation_store_name_default_none(monkeypatch, tmp_path):
+    # Bundled defaults name no store → non-claude models stay stateless.
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    from woollama import config
+    assert config.load_conversation_store_name() is None
+
+
+def test_conversation_store_name_from_mcp_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": "convstore",
+        "mcpServers": {"convstore": {"command": "python", "args": ["s.py"]}},
+    }))
+    from woollama import config
+    assert config.load_conversation_store_name() == "convstore"
+
+
+def test_conversation_store_name_not_string_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp.json").write_text(json.dumps({
+        "conversationStore": ["convstore"],   # must be a string
+        "mcpServers": {},
+    }))
+    from woollama import config
+    with pytest.raises(ValueError, match="'conversationStore' must be a"):
+        config.load_conversation_store_name()
+
+
 # --- type guards: each malformed-shape contract has its own clear error ------
 
 def test_mcp_servers_not_object_raises(monkeypatch, tmp_path):

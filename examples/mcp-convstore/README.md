@@ -21,10 +21,11 @@ unambiguous for woollama's `McpStoreProvider` to parse.
 
 ## Wiring it into woollama
 
-Register it in `mcp.json` and name it with `WOOLLAMA_CONVSTORE_SERVER`:
+Register it in `mcp.json` and name it with the top-level `conversationStore` key:
 
 ```json
 {
+  "conversationStore": "convstore",
   "mcpServers": {
     "convstore": {
       "command": "python",
@@ -35,7 +36,7 @@ Register it in `mcp.json` and name it with `WOOLLAMA_CONVSTORE_SERVER`:
 ```
 
 ```sh
-WOOLLAMA_CONVSTORE_SERVER=convstore woollama
+woollama
 ```
 
 Once wired, **every** non-claude model (`ollama/*`, cloud providers, and

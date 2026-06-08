@@ -95,6 +95,26 @@ def load_mcp_servers() -> dict[str, dict]:
     return out
 
 
+def load_conversation_store_name() -> str | None:
+    """The MCP server to use as the conversation store (issue #2), from the
+    top-level `conversationStore` key in `mcp.json` — a sibling of `mcpServers`
+    naming one of its keys. `None` (the default) ⇒ non-claude models stay
+    stateless. The named server must also appear in `mcpServers`; the router
+    warns and stays stateless if it doesn't. (Config-driven, not an env var, so
+    the wiring lives with the rest of woollama's file config.)"""
+    source, text = _read_user_or_default("mcp.json")
+    text = _expand_env(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"mcp.json parse error in {source}: {e}") from e
+    name = data.get("conversationStore")
+    if name is not None and not isinstance(name, str):
+        raise ValueError(f"mcp.json {source}: 'conversationStore' must be a "
+                         f"string (an mcpServers key)")
+    return name
+
+
 # ----- recipes.toml loading -------------------------------------------------
 
 def load_recipes() -> dict[str, recipes_module.Recipe]:

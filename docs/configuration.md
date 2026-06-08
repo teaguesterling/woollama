@@ -44,13 +44,15 @@ woollama starts one long-lived connection per server and aggregates their tools
 
 One MCP server can additionally serve as the **conversation store** — the
 external owner of transcript bytes that makes non-claude models stateful
-(issue #2; woollama stays a client). Register the server here as usual, then
-name it with [`WOOLLAMA_CONVSTORE_SERVER`](environment.md). The server must
-expose the `create_thread` / `get_thread` / `append_turn` / `delete_thread`
-tools; the reference implementation is `examples/mcp-convstore/server.py`:
+(issue #2; woollama stays a client). Register the server in `mcpServers` as
+usual, then name it with a top-level `conversationStore` key (a sibling of
+`mcpServers`). The server must expose the `create_thread` / `get_thread` /
+`append_turn` / `delete_thread` tools; the reference implementation is
+`examples/mcp-convstore/server.py`:
 
 ```json
 {
+  "conversationStore": "convstore",
   "mcpServers": {
     "convstore": {
       "command": "python",
@@ -60,11 +62,11 @@ tools; the reference implementation is `examples/mcp-convstore/server.py`:
 }
 ```
 
-```sh
-WOOLLAMA_CONVSTORE_SERVER=convstore woollama
-```
+| Field | Required | Description |
+|---|---|---|
+| `conversationStore` | — | Name of an `mcpServers` entry to use as the conversation store. Omitted (the default) ⇒ non-claude models are stateless. A name with no matching server is warned and ignored. |
 
-Once wired, **every** non-claude model (`ollama/*`, cloud providers, and
+Once set, **every** non-claude model (`ollama/*`, cloud providers, and
 `woollama/<recipe>`) becomes stateful on `/v1/responses` + `/v1/conversations`.
 See the [Conversations design](conversations-api-design.md) §10 for the contract.
 

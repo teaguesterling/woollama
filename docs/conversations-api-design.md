@@ -15,7 +15,7 @@ Status at a glance (decisions locked 2026-06-02):
 | conv-9 | streaming `/v1/responses` (Responses SSE) | §1 | shipped |
 | conv-6 | `managed-agents` backend (Anthropic-hosted) | §3.1, §8.7 | shipped |
 | conv-8 | interactive `requires_action` (ask_user) | §5 | shipped |
-| conv-7 | `store-backed` (non-claude) + reference MCP store provider | §3.1, §10 | shipped — wired via `WOOLLAMA_CONVSTORE_SERVER` (fabric provider still pending) |
+| conv-7 | `store-backed` (non-claude) + reference MCP store provider | §3.1, §10 | shipped — wired via mcp.json's `conversationStore` (fabric provider still pending) |
 | conv-5 | duckdb `stored` backend | §8.5 | **reverted** — woollama must never be the store |
 | conv-3/4 | Rust driver + claude-tmux backend | §4, §6 | pending (spike-gated) |
 
@@ -385,9 +385,9 @@ plain terminal before building the claude-tmux backend:
    provider and doing assembly + stateless inference woollama-side.
    `ConversationStoreProvider` protocol + `StoreBackedBackend` + routing gate +
    clean error path shipped and tested; `McpStoreProvider` + the reference
-   `examples/mcp-convstore` server make it live today via
-   `WOOLLAMA_CONVSTORE_SERVER` (hermetic + live round-trip tests). No provider
-   ships baked in, so unset ⇒ non-claude models stay stateless. Decision:
+   `examples/mcp-convstore` server make it live today via mcp.json's
+   `conversationStore` key (hermetic + live round-trip tests). No provider ships
+   baked in, so unset ⇒ non-claude models stay stateless. Decision:
    **provider-agnostic store seam** — fabric / the cosmic-fabricd session daemon
    (its contract still pending, §10.2) becomes one more provider; a JSONL reader
    another. See §10.
@@ -500,12 +500,13 @@ woollama's side alone, without waiting on the fabric contract (10.2).
 - **`conversations.McpStoreProvider`** — a `ConversationStoreProvider` whose four
   ops are each one MCP tool call via an injected `call(tool, args)` (injected so
   the module never imports `manager`/`router`). Holds no bytes.
-- **Router wiring** — `WOOLLAMA_CONVSTORE_SERVER` names a server in `mcp.json`;
-  at startup the lifespan builds `_mcp_store_call(mgr)` (invoke → parse the MCP
-  text block's `json.dumps` string → wrap any transport/parse failure as
-  `OrchestrationError(502)` so a flaky store is a clean gateway error, never a
-  500) and calls `register_store_backend(McpStoreProvider(...),
-  complete_stateless)`. Absent/missing server ⇒ warned + stays stateless.
+- **Router wiring** — the top-level `conversationStore` key in `mcp.json` names a
+  server in `mcpServers` (config-driven, not an env var); at startup the lifespan
+  builds `_mcp_store_call(mgr)` (invoke → parse the MCP text block's `json.dumps`
+  string → wrap any transport/parse failure as `OrchestrationError(502)` so a
+  flaky store is a clean gateway error, never a 500) and calls
+  `register_store_backend(McpStoreProvider(...), complete_stateless)`.
+  Absent/missing server ⇒ warned + stays stateless.
 - **Reference server** — `examples/mcp-convstore/server.py` (fastmcp; in-process
   dict; tools return explicit `json.dumps(...)` strings). A real deployment backs
   it with sqlite/postgres/a file.
@@ -531,9 +532,9 @@ fabric provider (10.2) becomes one more implementation of the same seam.
 **Woollama-side mechanism implemented + tested, AND wired through a reference MCP
 store provider (10.3).** The protocol, the `StoreBackedBackend`, the routing
 gate, the clean error path, and a working MCP-store provider all exist and pass,
-hermetically and live. Setting `WOOLLAMA_CONVSTORE_SERVER` makes non-claude
-models stateful today; unset, they stay stateless (the default — no provider
-ships baked in). What remains is cross-repo and deliberately not guessed: (1)
+hermetically and live. Setting mcp.json's `conversationStore` key makes
+non-claude models stateful today; unset, they stay stateless (the default — no
+provider ships baked in). What remains is cross-repo and deliberately not guessed: (1)
 **the fabric contract** — the `create/get/append/delete` shape is woollama's
 *proposal* to fabric, not yet agreed (10.2); (2) **the fabric provider** — a thin
 adapter once that's settled; (3) **cosmic-fabric wiring** (part of the last v1.0
