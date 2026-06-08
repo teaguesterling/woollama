@@ -181,7 +181,14 @@ independently of woollama.
 
 ## 5. Interactive turns — pending questions
 
-A live Claude session can pause on an `AskUserQuestion` or a permission prompt.
+**SHIPPED 2026-06-07 via the managed-agents backend** (ahead of the tmux driver).
+A hosted CMA session pauses when the model calls a client-side custom tool
+(`ask_user`, declared on the agent): `agent.custom_tool_use` fires and the session
+idles with `stop_reason.type == "requires_action"`. woollama maps that to the
+Responses primitive below and resumes by returning the answer as a
+`user.custom_tool_result`. The claude-tmux driver (a live TUI pausing on a real
+`AskUserQuestion`) will map onto the SAME primitive later.
+
 Map it to the existing Responses primitive:
 
 - Turn pauses → Response `status: "requires_action"`, `required_action`:
@@ -248,7 +255,9 @@ plain terminal before building the claude-tmux backend:
    backend's transcript is the session-driver's job (slice 3+).
 3. **Session driver (Rust) + claude-tmux backend** — the live backing (gated on
    the §6 spikes). The hard infra, isolated in its own package.
-4. **`requires_action` / interactive answer path** — §5; the interaction driver.
+4. **`requires_action` / interactive answer path** — §5. **SHIPPED 2026-06-07 via
+   the managed-agents backend** (the `ask_user` custom tool); the claude-tmux
+   driver will reuse the same Responses primitive.
 5. **duckdb `stored` backend** — **SHIPPED 2026-06-05 (conv-5), then REVERTED
    2026-06-06.** It made woollama OWN conversation storage: an embedded duckdb at
    `$XDG_DATA_HOME/woollama/conversations.duckdb` that persisted the transcript
@@ -324,12 +333,19 @@ plain terminal before building the claude-tmux backend:
    also a richer **executor** than claude-code delegation (Anthropic hosts the
    tool sandbox).
 
-   *Scope/tradeoffs:* needs an API key (cost, not subscription); beta API;
-   provisions a container per session (overkill for plain Q&A, ideal for
-   agentic/tool-running). Defer: multiagent, outcomes/rubrics, file/repo
-   resources, vault-credentialed MCP — start with a tool-less or
-   agent_toolset session that proves the handle-routing + retrieve-transcript +
-   requires_action path end-to-end.
+   *Interactive `requires_action` — SHIPPED 2026-06-07 (§5).* The agent carries
+   one client-side custom tool, `ask_user`; when the model calls it the session
+   idles with `stop_reason: requires_action`, woollama returns a Responses
+   `requires_action` (the tool input is the question), and a continuing turn
+   resumes via `user.custom_tool_result`. Custom tools are client-executed, so
+   this adds no container provisioning. Hermetically tested (pause→answer
+   round-trip, exact tool_use_id, the answer/send_turn routing discriminator); the
+   live gate is best-effort (the model must *choose* to call `ask_user`).
+
+   *Scope/tradeoffs:* needs an API key (cost, not subscription); beta API. Still
+   deferred: multiagent, outcomes/rubrics, file/repo resources, vault-credentialed
+   MCP, recipe→agent MCP mapping. The shipped agent is otherwise tool-less (just
+   `ask_user`), so plain Q&A provisions no container.
 
 8. **Store-only backend for non-claude models (issue #2)** — **woollama-side
    mechanism IMPLEMENTED 2026-06-07 behind an un-wired seam; fabric provider +

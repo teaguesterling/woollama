@@ -418,6 +418,44 @@ def test_managed_agents_conversation_journey_live(woollama_server):
     assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
 
 
+@needs_anthropic
+def test_managed_agents_requires_action_round_trip_live(woollama_server):
+    """The interactive requires_action path (§5) end-to-end against the real
+    Managed Agents API: a turn that strongly directs the model to call ask_user
+    should pause (Response status:requires_action), and continuing with the answer
+    should resume to a completed Response.
+
+    ⚠️ PAID + creates account objects (agent + per-session container). BEST-EFFORT:
+    whether the model calls ask_user is nondeterministic — if it answers directly
+    instead of pausing, we SKIP (not fail) rather than assert model behavior.
+    Driven via raw httpx (the requires_action response is a Responses SUPERSET the
+    openai SDK doesn't model). Launch with the `agents` extra so the subprocess
+    has the SDK."""
+    base = woollama_server
+    model = "claude-agent/haiku"
+
+    r1 = httpx.post(f"{base}/v1/responses", json={
+        "model": model, "store": True,
+        "input": "You MUST use the ask_user tool to ask me 'What is your name?'. "
+                 "Do not answer or greet me until you have asked via the tool."},
+        timeout=300).json()
+    cid = r1["conversation"]["id"]
+    if r1.get("status") != "requires_action":
+        pytest.skip(f"model did not pause on ask_user (status={r1.get('status')!r}); "
+                    "nondeterministic — the hermetic test is the contract proof")
+
+    # It paused: the question rode the required_action payload.
+    assert r1["required_action"]["type"] == "ask_user"
+
+    # Continue with the answer → resume → completed.
+    r2 = httpx.post(f"{base}/v1/responses", json={
+        "model": model, "conversation": cid, "input": "Alice"}, timeout=300).json()
+    assert r2["status"] == "completed"
+    assert "alice" in r2["output"][0]["content"][0]["text"].lower()
+
+    httpx.delete(f"{base}/v1/conversations/{cid}", timeout=30)
+
+
 @needs_ollama
 def test_two_provider_recipe_uses_tools_from_two_sessions(woollama_server):
     """The textcounter recipe allow-lists textops.word_count AND hello.count_to

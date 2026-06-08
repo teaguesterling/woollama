@@ -185,6 +185,14 @@ async def responses_create(request: Request) -> Response:
         responses.new_id("resp"), model, text))
 
 
+def _latest_text(messages: list[dict]) -> str:
+    """The latest user message text — the answer carried by a resume turn."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return messages[-1].get("content", "") if messages else ""
+
+
 async def _responses_stateful(body: dict, model: str,
                               messages: list[dict]) -> Response:
     """Route a stateful turn: resolve/attach the conversation handle, run the
@@ -222,10 +230,17 @@ async def _responses_stateful(body: dict, model: str,
         conv = conversation_store.create(backend, model)
 
     backend_impl = conversations.BACKENDS[conv.backend]
+    # Resume vs. new turn (§5): if the conversation is paused awaiting input and
+    # its backend can answer, this turn's input is the ANSWER to the pending
+    # question — route to backend.answer, not a fresh send_turn.
+    resuming = conv.status == "awaiting_input" and hasattr(backend_impl, "answer")
     async with conv.lock:                       # one writer per conversation
         conv.status = "busy"
         try:
-            text = await backend_impl.send_turn(conv, messages, options=body.get("options"))
+            if resuming:
+                text = await backend_impl.answer(conv, _latest_text(messages))
+            else:
+                text = await backend_impl.send_turn(conv, messages, options=body.get("options"))
         except (claude_code.ClaudeCodeError, managed_agents.ManagedAgentsError) as e:
             conv.status = "idle"
             return _error(f"{conv.backend} backend: {e}", "server_error", 502)
@@ -237,12 +252,17 @@ async def _responses_stateful(body: dict, model: str,
             if e.payload is not None:
                 return JSONResponse(e.payload, status_code=e.status)
             return _error(e.message, e.kind, e.status)
-        conv.status = "idle"
+        # A backend may have set status="awaiting_input" (it paused for input) —
+        # don't clobber that with idle.
+        if conv.status != "awaiting_input":
+            conv.status = "idle"
 
     resp_id = responses.new_id("resp")
     conversation_store.record_response(conv, resp_id)
+    status = "requires_action" if conv.required_action else "completed"
     return JSONResponse(responses.build_response(
-        resp_id, conv.model, text, conversation=conv.id))
+        resp_id, conv.model, text, conversation=conv.id, status=status,
+        required_action=conv.required_action))
 
 
 # --- /v1/conversations — discovery + attach + teardown (conv-2) --------------

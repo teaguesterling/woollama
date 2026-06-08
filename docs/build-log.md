@@ -808,3 +808,50 @@ num_ctx` drove a stateless /v1/responses turn with num_ctx=8192 → /api/ps show
 8192. Green in 10.1s. (The store-backed path uses the same completer; it's
 hermetic-only since no provider is wired.) Recipe/orchestrate path unaffected —
 num_ctx applies to direct ollama models.
+
+## conv-8 — interactive requires_action path (2026-06-07)
+
+The §5 interactive pause/answer path, shipped via the managed-agents backend —
+WITHOUT the §6-blocked Rust tmux driver. A hosted CMA session pauses when the
+model calls a client-side custom tool; woollama maps that onto the Responses
+`requires_action` primitive.
+
+Grounded the mechanism in the installed SDK first (the conv-6 discipline):
+`agent.custom_tool_use` carries `.id`/`.name`/`.input`; the resume is
+`user.custom_tool_result` with `custom_tool_use_id` (Required) + `content`;
+`session.status_idle` carries `stop_reason` whose `.type` is `requires_action`.
+Custom tools are client-executed → no container provisioning.
+
+- managed_agents.py: the agent gains ONE custom tool, `ask_user`
+  (question[, options]). `_collect_sync` (was `_run_turn_sync`) now also watches
+  for `agent.custom_tool_use` and returns `{text, pending}` (pending = the paused
+  tool call); `run_turn` (new user.message) and `answer_turn` (new
+  user.custom_tool_result) share it.
+- conversations.py: `Conversation` gains `required_action` + `pending_tool_use_id`.
+  `ManagedAgentsBackend._apply` folds `{text,pending}` into the handle — pending →
+  `required_action={type:ask_user,question:<input>}` + status `awaiting_input`,
+  else clears. New `answer(conv, answer)` resumes via `answer_turn`.
+- responses.py: `build_response` gains `required_action` (with
+  `status="requires_action"`) — a documented Responses SUPERSET (extra key +
+  non-OpenAI status), so that variant is NOT a strict openai Response; the
+  completed variant is unchanged and still validates.
+- router.py: signal the pause through `conv`, not a new return type (the
+  tool_use_id is conversation-scoped — consumed on a *later* request — so it must
+  live on `conv` anyway; a `TurnResult` would be a redundant second encoding).
+  Two gotchas handled: the post-send `status="idle"` is now conditional (don't
+  clobber `awaiting_input`); and an attached turn on an `awaiting_input` conv
+  routes to `backend.answer` BEFORE a fresh `send_turn`, clearing pending on
+  resume. The `requires_action` Response carries `conv.required_action`.
+
+Tests: `test_managed_agents.py` +2 — the pause→answer round-trip (asserts
+status:requires_action + the question, then the EXACT tool_use_id is returned on
+resume and the turn completes) and the routing discriminator (resume hits
+`answer`, not `send_turn`; the answer is NOT appended as a user.message). 185
+hermetic pass; ruff clean; mkdocs --strict clean.
+
+Scope/honesty: most build-ahead feature of the session — no consumer yet. Kept
+minimal (one `ask_user` tool, single round-trip; no tool_confirmation/always-ask,
+no multi-pending). Hermetic is the contract proof; the live gate
+(`test_managed_agents_requires_action_round_trip_live`, @needs_anthropic) is PAID
+and BEST-EFFORT — it SKIPS if the model answers directly instead of calling
+ask_user (nondeterministic) — and is written-but-NOT-run.

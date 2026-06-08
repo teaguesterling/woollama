@@ -53,12 +53,18 @@ def parse_input(value) -> list[dict]:
 def build_response(resp_id: str, model: str, text: str, *,
                    conversation: str | None = None,
                    status: str = "completed",
-                   created_at: int | None = None) -> dict:
+                   created_at: int | None = None,
+                   required_action: dict | None = None) -> dict:
     """Assemble an OpenAI-Responses-shaped dict the `openai` SDK validates. The
     field set is exactly what `openai.types.responses.Response` requires plus the
     assistant message; `.output_text` is the SDK-computed join of the
-    `output_text` parts (we don't emit it ourselves)."""
-    return {
+    `output_text` parts (we don't emit it ourselves).
+
+    `required_action` (with `status="requires_action"`) is woollama's interactive
+    SUPERSET (§5) — when set, the object carries an extra `required_action` key and
+    a non-OpenAI status, so that variant is NOT a strict `openai` Response; the
+    completed variant (required_action=None) is unchanged and still validates."""
+    obj = {
         "id": resp_id,
         "object": "response",
         "created_at": int(created_at if created_at is not None else time.time()),
@@ -80,6 +86,9 @@ def build_response(resp_id: str, model: str, text: str, *,
         "tool_choice": "auto",
         "tools": [],
     }
+    if required_action is not None:
+        obj["required_action"] = required_action
+    return obj
 
 
 def item_object(msg: dict) -> dict:

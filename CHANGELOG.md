@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Interactive `requires_action` path** (conv-8) via the managed-agents backend
+  — without the tmux driver. The hosted agent carries an `ask_user` custom tool;
+  when it's called the session pauses, woollama returns a Responses
+  `status:"requires_action"` carrying the question, and continuing the
+  conversation with the answer resumes it (`user.custom_tool_result`). The
+  `requires_action` response is a documented superset of the OpenAI Responses
+  shape. See `docs/conversations-api-design.md` §5.
 - **Store-backed conversation backend** (#2, woollama-side mechanism): a
   store-only / BYO-inference backend that makes non-claude models (ollama, cloud,
   recipes) stateful by deferring the transcript to an external

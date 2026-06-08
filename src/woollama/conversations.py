@@ -75,6 +75,11 @@ class Conversation:
     created_at: int = field(default_factory=_now)
     updated_at: int = field(default_factory=_now)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Interactive pause state (§5): set when a backend turn stops awaiting input.
+    # `required_action` is the Responses payload; `pending_tool_use_id` is the
+    # backend's handle for resuming (e.g. a CMA custom_tool_use id).
+    required_action: dict | None = None
+    pending_tool_use_id: str | None = None
 
 
 class ConversationStore:
@@ -193,6 +198,21 @@ class ManagedAgentsBackend:
                     name=f"woollama:{full}", model=full, system="")
         return self._agents[full], self._env_id
 
+    def _apply(self, conv: Conversation, result: dict) -> str:
+        """Fold a `{text, pending}` turn result into the conversation handle. A
+        pending custom-tool call → set `required_action` + `awaiting_input` (the
+        interactive pause, §5); otherwise clear any prior pause. Returns the text."""
+        pending = result.get("pending")
+        if pending:
+            conv.pending_tool_use_id = pending["id"]
+            # The ask_user tool's input IS the question payload (question[, options]).
+            conv.required_action = {"type": "ask_user", "question": pending["input"]}
+            conv.status = "awaiting_input"
+        else:
+            conv.pending_tool_use_id = None
+            conv.required_action = None
+        return result.get("text") or ""
+
     async def send_turn(self, conv: Conversation, messages: list[dict],
                         *, options: dict | None = None) -> str:
         # `options` is inert here — Anthropic owns inference for the hosted session.
@@ -202,7 +222,15 @@ class ManagedAgentsBackend:
             agent_id, env_id = await self._ensure_agent(conv.model)
             conv.native_id = await managed_agents.create_session(
                 agent_id, env_id, title=conv.title, metadata=conv.metadata)
-        return await managed_agents.run_turn(conv.native_id, _latest_user_text(messages))
+        result = await managed_agents.run_turn(conv.native_id, _latest_user_text(messages))
+        return self._apply(conv, result)
+
+    async def answer(self, conv: Conversation, answer: str) -> str:
+        """Resume a session paused on `ask_user` by returning the user's answer
+        as the pending custom-tool result (§5). May complete or pause again."""
+        result = await managed_agents.answer_turn(
+            conv.native_id, conv.pending_tool_use_id, answer)
+        return self._apply(conv, result)
 
     async def history(self, conv: Conversation) -> list[dict]:
         """Retrieve the backend's transcript (Anthropic owns the bytes). Empty

@@ -103,11 +103,19 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      Hermetic-tested (SDK seam mocked) + SDK signatures introspected against
      `anthropic==0.107.1` + **live round-trip verified 2026-06-07** (15s: create →
      two-turn recall → `/items` 200 → delete). Deferred: recipe→agent MCP mapping,
-     vaults, the interactive `requires_action` path (the remaining route to the
-     §6-blocked tmux capability).
+     vaults, outcomes/multiagent.
+   - [x] **conv-8 — interactive `requires_action` path** SHIPPED 2026-06-07
+     (design-doc §5) via the managed-agents backend, WITHOUT the §6-blocked tmux
+     driver: the agent carries an `ask_user` custom tool; calling it idles the
+     session with `stop_reason: requires_action` → woollama returns a Responses
+     `requires_action` (the question rides `required_action`), and a continuing
+     turn resumes via `user.custom_tool_result`. Hermetic round-trip (pause→answer,
+     exact tool_use_id, the answer/send_turn routing discriminator); live gate is
+     best-effort (the model must choose to call ask_user) — paid, written-not-run.
    - [ ] conv-3/4 — the Rust session driver + claude-tmux backend (gated on the
-     §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`);
-     interactive `requires_action`; cosmic-fabric wiring.
+     §6 INTERACTIVE spikes — these genuinely hang nested, unlike `-p`); maps the
+     LIVE-TUI pause onto the same `requires_action` primitive (now shipped via
+     managed-agents); cosmic-fabric wiring.
    - [~] **conv-7 — store-only backend for non-claude models** (issue #2):
      woollama-side mechanism IMPLEMENTED 2026-06-07 (design-doc §10) behind an
      UN-WIRED seam; fabric provider + contract pending. `ConversationStoreProvider`

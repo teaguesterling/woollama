@@ -105,10 +105,33 @@ def _create_environment_sync(name: str) -> str:
     return env.id
 
 
+# One client-side custom tool so the hosted agent can PAUSE for user input — the
+# interactive `requires_action` path (§5). Custom tools are executed by us, not on
+# a container, so this adds no provisioning over the tool-less agent. When the
+# model calls it the session goes idle with stop_reason `requires_action`; woollama
+# surfaces the question and resumes with the answer as a `user.custom_tool_result`.
+ASK_USER_TOOL = {
+    "type": "custom",
+    "name": "ask_user",
+    "description": "Ask the user a question and pause until they answer. Use when "
+                   "you need clarification or a decision only the user can make.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question to ask."},
+            "options": {"type": "array", "items": {"type": "string"},
+                        "description": "Optional choices to offer."},
+        },
+        "required": ["question"],
+    },
+}
+
+
 def _create_agent_sync(name: str, model: str, system: str) -> str:
-    # Tool-less agent (§8.7 minimal): only `name` + `model` are required; no
-    # toolset means no per-session container provisioning we don't need yet.
-    kwargs = {"name": name, "model": model}
+    # `name` + `model` are the only required fields; we add ONE custom tool
+    # (ask_user) so the agent can pause for input (§5). Custom tools are
+    # client-executed → no per-session container provisioning.
+    kwargs = {"name": name, "model": model, "tools": [ASK_USER_TOOL]}
     if system:
         kwargs["system"] = system
     agent = _client().beta.agents.create(**kwargs)
@@ -141,20 +164,19 @@ def _event_text(event) -> str:
     return "".join(parts)
 
 
-def _run_turn_sync(session_id: str, text: str, deadline: float) -> str:
-    """Send one user message and collect the agent's reply, streaming events
-    until the session goes idle. Stream-first (open before send, per the SDK
-    guidance), with a per-event wall-clock deadline (SDK stream timeouts are
-    per-chunk, not total)."""
+def _collect_sync(session_id: str, send_events: list, deadline: float) -> dict:
+    """Send `send_events` (a user.message OR a user.custom_tool_result), then
+    stream until the session goes idle, returning `{text, pending}`. `pending` is
+    None for a completed turn, or `{id, name, input}` if the agent paused on a
+    custom tool (the interactive `requires_action` signal — §5). Stream-first
+    (open before send), per-event wall-clock deadline (SDK timeouts are
+    per-chunk)."""
     client = _client()
     start = time.monotonic()
     chunks: list[str] = []
+    pending: dict | None = None
     with client.beta.sessions.events.stream(session_id=session_id) as stream:
-        client.beta.sessions.events.send(
-            session_id=session_id,
-            events=[{"type": "user.message",
-                     "content": [{"type": "text", "text": text}]}],
-        )
+        client.beta.sessions.events.send(session_id=session_id, events=send_events)
         for event in stream:
             if time.monotonic() - start > deadline:
                 raise ManagedAgentsError(
@@ -162,9 +184,15 @@ def _run_turn_sync(session_id: str, text: str, deadline: float) -> str:
             etype = getattr(event, "type", None)
             if etype == "agent.message":
                 chunks.append(_event_text(event))
+            elif etype == "agent.custom_tool_use":
+                # The agent invoked our client-side tool → it will idle awaiting
+                # the result. Capture the call; the session is now paused.
+                pending = {"id": event.id,
+                           "name": getattr(event, "name", ""),
+                           "input": getattr(event, "input", None) or {}}
             elif etype in ("session.status_idle", "session.status_terminated"):
                 break
-    return "".join(chunks)
+    return {"text": "".join(chunks), "pending": pending}
 
 
 def _list_events_sync(session_id: str) -> list:
@@ -180,13 +208,13 @@ delete_session = _wrap(_delete_session_sync)
 list_events = _wrap(_list_events_sync)
 
 
-async def run_turn(session_id: str, text: str, *, deadline: float = _DEADLINE) -> str:
-    """One conversational turn. Wraps the blocking stream-collect in a hard
-    wall-clock `wait_for` (in case the stream produces NO events at all, where
-    the per-event deadline can't fire), atop the per-event deadline inside."""
+async def _collect(session_id: str, send_events: list, deadline: float) -> dict:
+    """Async wrapper around `_collect_sync`: a hard wall-clock `wait_for` (covers
+    a stream that produces NO events, where the per-event deadline can't fire) on
+    top of the per-event deadline inside. Returns `{text, pending}`."""
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_run_turn_sync, session_id, text, deadline),
+            asyncio.to_thread(_collect_sync, session_id, send_events, deadline),
             timeout=deadline + 30.0)
     except asyncio.TimeoutError as e:
         raise ManagedAgentsError(
@@ -196,6 +224,27 @@ async def run_turn(session_id: str, text: str, *, deadline: float = _DEADLINE) -
         raise
     except Exception as e:
         raise ManagedAgentsError(f"managed-agents turn failed: {e}") from e
+
+
+async def run_turn(session_id: str, text: str, *, deadline: float = _DEADLINE) -> dict:
+    """One conversational turn (a new user message). Returns `{text, pending}` —
+    `pending` set if the agent paused for input (requires_action)."""
+    return await _collect(
+        session_id,
+        [{"type": "user.message", "content": [{"type": "text", "text": text}]}],
+        deadline)
+
+
+async def answer_turn(session_id: str, tool_use_id: str, answer: str, *,
+                      deadline: float = _DEADLINE) -> dict:
+    """Resume a paused session by returning the user's answer as the result of the
+    pending custom-tool call (`user.custom_tool_result`). Returns `{text,
+    pending}` — the agent may complete, or pause again."""
+    return await _collect(
+        session_id,
+        [{"type": "user.custom_tool_result", "custom_tool_use_id": tool_use_id,
+          "content": [{"type": "text", "text": answer}]}],
+        deadline)
 
 
 def events_to_messages(events: list) -> list[dict]:

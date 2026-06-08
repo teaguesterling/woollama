@@ -25,6 +25,13 @@ def _event(type_: str, text: str | None = None):
     return SimpleNamespace(type=type_, content=content)
 
 
+def _tool_use_event(id_: str, name: str, input_: dict):
+    """An agent.custom_tool_use event — the interactive pause signal (its fields
+    mirror the installed SDK's BetaManagedAgentsAgentCustomToolUseEvent)."""
+    return SimpleNamespace(type="agent.custom_tool_use", id=id_, name=name,
+                           input=input_, content=[])
+
+
 class _FakeStream:
     """Context manager + iterable over a session's pending events. Reads the
     queue at iteration time, so the stream-first pattern (open, THEN send) sees
@@ -47,6 +54,11 @@ class FakeClient:
         self.rec = {"agents": [], "envs": [], "sessions": [], "deleted": []}
         self._sessions: dict[str, dict] = {}
         self._n = 0
+        # Interactive scripting: when True, the NEXT user.message makes the agent
+        # call ask_user (pause) instead of replying. The id it later receives in a
+        # custom_tool_result is recorded for round-trip assertions.
+        self.pause_next = False
+        self.received_tool_result_id = None
         events = SimpleNamespace(send=self._send, stream=self._stream, list=self._list)
         self.beta = SimpleNamespace(
             agents=SimpleNamespace(create=self._agent_create),
@@ -79,8 +91,24 @@ class FakeClient:
     def _send(self, session_id, events):
         s = self._sessions[session_id]
         for ev in events:
+            if ev["type"] == "user.custom_tool_result":
+                # Resuming a paused turn: record the id, then the agent answers.
+                self.received_tool_result_id = ev["custom_tool_use_id"]
+                answer = ev["content"][0]["text"]
+                reply = f"hello {answer}"
+                s["log"].append(("assistant", reply))
+                s["pending"] = [_event("agent.message", reply),
+                                _event("session.status_idle")]
+                return
             text = ev["content"][0]["text"]
             s["log"].append(("user", text))
+        if self.pause_next:
+            # The agent calls ask_user instead of replying → session pauses.
+            self.pause_next = False
+            s["pending"] = [_tool_use_event("tu_1", "ask_user",
+                                            {"question": "What's your name?"}),
+                            _event("session.status_idle")]
+            return
         reply = f"echo: {s['log'][-1][1]}"
         s["log"].append(("assistant", reply))
         s["pending"] = [_event("agent.message", reply), _event("session.status_idle")]
@@ -236,3 +264,57 @@ async def test_backend_error_maps_to_502(monkeypatch):
         "model": "claude-agent/opus", "input": "hi", "store": True}))
     assert r.status_code == 502
     assert "managed-agents backend" in json.loads(r.body)["error"]["message"]
+
+
+# --- interactive requires_action round-trip (§5) ------------------------------
+
+async def test_requires_action_pause_then_answer_round_trip(monkeypatch):
+    """The model calls ask_user → Response status:requires_action carrying the
+    question + conv awaiting_input; the client continues with the answer → the
+    EXACT custom_tool_use_id is returned and the Response completes."""
+    fake = fresh(monkeypatch)
+    fake.pause_next = True
+
+    # Turn 1 — the agent pauses on ask_user.
+    r1 = await router.responses_create(FakeRequest({
+        "model": "claude-agent/opus", "input": "help me", "store": True}))
+    b1 = json.loads(r1.body)
+    cid = b1["conversation"]["id"]
+    assert b1["status"] == "requires_action"
+    assert b1["required_action"] == {"type": "ask_user",
+                                     "question": {"question": "What's your name?"}}
+    conv = router.conversation_store.get(cid)
+    assert conv.status == "awaiting_input" and conv.pending_tool_use_id == "tu_1"
+
+    # Turn 2 — continue with the answer; resumes via user.custom_tool_result.
+    r2 = await router.responses_create(FakeRequest({
+        "model": "claude-agent/opus", "input": "Alice", "conversation": cid}))
+    b2 = json.loads(r2.body)
+    assert b2["status"] == "completed"
+    assert "hello alice" in b2["output"][0]["content"][0]["text"].lower()
+    # The resume sent back the EXACT id from the pause event (the conv-6 lesson).
+    assert fake.received_tool_result_id == "tu_1"
+    # Pending cleared → a third turn is a normal send_turn again.
+    assert conv.status == "idle" and conv.required_action is None
+    assert "required_action" not in b2
+
+
+async def test_resume_routes_to_answer_not_send_turn(monkeypatch):
+    """The routing discriminator: an attached turn on an awaiting_input conv hits
+    backend.answer (custom_tool_result), NOT a fresh send_turn (user.message)."""
+    fake = fresh(monkeypatch)
+    fake.pause_next = True
+    r1 = await router.responses_create(FakeRequest({
+        "model": "claude-agent/opus", "input": "go", "store": True}))
+    cid = json.loads(r1.body)["conversation"]["id"]
+    sid = router.conversation_store.get(cid).native_id
+
+    await router.responses_create(FakeRequest({
+        "model": "claude-agent/opus", "input": "Bob", "conversation": cid}))
+    # The answer arrived as a custom_tool_result (id recorded); had it gone through
+    # send_turn it would have been a user.message and recorded nothing.
+    assert fake.received_tool_result_id == "tu_1"
+    # The transcript's user turns are the first message + (assistant) — the answer
+    # went via the tool-result path, not appended as a user.message.
+    log_roles = [r for r, _ in fake._sessions[sid]["log"]]
+    assert log_roles.count("user") == 1     # only the initial "go"
