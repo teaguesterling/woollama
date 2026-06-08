@@ -178,14 +178,23 @@ Smaller follow-ons (not blocking):
   the spike). Hermetic unit + routing tests cover the construction/boundary; the
   positive + adversarial *live* gate is plain-terminal-only (see below).
 
-## Pending verifications (need a real terminal + creds; can't run nested)
+## Verifications
+
+### Still pending (need a real terminal + creds)
 
 - **Claude Code tool-lockdown** (slice i): the runtime safety boundary is
   verified by construction + unit tests, NOT live. Run in a plain terminal:
   `WOOLLAMA_TEST_CLAUDE_CODE=1 uv run --extra dev pytest tests/test_integration.py -m integration -k claude_code`
   (checks a real completion works AND neither a shell-exec nor a file-read
   prompt-injection succeeds).
-- ~~**Tool delegation** (executor)~~ — ✅ VERIFIED + HARDENED. The lockdown is
+- **Anthropic (and other cloud) live round-trips** (slices j/k): routing/auth
+  is unit-tested on the emit side + doc-confirmed (tools supported); the live
+  round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:
+  `uv run --extra dev pytest tests/test_integration.py -m integration -k anthropic`
+
+### Live-verified
+
+- **Tool delegation** (executor) — ✅ VERIFIED + HARDENED. The lockdown is
   `--tools ""` (an allow-list of built-in tools set to NONE) — robust against
   whatever tools a deployment's global config / plugins enable, which a deny-list
   can't enumerate and `dontAsk` doesn't deny (it only hard-denies tools that
@@ -203,11 +212,7 @@ Smaller follow-ons (not blocking):
   host-settings undercut (`--setting-sources project`), and a tool-name comma
   injection; SQL/argv/JSON-injection + path surfaces verified safe; same-server
   sibling-tool denial now has a live test. See docs/build-log.md (2026-06-06).
-- **Anthropic (and other cloud) live round-trips** (slices j/k): routing/auth
-  is unit-tested on the emit side + doc-confirmed (tools supported); the live
-  round-trip is unverified without keys. With `ANTHROPIC_API_KEY` set:
-  `uv run --extra dev pytest tests/test_integration.py -m integration -k anthropic`
-- ~~**managed-agents backend live round-trip**~~ (conv-6) — ✅ VERIFIED
+- **managed-agents backend live round-trip** (conv-6) — ✅ VERIFIED
   2026-06-07 against the real Managed Agents API (`claude-agent/haiku`, 15s):
   create (backend `managed-agents`) → two-turn recall proving Anthropic resumed
   the hosted session → `/items` 200 serving the transcript → session delete →
@@ -215,12 +220,17 @@ Smaller follow-ons (not blocking):
   a per-model agent that survives session delete). Re-run (launch WITH the
   `agents` extra so the server subprocess has the SDK):
   `uv run --extra dev --extra agents pytest tests/test_integration.py -m integration -k managed_agents_conversation_journey_live`
-- ~~**Streaming orchestration against real Ollama**~~ (slice streaming-2): ✅
+- **Streaming orchestration against real Ollama** (slice streaming-2) — ✅
   VERIFIED 2026-06-04 against real Ollama (`qwen3:14b-iq4xs`) — fragmented
   tool_call SSE deltas reassemble, the tool loop stays hidden, and the answer
   streams with one terminator (`test_orchestrated_recipe_streams_final_answer_hiding_tool_loop`,
   alongside the non-streaming + two-provider + MCP chat live tests). Re-run:
   `uv run --extra dev pytest tests/test_integration.py -m integration -k "stream or orchestrat or two_provider"`
+- **Also live-verified** (see build-log for dates): the `/v1/conversations`
+  journey on `claude-resume`; the `managed-agents` journey; streaming
+  `/v1/responses` and ollama `num_ctx` against real ollama. The
+  `managed-agents` interactive `requires_action` live gate is written but
+  best-effort/unrun (paid + nondeterministic).
 
 ## v1.0 (Rust) gate — progress
 

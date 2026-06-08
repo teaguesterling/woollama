@@ -122,6 +122,22 @@ attach-time signal that a live session is blocked on a question (§5).
 
 ## 3. Internal seam — the `ConversationBackend` interface
 
+**Terminology** (these words are easy to conflate):
+
+- **inferencer** — an OpenAI-compatible inference backend (`ollama`, `anthropic`,
+  …), addressed `<provider>/<model>`. Runs *inference*.
+- **(conversation) backend** — a state owner for a conversation (`claude-resume`,
+  `managed-agents`, `store-backed`). Implements the interface below. Runs *state*.
+- **executor** — a recipe runner that drives the agentic loop (the in-process
+  orchestrator, or claude-code tool delegation).
+- **handle** — woollama's opaque `conv_<hex>` id + its routing entry
+  (`{backend, native_id}`). woollama owns the handle, never the transcript.
+- **native_id** — the backend's own id for the conversation (a claude
+  `session_id`, a CMA session id, a store thread key).
+- **store provider** — `ConversationStoreProvider` (§10): an *external* owner of
+  transcript bytes that a `store-backed` backend defers to. Distinct from the
+  `ConversationStore` handle table, which is routing state, not bytes.
+
 woollama-side abstraction; each backend implements it. woollama stays thin —
 all backends are small adapters; the hard one (claude-tmux) is just an HTTP
 client to the Rust driver.

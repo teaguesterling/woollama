@@ -171,10 +171,10 @@ If `bosun` lands, the suite could naturally grow:
 (Names suggest themselves once you commit to the metaphor — that's an
 argument for nautical naming, not against.)
 
-## What's next
+## Outcome (done)
 
-Pick a name. Once chosen:
-1. Reserve the GitHub repo + PyPI name
-2. Update `router-architecture.md` to use it throughout
-3. Set up the bundle layout (router + forks + examples)
-4. Plan the cosmic-fabric → new-name migration / coexistence
+The name chosen was **woollama** (not on the shortlist above — it won on the
+"Web Over Ollama (and Llamas)" backronym + the llama metaphor). This doc is kept
+for the reasoning. The follow-through is complete: the repo is
+`teaguesterling/woollama`, the architecture/design docs use the name throughout,
+and cosmic-fabric consumes it as its router.
