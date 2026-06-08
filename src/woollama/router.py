@@ -13,6 +13,7 @@ FastAPI lifespan's split startup/shutdown task scope.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import time
@@ -97,19 +98,43 @@ app = FastAPI(title="woollama", version=__version__, lifespan=lifespan)
 app.mount("/mcp", _mcp_app)
 
 
+async def _discover_models(inf: inferencers.Inferencer) -> list[str]:
+    """Live-query a provider's own /v1/models, filtered by its `model_patterns`
+    (fnmatch globs; empty = all). Raises on transport/auth failure — the caller
+    logs and skips so one provider can't break the whole listing."""
+    headers = inf.headers()        # InferencerError here if a needed key is unset
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{inf.base_url.rstrip('/')}/models", headers=headers)
+        r.raise_for_status()
+    ids = [m["id"] for m in r.json().get("data", []) if isinstance(m, dict) and "id" in m]
+    if inf.model_patterns:
+        ids = [i for i in ids
+               if any(fnmatch.fnmatch(i, p) for p in inf.model_patterns)]
+    return ids
+
+
 @app.get("/v1/models")
 async def list_models() -> JSONResponse:
+    """OpenAI model list: each inferencer's opted-in models (static `models` +
+    optional live `discover`, namespaced `provider/<id>`) plus `woollama/<recipe>`.
+    Built-in cloud providers surface nothing until configured (issue #3); ollama
+    discovers its local catalog by default."""
     data: list[dict] = []
-    async with httpx.AsyncClient(timeout=10) as c:
-        try:
-            r = await c.get(f"{inferencers.get('ollama').base_url}/models")
-            for m in r.json().get("data", []):
-                data.append({"id": f"ollama/{m['id']}", "object": "model",
-                             "owned_by": "ollama"})
-        except Exception as e:
-            log.warning("ollama /v1/models failed: %s", e)
-    for name in recipes.names():
-        data.append({"id": f"woollama/{name}", "object": "model",
+    for name, inf in inferencers.all().items():
+        seen: set[str] = set()
+        ids = list(inf.models)
+        if inf.discover:
+            try:
+                ids += await _discover_models(inf)
+            except Exception as e:        # missing key / unreachable / non-200
+                log.warning("%s model discovery failed: %s", name, e)
+        for mid in ids:
+            if mid in seen:
+                continue
+            seen.add(mid)
+            data.append({"id": f"{name}/{mid}", "object": "model", "owned_by": name})
+    for rname in recipes.names():
+        data.append({"id": f"woollama/{rname}", "object": "model",
                      "owned_by": "woollama"})
     return JSONResponse({"object": "list", "data": data})
 

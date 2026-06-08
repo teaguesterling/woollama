@@ -8,6 +8,9 @@ a real round-trip is the opt-in @needs_anthropic live test in test_integration).
 """
 from __future__ import annotations
 
+import json
+
+import httpx
 import pytest
 
 from woollama import config, inferencers, recipes, router
@@ -69,11 +72,68 @@ def test_config_expands_env_in_values(monkeypatch, tmp_path):
     assert inferencers.get("local").chat_url() == "http://10.0.0.5:9000/v1/chat/completions"
 
 
-def test_load_inferencers_requires_base_url(tmp_path):
+def test_new_inferencer_requires_base_url(tmp_path):
+    # base_url is required for a NEW provider — validated at registry build now
+    # (so extending a built-in can omit it). config.load_inferencers just parses.
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.bad]\napi_key_env = "X"\n')   # no base_url
-    with pytest.raises(ValueError, match="base_url"):
-        config.load_inferencers()
+        '[inferencers.bad]\napi_key_env = "X"\n')   # no base_url, not a built-in
+    with pytest.raises(inferencers.InferencerError, match="base_url"):
+        inferencers.get("bad")
+
+
+def test_extend_builtin_without_base_url(tmp_path):
+    # Adding models to a built-in cloud provider needs NO base_url (field-merge).
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.anthropic]\n'
+        'models = ["claude-opus-4-8", "claude-haiku-4-5"]\n')
+    a = inferencers.get("anthropic")
+    assert a.base_url == "https://api.anthropic.com/v1"   # inherited from built-in
+    assert a.api_key_env == "ANTHROPIC_API_KEY"           # inherited
+    assert a.models == ("claude-opus-4-8", "claude-haiku-4-5")
+
+
+def test_discover_and_patterns_parse(tmp_path):
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.openrouter]\n'
+        'discover = true\n'
+        'model_patterns = ["anthropic/*", "openai/gpt-4*"]\n')
+    o = inferencers.get("openrouter")
+    assert o.discover is True
+    assert o.model_patterns == ("anthropic/*", "openai/gpt-4*")
+
+
+async def test_v1_models_enumerates_static_and_discovered(monkeypatch, tmp_path):
+    """GET /v1/models lists static `models` as-is and discovered models filtered
+    by `model_patterns` (issue #3); a discover that fails is skipped, not fatal."""
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.anthropic]\n'
+        'models = ["claude-opus-4-8"]\n\n'        # static; discover stays False
+        '[inferencers.myco]\n'
+        'base_url = "http://myco/v1"\n'
+        'discover = true\n'
+        'model_patterns = ["keep-*"]\n')
+
+    class _Resp:
+        def __init__(self, payload): self._p = payload
+        def json(self): return self._p
+        def raise_for_status(self): pass
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, url, headers=None):
+            if "myco" in url:
+                return _Resp({"data": [{"id": "big-1"}, {"id": "keep-this"}]})
+            return _Resp({"data": []})            # ollama etc. → empty catalog
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    body = json.loads((await router.list_models()).body)
+    ids = {m["id"]: m["owned_by"] for m in body["data"]}
+    assert ids.get("anthropic/claude-opus-4-8") == "anthropic"   # static, no query
+    assert ids.get("myco/keep-this") == "myco"                   # discovered + matched
+    assert "myco/big-1" not in ids                               # filtered by pattern
+    assert any(i.startswith("woollama/") for i in ids)           # recipes still listed
 
 
 def test_load_inferencers_absent_is_empty():

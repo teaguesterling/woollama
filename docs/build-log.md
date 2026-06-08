@@ -886,3 +886,39 @@ clean. Live: `test_responses_streaming_live` drove a real ollama stream — even
 `created…delta…completed`, deltas concatenating to the completed text. Green in
 ~15s. (#1↔#2 note: streaming uses the inferencer's /v1 SSE, so `num_ctx`-native is
 non-stream-only for now — documented follow-on.)
+
+## issue #3 — cloud models discoverable in GET /v1/models (2026-06-08)
+
+cosmic-fabric's model picker is populated from `/v1/models`, which listed only
+`ollama/<model>` (live-discovered) + `woollama/<recipe>` — cloud models routed by
+id but weren't discoverable, so a list-backed combobox couldn't offer them.
+
+Design (user's call): woollama owns NO model catalog. Each inferencer opts in via
+`inferencers.toml`: a static `models = [...]` list (no key needed to list) and/or
+`discover = true` (live-query the provider's own `/v1/models`) filtered by
+`model_patterns` (fnmatch globs, so openrouter's ~300 don't flood the picker).
+This generalizes ollama's existing live discovery (ollama is now just
+`discover=True` by default) to any provider, opt-in. Built-in clouds surface
+nothing until configured → no regression, and no listing models whose key isn't
+set.
+
+- inferencers.py: `Inferencer` gains `models`/`discover`/`model_patterns`; ollama
+  built-in defaults `discover=True`; `all()` exposes the registry. **Config merge
+  is now FIELD-LEVEL over built-ins** (was wholesale replace) so you can add
+  `models` to `anthropic` without restating base_url; the "new provider needs
+  base_url" check moved here (only here do we know if a name extends a built-in).
+- config.py: `load_inferencers` parses the new fields and emits only-present keys
+  (so the merge can tell "unset" from "set"); base_url no longer required at parse
+  time.
+- router.py: `/v1/models` loops all inferencers — static `models` + (if `discover`)
+  `_discover_models` (queries `{base_url}/models`, fnmatch-filtered), deduped,
+  namespaced `provider/<id>`; a failing discover is logged and skipped, not fatal.
+
+Tests: test_inferencers.py +4 (field-merge extend-without-base_url, new-provider
+base_url error now from the registry, discover/patterns parse, and the /v1/models
+enumeration with static + pattern-filtered discovery over mocked httpx); fixed the
+shared HttpxResponseStub to add `raise_for_status`. 194 hermetic pass; ruff clean.
+Live: the existing `@needs_ollama` /v1/models test passes against real ollama
+(the refactored discovery path). The cloud-discovery-against-a-real-vendor
+variation is the same code path (hermetic-covered); could be live-checked with a
+key later. Config reference for the new fields lands with the docs pass.

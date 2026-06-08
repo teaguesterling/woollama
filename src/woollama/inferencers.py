@@ -40,6 +40,15 @@ class Inferencer:
     # (not passthrough — there the client owns the body). Keeps Ollama's native
     # `options` and gives Anthropic a sane max_tokens / a clamped temperature.
     extra_body: dict = field(default_factory=dict)
+    # Model discoverability in GET /v1/models (issue #3). woollama owns no model
+    # catalog — a provider's models are surfaced only if opted in here:
+    #   `models`         — explicit ids to list (no key needed to list).
+    #   `discover`       — query the provider's own /v1/models live (needs key).
+    #   `model_patterns` — fnmatch globs to filter a (large) discovered catalog;
+    #                      empty = list all discovered. Applies to discovery only.
+    models: tuple[str, ...] = ()
+    discover: bool = False
+    model_patterns: tuple[str, ...] = ()
 
     def chat_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
@@ -80,6 +89,7 @@ def _registry() -> dict[str, Inferencer]:
             name="ollama",
             base_url=f"{ollama_url}/v1",
             extra_body={"options": {"temperature": 0}},  # Ollama-native; unchanged
+            discover=True,    # local catalog is small + needs no key → list it (as before)
         ),
         "anthropic": Inferencer(
             name="anthropic",
@@ -92,15 +102,34 @@ def _registry() -> dict[str, Inferencer]:
         reg[name] = Inferencer(name=name, base_url=base_url,
                                api_key_env=key_env, extra_body={"temperature": 0})
 
-    # User config merges over built-ins (add new providers / override a base_url).
+    # User config merges over built-ins, FIELD BY FIELD: a config entry for an
+    # existing provider overlays only the keys it sets (so you can add `models` to
+    # `anthropic` without restating its base_url); a new provider must supply
+    # base_url. (`base_url` validation lives here, not in config.load_inferencers,
+    # because only here do we know whether the name extends a built-in.)
     for name, spec in config.load_inferencers().items():
+        base = reg.get(name)
+        base_url = spec.get("base_url") or (base.base_url if base else None)
+        if not base_url:
+            raise InferencerError(
+                f"inferencer '{name}' has no base_url and is not a known built-in "
+                "to extend — add base_url in inferencers.toml")
         reg[name] = Inferencer(
             name=name,
-            base_url=spec["base_url"],
-            api_key_env=spec.get("api_key_env"),
-            extra_body=spec.get("extra_body") or {},
+            base_url=base_url,
+            api_key_env=spec.get("api_key_env", base.api_key_env if base else None),
+            extra_body=spec.get("extra_body") or (base.extra_body if base else {}),
+            models=tuple(spec.get("models") or (base.models if base else ())),
+            discover=spec.get("discover", base.discover if base else False),
+            model_patterns=tuple(
+                spec.get("model_patterns") or (base.model_patterns if base else ())),
         )
     return reg
+
+
+def all() -> dict[str, Inferencer]:  # noqa: A001 — registry accessor
+    """All inferencers (built-ins overlaid by config). Used by GET /v1/models."""
+    return _registry()
 
 
 def get(provider: str) -> Inferencer | None:

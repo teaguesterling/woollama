@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Cloud models discoverable in `GET /v1/models`** (#3): each inferencer can opt
+  in via `inferencers.toml` — a static `models = [...]` list and/or live
+  `discover = true` that queries the provider's own `/v1/models`, filtered by
+  `model_patterns` (fnmatch globs, e.g. `["claude-*", "gpt-4*"]`) so a huge
+  catalog can be narrowed. Built-in cloud providers surface nothing until
+  configured (no regression; ollama still auto-discovers its local catalog).
+  Config now merges over built-ins field-by-field, so you can add `models` to
+  `anthropic` without restating its `base_url`. Closes #3.
+
 ## v0.3.0 — 2026-06-07
 
 Still the Python prototype (v1.0 is the Rust rewrite). Conversation-surface

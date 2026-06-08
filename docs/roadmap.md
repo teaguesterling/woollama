@@ -40,6 +40,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **Interactive `requires_action`** — managed-agents `ask_user` custom tool → pause/answer via the Responses primitive | `managed_agents.py`, `router.py` | conv-8 |
 | **Streaming `/v1/responses`** — stateless `stream:true` → OpenAI Responses SSE (recipe or inferencer deltas) | `router.py` | conv-9 |
 | **Ollama `num_ctx` honored** — `ollama/<model>` with `options.num_ctx` routes to native `/api/chat` (passthrough + stateful) | `ollama_native.py`, `router.py` | #1 |
+| **Cloud models in `/v1/models`** — per-inferencer static `models` + opt-in `discover`/`model_patterns` (field-merge over built-ins) | `inferencers.py`, `config.py`, `router.py` | #3 |
 | Lint-clean (`ruff check .`) | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`

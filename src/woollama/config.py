@@ -136,18 +136,26 @@ def load_inferencers() -> dict[str, dict]:
     """User-defined OpenAI-compat inferencers from `$config/inferencers.toml`
     (optional). Returns `{name: {base_url, api_key_env, extra_body}}`.
 
-    Unlike recipes/mcp.json, this is MERGED OVER the built-in providers (a same
-    name overrides a built-in) rather than replacing them — inferencers are an
-    infrastructure registry you extend (add vLLM / a self-hosted endpoint /
-    override a base_url), not user content you own wholesale. See
-    `inferencers._registry`. `${VAR}` is expanded in values (e.g.
-    `base_url = "${VLLM_URL}/v1"`); `api_key_env` is the NAME of an env var.
+    Unlike recipes/mcp.json, this is MERGED OVER the built-in providers FIELD BY
+    FIELD (a same name overlays only the keys it sets) rather than replacing them
+    — inferencers are an infrastructure registry you extend (add vLLM, override a
+    base_url, or add `models` to a built-in cloud provider without restating its
+    base_url). The merge + the "new provider needs base_url" check live in
+    `inferencers._registry`; this function only parses. `${VAR}` is expanded in
+    values; `api_key_env` is the NAME of an env var.
 
-    TOML shape:
+    TOML shape (all fields optional when extending a built-in; base_url required
+    for a NEW provider):
         [inferencers.<name>]
-        base_url   = "https://host/v1"     # required (OpenAI-compatible base)
-        api_key_env = "SOME_API_KEY"       # optional; omit for no-auth (local)
-        extra_body = { temperature = 0 }   # optional; merged into each request
+        base_url       = "https://host/v1"      # OpenAI-compatible base
+        api_key_env    = "SOME_API_KEY"         # omit for no-auth (local)
+        extra_body     = { temperature = 0 }    # merged into each request
+        models         = ["id1", "id2"]         # surface these in /v1/models (#3)
+        discover       = true                   # live-query the provider's /v1/models
+        model_patterns = ["claude-*", "gpt-4*"] # fnmatch filter for `discover`
+
+    Returns `{name: {only the keys present in the TOML}}` — absent keys are
+    omitted (not defaulted) so the registry merge can tell "unset" from "set".
     """
     path = config_dir() / "inferencers.toml"
     if not path.is_file():
@@ -164,13 +172,22 @@ def load_inferencers() -> dict[str, dict]:
     for name, entry in raw.items():
         if not isinstance(entry, dict):
             raise ValueError(f"inferencers.toml {path}: '{name}' must be a table")
-        if "base_url" not in entry:
-            raise ValueError(f"inferencers.toml {path}: '{name}' missing 'base_url'")
-        out[name] = {
-            "base_url": entry["base_url"],
-            "api_key_env": entry.get("api_key_env"),
-            "extra_body": entry.get("extra_body") or {},
-        }
+        spec: dict = {}
+        for key in ("base_url", "api_key_env", "extra_body"):
+            if key in entry:
+                spec[key] = entry[key]
+        for list_key in ("models", "model_patterns"):
+            if list_key in entry:
+                if not isinstance(entry[list_key], list):
+                    raise ValueError(
+                        f"inferencers.toml {path}: '{name}.{list_key}' must be a list")
+                spec[list_key] = [str(v) for v in entry[list_key]]
+        if "discover" in entry:
+            if not isinstance(entry["discover"], bool):
+                raise ValueError(
+                    f"inferencers.toml {path}: '{name}.discover' must be true/false")
+            spec["discover"] = entry["discover"]
+        out[name] = spec
     log.info("loaded %d user inferencer(s) from %s: %s",
              len(out), path, list(out.keys()))
     return out

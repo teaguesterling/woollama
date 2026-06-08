@@ -45,6 +45,10 @@ class HttpxResponseStub:
     def json(self) -> dict:
         return self._payload
 
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
 
 def mock_httpx(monkeypatch, post_responses: list[dict] | dict | None = None,
                get_payload: dict | None = None):
