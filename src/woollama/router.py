@@ -267,7 +267,7 @@ async def responses_create(request: Request) -> Response:
         return _error(str(e), "invalid_request_error", 400)
 
     stateful = bool(body.get("store") or body.get("conversation")
-                    or body.get("previous_response_id"))
+                    or body.get("previous_response_id") or body.get("key"))
 
     if body.get("stream"):
         if stateful:
@@ -303,6 +303,14 @@ def _latest_text(messages: list[dict]) -> str:
     return messages[-1].get("content", "") if messages else ""
 
 
+def _no_stateful_backend_msg(model: str) -> str:
+    return (f"no stateful backend for model '{model}': only claude-code "
+            "(claude-resume) and claude-agent (managed-agents) models have a "
+            "state-owning backend unless a conversationStore is configured "
+            "(issue #2). woollama does not store conversations in its own system "
+            "— use `store:false` (the caller owns history) otherwise.")
+
+
 async def _responses_stateful(body: dict, model: str,
                               messages: list[dict]) -> Response:
     """Route a stateful turn: resolve/attach the conversation handle, run the
@@ -314,6 +322,7 @@ async def _responses_stateful(body: dict, model: str,
     conversation is created, its backend chosen by `model`."""
     conv_id = body.get("conversation")
     prev = body.get("previous_response_id")
+    key = body.get("key")             # caller's own key (e.g. fabric's sessionName)
 
     if conv_id:
         conv = conversation_store.get(conv_id)
@@ -327,16 +336,19 @@ async def _responses_stateful(body: dict, model: str,
         conv = conversation_store.by_response(prev)
         if conv is None:
             return _error(f"unknown previous_response_id '{prev}'", "not_found", 404)
+    elif key:
+        # Attach-by-key (create-or-attach): the caller drives turns by its own
+        # sessionName and never holds a woollama conversation id — woollama owns
+        # the durable key→conv map. First turn creates the handle; later turns
+        # with the same key continue it.
+        backend = conversations.backend_for_model(model)
+        if backend is None:
+            return _error(_no_stateful_backend_msg(model), "not_implemented", 501)
+        conv, _ = conversation_store.get_or_create_by_alias(key, backend, model)
     else:
         backend = conversations.backend_for_model(model)
         if backend is None:
-            return _error(
-                f"no stateful backend for model '{model}': only claude-code "
-                "(claude-resume) and claude-agent (managed-agents) models have a "
-                "state-owning backend in this build. woollama does not store "
-                "conversations in its own system — use `store:false` (the caller "
-                "owns history) for ollama/recipe/cloud models.",
-                "not_implemented", 501)
+            return _error(_no_stateful_backend_msg(model), "not_implemented", 501)
         conv = conversation_store.create(backend, model)
 
     backend_impl = conversations.BACKENDS[conv.backend]
@@ -395,9 +407,15 @@ async def conversations_create(request: Request) -> Response:
             "this build. woollama does not store conversations in its own system — "
             "ollama/recipe/cloud models are stateless (use `store:false`).",
             "not_implemented", 501)
+    # Idempotent attach-by-key: if the caller passes its own `key` (e.g. fabric's
+    # sessionName) and a conversation already exists for it, return that one (200)
+    # instead of minting a duplicate — so the caller keeps no key→id map of its own.
+    key = body.get("key")
+    if key is not None and (existing := conversation_store.by_alias(key)) is not None:
+        return JSONResponse(responses.conversation_object(existing), status_code=200)
     conv = conversation_store.create(backend, model,
                                      metadata=body.get("metadata") or {},
-                                     title=body.get("title"))
+                                     title=body.get("title"), key=key)
     return JSONResponse(responses.conversation_object(conv), status_code=201)
 
 

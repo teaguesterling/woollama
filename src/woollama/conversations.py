@@ -73,6 +73,7 @@ class Conversation:
     backend: str
     model: str
     native_id: str | None = None      # backend's own id (e.g. a claude session_id)
+    key: str | None = None            # caller's own external key (e.g. fabric's sessionName)
     workdir: str | None = None        # stable cwd for the backing session (resume scoping)
     response_ids: list[str] = field(default_factory=list)
     status: str = "idle"              # idle | busy | awaiting_input | dead
@@ -93,7 +94,7 @@ class Conversation:
 # — NOT the transcript (the backend/store owns that), so persisting it does not
 # violate "woollama never owns conversation state".
 _PERSISTED_FIELDS = (
-    "id", "backend", "model", "native_id", "workdir", "response_ids",
+    "id", "backend", "model", "native_id", "key", "workdir", "response_ids",
     "status", "title", "metadata", "created_at", "updated_at",
     "required_action", "pending_tool_use_id",
 )
@@ -112,6 +113,7 @@ class ConversationStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self._convs: dict[str, Conversation] = {}
         self._resp_to_conv: dict[str, str] = {}
+        self._alias_to_conv: dict[str, str] = {}    # caller's key → conv_id
         self._path: Path | None = Path(path) if path else None
         if self._path is not None:
             self._load()
@@ -124,12 +126,31 @@ class ConversationStore:
         self._load()
 
     def create(self, backend: str, model: str, *, metadata: dict | None = None,
-               title: str | None = None) -> Conversation:
+               title: str | None = None, key: str | None = None) -> Conversation:
         conv = Conversation(id=responses.new_id("conv"), backend=backend,
-                            model=model, metadata=metadata or {}, title=title)
+                            model=model, metadata=metadata or {}, title=title,
+                            key=key)
         self._convs[conv.id] = conv
+        if key is not None:
+            self._alias_to_conv[key] = conv.id
         self._save()
         return conv
+
+    def by_alias(self, key: str) -> Conversation | None:
+        """Resolve a caller's own external key (e.g. fabric's sessionName) to its
+        conversation — woollama owns this `key → conv_id` map (durably), so the
+        caller need not keep its own."""
+        cid = self._alias_to_conv.get(key)
+        return self._convs.get(cid) if cid else None
+
+    def get_or_create_by_alias(self, key: str, backend: str, model: str,
+                               **kw) -> tuple[Conversation, bool]:
+        """Idempotent attach-by-key: return the existing conversation for `key`
+        (created=False), or create a new one bound to it (created=True)."""
+        existing = self.by_alias(key)
+        if existing is not None:
+            return existing, False
+        return self.create(backend, model, key=key, **kw), True
 
     def get(self, conv_id: str) -> Conversation | None:
         return self._convs.get(conv_id)
@@ -156,6 +177,8 @@ class ConversationStore:
         if conv is not None:
             for rid in conv.response_ids:
                 self._resp_to_conv.pop(rid, None)
+            if conv.key is not None:
+                self._alias_to_conv.pop(conv.key, None)
             self._save()
         return conv
 
@@ -190,6 +213,8 @@ class ConversationStore:
                 d["status"] = "idle"
             conv = Conversation(**d)
             self._convs[conv.id] = conv
+            if conv.key is not None:        # rebuild the alias index from conv.key
+                self._alias_to_conv[conv.key] = conv.id
         self._resp_to_conv = dict(data.get("resp_to_conv", {}))
         log.info("loaded %d conversation handle(s) from %s",
                  len(self._convs), self._path)

@@ -130,5 +130,6 @@ def conversation_object(conv) -> dict:
         "model": conv.model,
         "status": conv.status,
         "title": conv.title,
+        "key": conv.key,                # caller's own external key, if attached by one
         "updated_at": conv.updated_at,
     }

@@ -111,7 +111,8 @@ drive it.
 
 ```
 POST   /v1/conversations            { "backend": "claude-resume" | "claude-tmux" | "managed-agents",
-                                       "model": "...", "metadata": {...} }   -> {id, status}
+                                       "model": "...", "metadata": {...},
+                                       "key": "<caller's own key>" (optional, idempotent) }  -> {id, status}
 GET    /v1/conversations            -> [ {id, backend, status, title, updated_at}, ... ]
 GET    /v1/conversations/{id}        -> {id, backend, status, ...}
 GET    /v1/conversations/{id}/items  -> the transcript (messages)
@@ -119,6 +120,25 @@ DELETE /v1/conversations/{id}        -> end / kill the backing
 ```
 `status` ∈ `idle | busy | awaiting_input | dead`. `awaiting_input` is the
 attach-time signal that a live session is blocked on a question (§5).
+
+### 2.1 Attach by external key (the cosmic-fabric smoother)
+
+A caller that already has its own session identity — e.g. cosmic-fabric's
+`sessionName` — can drive turns by **its own key** and never hold a woollama
+`conversation_id`. woollama owns the durable `key → conv_id` map (it's part of
+the persisted handle table), so the **caller keeps no mapping table of its own**:
+
+- `POST /v1/conversations` with `{"model": "...", "key": "<sessionName>"}` is
+  **idempotent**: first call creates the handle (`201`), later calls with the same
+  key return the existing one (`200`).
+- `POST /v1/responses` with `{"model": "...", "key": "<sessionName>", "input": …}`
+  is **create-or-attach + run**: the first turn for a key creates the backing
+  conversation, later turns continue it. No `conversation` id ever changes hands.
+
+Resolution precedence on `/v1/responses`: explicit `conversation` id > `previous_
+response_id` > `key` > new. The key is echoed back as `key` on the conversation
+object. This is the woollama side of cosmic-fabric#1: fabric maps a cosmic session
+→ a woollama conversation simply by passing the session name as `key`.
 
 ## 3. Internal seam — the `ConversationBackend` interface
 
