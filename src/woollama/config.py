@@ -43,6 +43,19 @@ def config_dir() -> Path:
     return Path(base) / "woollama"
 
 
+def state_dir() -> Path:
+    """Where woollama's durable runtime state lives (e.g. the conversation handle
+    table that must survive a restart). Precedence:
+      1. `$WOOLLAMA_STATE_DIR` (explicit override)
+      2. `$XDG_STATE_HOME/woollama`
+      3. `~/.local/state/woollama`
+    Distinct from `config_dir()` (user-authored config) — this is app-managed."""
+    if override := os.environ.get("WOOLLAMA_STATE_DIR"):
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "woollama"
+
+
 def _examples_dir() -> Path:
     """The package's `examples/` directory, used for bundled defaults."""
     return Path(__file__).resolve().parent.parent.parent / "examples"

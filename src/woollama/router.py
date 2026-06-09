@@ -118,6 +118,12 @@ def _http_store_call(base_url: str) -> conversations.StoreCallFn:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Make the conversation handle table durable across restarts: load any
+    # persisted handles and atomically persist on every mutation. This is ROUTING
+    # state (conv_id → backend + native_id), not transcripts — the backends/stores
+    # still own the bytes; woollama just remembers which handle points where so a
+    # client's conversation id keeps resolving after a restart.
+    conversation_store.enable_persistence(config.state_dir() / "conversations.json")
     # Server bundle from mcp.json (user config or bundled defaults).
     for name, cfg in config.load_mcp_servers().items():
         registry.add(ServerManager(name, cfg["command"], cfg["args"]))

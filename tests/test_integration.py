@@ -81,6 +81,7 @@ def _spawn_woollama(tmp_path, *, extra_env=None):
         "WOOLLAMA_ADDRESS": f"127.0.0.1:{port}",
         "WOOLLAMA_CONFIG_DIR": str(tmp_path),  # empty dir → bundled defaults
         "XDG_RUNTIME_DIR": str(tmp_path),       # don't clobber the user's real addr-file
+        "WOOLLAMA_STATE_DIR": str(tmp_path / "state"),  # isolate the durable handle table
         **(extra_env or {}),
     }
     proc = subprocess.Popen(
@@ -613,6 +614,51 @@ def test_http_store_backed_conversation_journey_live(woollama_server_http_convst
     assert httpx.get(f"{base}/v1/conversations/{cid}", timeout=10).status_code == 404
     assert not list(store_dir.glob("*.json")), \
         "delete should have removed the store's thread file"
+
+
+@needs_ollama
+def test_handle_table_survives_woollama_restart_live(tmp_path):
+    """The durable handle table end-to-end: create a stateful ollama conversation,
+    KILL woollama, bring a FRESH woollama up on the same state dir + same
+    (persistent REST) store, and continue the SAME conversation id — recall proves
+    both halves survived the restart: woollama's conv_id→handle routing (state dir)
+    AND the transcript (the external file store). The first proof that a client's
+    conversation id keeps working across a woollama restart."""
+    import openai
+    store_dir = tmp_path / "store"
+    store_dir.mkdir()
+    with _spawn_rest_convstore(store_dir) as store_url:
+        (tmp_path / "mcp.json").write_text(json.dumps({
+            "conversationStore": {"type": "http", "url": store_url},
+            "mcpServers": {},
+        }))
+        # First woollama: create the conversation and plant a codeword.
+        with _spawn_woollama(tmp_path) as base1:
+            models = httpx.get(f"{base1}/v1/models", timeout=5).json()["data"]
+            ids = [m["id"][len("ollama/"):] for m in models
+                   if m["id"].startswith("ollama/")]
+            if not ids:
+                pytest.skip("no Ollama models available")
+            model = f"ollama/{ids[0]}"
+            created = httpx.post(f"{base1}/v1/conversations",
+                                 json={"model": model, "title": "restart"}, timeout=15)
+            assert created.status_code == 201, created.text
+            cid = created.json()["id"]
+            c1 = openai.OpenAI(base_url=f"{base1}/v1", api_key="not-required")
+            c1.responses.create(model=model, conversation=cid,
+                                input="Remember this codeword: banana. Reply only: ok",
+                                timeout=180)
+        # woollama #1 is DOWN. A fresh one on the SAME state dir + store must still
+        # resolve the conversation id and recall across the restart.
+        with _spawn_woollama(tmp_path) as base2:
+            got = httpx.get(f"{base2}/v1/conversations/{cid}", timeout=10)
+            assert got.status_code == 200, "the handle must survive a restart"
+            c2 = openai.OpenAI(base_url=f"{base2}/v1", api_key="not-required")
+            r = c2.responses.create(model=model, conversation=cid,
+                                    input="What codeword did I ask you to remember? "
+                                          "Reply with only that word.", timeout=180)
+            assert "banana" in r.output_text.lower(), \
+                f"recall after restart should work; got {r.output_text!r}"
 
 
 @needs_anthropic

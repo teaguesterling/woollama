@@ -33,7 +33,7 @@ inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
 | **MCP progress events** — the `chat` tool emits a `ctx.info` notification per tool call/result during the hidden loop (live progress; return value unchanged) | `mcp_server.py`, `router.py` | streaming-3 |
 | **Unix socket alongside HTTP loopback** — one app on a UDS (`$XDG_RUNTIME_DIR/woollama.sock`, mode 0600) + the loopback TCP port | `binding.py`, `__main__.py` | unix-socket |
 | **`/v1/responses` (stateless subset)** — OpenAI Responses-shaped superset of chat-completions (`store:false`), SDK-verified | `responses.py`, `router.py` | conv-1a |
-| **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified | `conversations.py`, `router.py` | conv-1b |
+| **Stateful `/v1/responses`** — handle table routes `conversation_id` → backend; `claude-resume` backend (`store:true`/`conversation`/`previous_response_id`); live-verified. Handle table is **durable** (persisted to `$XDG_STATE_HOME`), so conv ids survive a restart | `conversations.py`, `router.py` | conv-1b |
 | **`/v1/conversations`** — discovery/attach: create, list, get, delete (handle table; OpenAI Conversation shape + routing extras) | `router.py`, `conversations.py` | conv-2 |
 | **`managed-agents` backend** — `claude-agent/<model>` → Anthropic Managed Agents (hosted session owns state); implements `history` so `/items` serves the transcript | `managed_agents.py`, `conversations.py` | conv-6 |
 | **`store-backed` backend + two reference store providers** — store-only/BYO-inference makes non-claude models stateful; `McpStoreProvider` (`examples/mcp-convstore`) + `HttpStoreProvider` (`examples/rest-convstore`, file-backed) wire it via mcp.json's `conversationStore` key (both live round-trip tested). No provider ships baked in → stateless by default | `conversations.py`, `router.py` | conv-7 |
@@ -84,10 +84,16 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
    session driven by a separate Rust package). Build order is in that doc.
    - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
      OpenAI Responses wire shape, verified live via the `openai` SDK.
-   - [x] **conv-1b** — in-memory handle table (`conversation_id` → backend +
+   - [x] **conv-1b** — handle table (`conversation_id` → backend +
      claude `session_id` + stable workdir; one writer per conversation) +
      `claude-resume` backend + `store:true` / `conversation` /
      `previous_response_id` routing. Live-verified (create → resume → recall).
+     **Durable** (2026-06-08): the table is persisted to
+     `$XDG_STATE_HOME/woollama/conversations.json` (atomic rewrite per mutation),
+     so a `conversation` id keeps resolving across a woollama restart — routing
+     state only (conv_id → backend + native_id), never transcripts. Live-verified
+     end-to-end (`test_handle_table_survives_woollama_restart_live`: kill + respawn
+     on the same state dir + persistent store → recall holds).
    - [x] **conv-2** — `/v1/conversations` create / list / get / delete (the
      discovery + attach + teardown surface). Live CRUD verified; the full e2e
      journey (create → discover → two-turn recall → `items` 501 → delete) is

@@ -45,15 +45,20 @@ Limitations (documented, not hidden):
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import shutil
 import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from . import claude_code, managed_agents, responses
+
+log = logging.getLogger("woollama.conversations")
 
 
 def _now() -> int:
@@ -83,19 +88,47 @@ class Conversation:
     pending_tool_use_id: str | None = None
 
 
-class ConversationStore:
-    """In-memory handle table. Maps `conv_id → Conversation` and `resp_id →
-    conv_id` (so `previous_response_id` resolves to its conversation)."""
+# Conversation fields that make up the durable handle (everything except the
+# transient asyncio.Lock). This is ROUTING state — conv_id → (backend, native_id)
+# — NOT the transcript (the backend/store owns that), so persisting it does not
+# violate "woollama never owns conversation state".
+_PERSISTED_FIELDS = (
+    "id", "backend", "model", "native_id", "workdir", "response_ids",
+    "status", "title", "metadata", "created_at", "updated_at",
+    "required_action", "pending_tool_use_id",
+)
 
-    def __init__(self) -> None:
+
+class ConversationStore:
+    """Handle table. Maps `conv_id → Conversation` and `resp_id → conv_id` (so
+    `previous_response_id` resolves to its conversation).
+
+    Optionally **durable**: pass a `path` (or call `enable_persistence`) and the
+    table is loaded on construction and atomically rewritten on every mutation, so
+    conv_ids survive a woollama restart (the routing state outlives the process,
+    matching the backends/stores that already outlive it). With no path it is
+    purely in-memory (the default; tests rely on this)."""
+
+    def __init__(self, path: str | Path | None = None) -> None:
         self._convs: dict[str, Conversation] = {}
         self._resp_to_conv: dict[str, str] = {}
+        self._path: Path | None = Path(path) if path else None
+        if self._path is not None:
+            self._load()
+
+    def enable_persistence(self, path: str | Path) -> None:
+        """Make this (already-constructed) store durable at `path`, loading any
+        existing state. Used by the router lifespan so the module-level store stays
+        import-side-effect-free until the server actually starts."""
+        self._path = Path(path)
+        self._load()
 
     def create(self, backend: str, model: str, *, metadata: dict | None = None,
                title: str | None = None) -> Conversation:
         conv = Conversation(id=responses.new_id("conv"), backend=backend,
                             model=model, metadata=metadata or {}, title=title)
         self._convs[conv.id] = conv
+        self._save()
         return conv
 
     def get(self, conv_id: str) -> Conversation | None:
@@ -112,6 +145,9 @@ class ConversationStore:
         conv.response_ids.append(response_id)
         conv.updated_at = _now()
         self._resp_to_conv[response_id] = conv.id
+        # Called after EVERY stateful turn (router._responses_stateful), so this is
+        # also the persistence point that captures native_id/status/required_action.
+        self._save()
 
     def remove(self, conv_id: str) -> Conversation | None:
         """Drop the handle (and its response_id back-references). The backing's
@@ -120,7 +156,43 @@ class ConversationStore:
         if conv is not None:
             for rid in conv.response_ids:
                 self._resp_to_conv.pop(rid, None)
+            self._save()
         return conv
+
+    # --- persistence (no-op unless a path is set) -----------------------------
+
+    def _save(self) -> None:
+        if self._path is None:
+            return
+        data = {
+            "convs": [{f: getattr(c, f) for f in _PERSISTED_FIELDS}
+                      for c in self._convs.values()],
+            "resp_to_conv": self._resp_to_conv,
+        }
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(self._path)             # atomic swap
+
+    def _load(self) -> None:
+        if self._path is None or not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("conversation handle table at %s is unreadable (%s); "
+                        "starting empty", self._path, e)
+            return
+        for d in data.get("convs", []):
+            # A turn can't be mid-flight after a restart — a persisted 'busy' is
+            # stale; reset it so the conversation is usable again.
+            if d.get("status") == "busy":
+                d["status"] = "idle"
+            conv = Conversation(**d)
+            self._convs[conv.id] = conv
+        self._resp_to_conv = dict(data.get("resp_to_conv", {}))
+        log.info("loaded %d conversation handle(s) from %s",
+                 len(self._convs), self._path)
 
 
 class ClaudeResumeBackend:

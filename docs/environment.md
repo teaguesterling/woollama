@@ -32,6 +32,8 @@ Required only to *use* (or live-`discover`) the matching cloud provider.
 |---|---|---|
 | `WOOLLAMA_CONFIG_DIR` | `$XDG_CONFIG_HOME/woollama` (`~/.config/woollama`) | Where `mcp.json` / `recipes.toml` / `inferencers.toml` are read from. |
 | `XDG_CONFIG_HOME` | `~/.config` | Base for the default config dir (above). |
+| `WOOLLAMA_STATE_DIR` | `$XDG_STATE_HOME/woollama` (`~/.local/state/woollama`) | Where the **durable conversation handle table** (`conversations.json`) is stored, so a client's `conversation` id keeps resolving across a woollama restart. App-managed routing state (conv_id → backend + native id), not transcripts — the backend/store still owns the bytes. |
+| `XDG_STATE_HOME` | `~/.local/state` | Base for the default state dir (above). |
 | `WOOLLAMA_OLLAMA_URL` | `http://localhost:11434` | The local Ollama endpoint (the `ollama/` provider's base + its `/v1/models` discovery). |
 | `WOOLLAMA_CLAUDE_BIN` | `claude` (on `PATH`) | Path to the Claude Code CLI for `claude-code/<model>` (inference, delegation, and the `claude-resume` conversation backend). |
 

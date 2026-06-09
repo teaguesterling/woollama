@@ -261,7 +261,7 @@ plain terminal before building the claude-tmux backend:
    the Responses shape against the EASY (non-interactive) backend. No tmux.
    - [x] **conv-1a** — `/v1/responses` stateless subset (`store:false`); the
      Responses wire shape, SDK-verified. No backend/handle table yet.
-   - [x] **conv-1b** — in-memory handle table
+   - [x] **conv-1b** — handle table
      (`conversations.py`: `conv_id → {backend, native_id, workdir}`; resp_id is
      the chain key; one `asyncio.Lock` writer per conversation) + `claude-resume`
      backend + `store:true` / `conversation` / `previous_response_id` routing in
@@ -276,7 +276,16 @@ plain terminal before building the claude-tmux backend:
      `workdir` (a fresh empty temp dir, removed on `DELETE` by the backend).
      `--resume` continues from the session TIP (no fork-from-earlier-turn
      primitive), so `previous_response_id` CHAINS off the conversation; true
-     forking is later. Handle table is in-memory → a restart loses sid mappings.
+     forking is later.
+   - [x] **conv-1b durability** — the handle table is now **persisted** to
+     `$XDG_STATE_HOME/woollama/conversations.json` (atomic rewrite on every
+     mutation; `ConversationStore(path)` / `enable_persistence`), so a client's
+     `conversation` id keeps resolving across a woollama restart. It stores only
+     ROUTING state (conv_id → backend + native_id), never transcripts — backends/
+     stores still own the bytes. A stale `busy` (crash mid-turn) resets to `idle`
+     on load. Live-verified: kill woollama, respawn on the same state dir + a
+     persistent store, continue the same conversation id, recall holds
+     (`test_handle_table_survives_woollama_restart_live`).
 2. **`/v1/conversations` listing + delete** — discovery/attach surface.
    **conv-2**: `POST` (create handle; backend derived from
    `model`), `GET` (list), `GET /{id}`, `DELETE /{id}` (backend teardown +
@@ -321,10 +330,11 @@ plain terminal before building the claude-tmux backend:
    501s). `delete` → `sessions.delete`. Hermetic tests mock the SDK seam
    (`managed_agents._client`); the live gate is `@needs_anthropic` (PAID).
    *Deferred (unchanged from below):* recipe→agent MCP mapping, vaults, file/repo
-   resources, the `requires_action` interactive path. *Known limit:* the
-   in-memory handle table means a restart orphans live (billed) sessions, and each
-   fresh process re-creates its per-model agent — the `ant`-YAML / reuse-by-name
-   control plane is the eventual fix.
+   resources, the `requires_action` interactive path. *Known limit:* the handle
+   table is now durable, so a restart no longer orphans live (billed) sessions —
+   the `session_id` survives and woollama reattaches — but each fresh process
+   still re-creates its per-model agent (the agent cache is instance-level, not
+   persisted); the `ant`-YAML / reuse-by-name control plane is the eventual fix.
    The purest embodiment of "backends own state" — Anthropic literally hosts the
    session, the loop, and a per-session container; woollama just routes the
    handle. **An alternative to slices 3/4** (the Rust claude-tmux driver +
@@ -399,8 +409,10 @@ plain terminal before building the claude-tmux backend:
 - One writer per conversation — woollama serializes turns per `conversation_id`.
 - woollama holds **handles, not state**. It routes a `conversation_id` to a
   backend that owns the bytes (or runs the turn statelessly); it does NOT store
-  transcripts in its own system. The in-memory handle table is just the
-  routing map. (conv-5 briefly broke this with an embedded duckdb; reverted.)
+  transcripts in its own system. The handle table is just the routing map —
+  persisted (conv_id → backend + native_id) so handles survive a restart, but
+  never the transcript. (conv-5 briefly broke this with an embedded duckdb that
+  stored the bytes; reverted. Persisting the *routing map* is not that.)
 - Don't half-implement the Responses spec — minimal subset only (create /
   continue / read / fork / requires_action).
 
