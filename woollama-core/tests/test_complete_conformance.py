@@ -110,3 +110,63 @@ def test_missing_key_raises_fast(monkeypatch):
 def test_provider_names():
     assert wc.provider_names() == ["ollama", "anthropic", "openai",
                                    "groq", "together", "openrouter"]
+
+
+# --- streaming ---------------------------------------------------------------
+
+def _sse(*deltas):
+    body = "".join(
+        "data: " + json.dumps({"choices": [{"delta": {"content": d}}]}) + "\n\n"
+        for d in deltas)
+    return body + "data: [DONE]\n\n"
+
+
+class _SSEMock(BaseHTTPRequestHandler):
+    sse: str = ""
+    status: int = 200
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        if _SSEMock.status >= 400:
+            raw = b'{"error": "bad"}'
+        else:
+            raw = _SSEMock.sse.encode()
+        self.send_response(_SSEMock.status)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+@pytest.fixture
+def sse_url():
+    srv = HTTPServer(("127.0.0.1", 0), _SSEMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    finally:
+        srv.shutdown()
+
+
+def test_complete_stream_yields_deltas(sse_url):
+    _SSEMock.status, _SSEMock.sse = 200, _sse("a", "b", "c")
+
+    async def go():
+        return [d async for d in
+                wc.complete_stream("openai/x", MSGS, base_url=sse_url, api_key="k")]
+
+    assert asyncio.run(go()) == ["a", "b", "c"]
+
+
+def test_complete_stream_setup_error_raises(sse_url):
+    _SSEMock.status = 503
+
+    async def go():
+        async for _ in wc.complete_stream("openai/x", MSGS, base_url=sse_url, api_key="k"):
+            pass
+
+    with pytest.raises(wc.InferenceError):
+        asyncio.run(go())

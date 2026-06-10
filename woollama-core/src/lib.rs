@@ -13,13 +13,15 @@
 //! `ToolProvider`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 create_exception!(woollama_core, InferenceError, PyException);
 
@@ -103,6 +105,7 @@ fn build_request(
     prms: Option<Value>,
     api_key: Option<&str>,
     base_url: Option<String>,
+    stream: bool,
 ) -> PyResult<Request> {
     let (provider, bare) = split_model(model);
     let inf = get_inferencer(&provider).ok_or_else(|| {
@@ -118,7 +121,9 @@ fn build_request(
         .to_string();
     let headers = build_headers(&inf, api_key).map_err(InferenceError::new_err)?;
 
-    let native = provider == "ollama"
+    // ollama-native num_ctx routing is non-stream only (matches Python).
+    let native = !stream
+        && provider == "ollama"
         && obj(&opts).and_then(|o| o.get("num_ctx")).map_or(false, |v| !v.is_null());
 
     let (url, body, timeout) = if native {
@@ -135,7 +140,7 @@ fn build_request(
             600,
         )
     } else {
-        let mut body = json!({"model": bare, "messages": msgs, "stream": false});
+        let mut body = json!({"model": bare, "messages": msgs, "stream": stream});
         if let Some(o) = &opts {
             body["options"] = o.clone();
         }
@@ -187,7 +192,7 @@ fn complete<'py>(
     base_url: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let msgs: Value = pythonize::depythonize(&messages)?;
-    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url)?;
+    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url, false)?;
     future_into_py(py, async move {
         let out: Result<String, String> = async move {
             let client = reqwest::Client::builder()
@@ -220,7 +225,7 @@ fn complete_sync(
     base_url: Option<String>,
 ) -> PyResult<String> {
     let msgs: Value = pythonize::depythonize(&messages)?;
-    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url)?;
+    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url, false)?;
     py.allow_threads(move || -> Result<String, String> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(req.timeout))
@@ -243,12 +248,144 @@ fn provider_names() -> Vec<String> {
     known_providers().iter().map(|s| s.to_string()).collect()
 }
 
+// --- streaming ---------------------------------------------------------------
+
+enum StreamState {
+    Pending(Request),                                 // not yet POSTed
+    Active { resp: reqwest::Response, buf: String },  // reading SSE
+    Done,
+}
+
+enum Delta {
+    Yield(String),
+    NeedMore,
+    Done,
+}
+
+/// Pull the next non-empty `choices[0].delta.content` out of complete SSE lines in
+/// `buf` (consuming them); leaves any trailing partial line. `[DONE]` → `Done`.
+fn next_delta(buf: &mut String) -> Delta {
+    while let Some(nl) = buf.find('\n') {
+        let line: String = buf.drain(..=nl).collect();
+        let line = line.trim();
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if data == "[DONE]" {
+                return Delta::Done;
+            }
+            if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+                let d = chunk
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(Value::as_str);
+                if let Some(piece) = d {
+                    if !piece.is_empty() {
+                        return Delta::Yield(piece.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Delta::NeedMore
+}
+
+/// An async iterator over assistant text deltas — `async for d in complete_stream(...)`.
+#[pyclass]
+struct DeltaStream {
+    state: Arc<Mutex<StreamState>>,
+}
+
+#[pymethods]
+impl DeltaStream {
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.clone();
+        future_into_py(py, async move {
+            let mut s = state.lock().await;
+            loop {
+                // 1. Lazily POST on the first pull (so a setup error raises here,
+                //    matching the Python generator's "before first yield").
+                if matches!(&*s, StreamState::Pending(_)) {
+                    let req = match std::mem::replace(&mut *s, StreamState::Done) {
+                        StreamState::Pending(r) => r,
+                        _ => unreachable!(),
+                    };
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(req.timeout))
+                        .build()
+                        .map_err(|e| InferenceError::new_err(e.to_string()))?;
+                    let mut rb = client.post(&req.url).json(&req.body);
+                    for (k, v) in &req.headers {
+                        rb = rb.header(k, v);
+                    }
+                    let resp = rb
+                        .send()
+                        .await
+                        .map_err(|e| InferenceError::new_err(e.to_string()))?;
+                    if resp.status().as_u16() >= 400 {
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(InferenceError::new_err(format!("inferencer error: {body}")));
+                    }
+                    *s = StreamState::Active { resp, buf: String::new() };
+                }
+                // 2. Serve a buffered delta, or read more bytes.
+                match &mut *s {
+                    StreamState::Done => return Err(PyStopAsyncIteration::new_err(())),
+                    StreamState::Pending(_) => unreachable!(),
+                    StreamState::Active { resp, buf } => match next_delta(buf) {
+                        Delta::Yield(piece) => return Ok(piece),
+                        Delta::Done => {
+                            *s = StreamState::Done;
+                            return Err(PyStopAsyncIteration::new_err(()));
+                        }
+                        Delta::NeedMore => match resp
+                            .chunk()
+                            .await
+                            .map_err(|e| InferenceError::new_err(e.to_string()))?
+                        {
+                            Some(bytes) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                            None => {
+                                *s = StreamState::Done;
+                                return Err(PyStopAsyncIteration::new_err(()));
+                            }
+                        },
+                    },
+                }
+            }
+        })
+    }
+}
+
+/// Stream one stateless turn as assistant text deltas (the inferencer's `/v1` SSE;
+/// num_ctx-native routing is non-stream only). Returns an async iterator.
+#[pyfunction]
+#[pyo3(signature = (model, messages, *, options=None, params=None, api_key=None, base_url=None))]
+fn complete_stream(
+    model: String,
+    messages: Bound<'_, PyAny>,
+    options: Option<Bound<'_, PyAny>>,
+    params: Option<Bound<'_, PyAny>>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> PyResult<DeltaStream> {
+    let msgs: Value = pythonize::depythonize(&messages)?;
+    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url, true)?;
+    Ok(DeltaStream { state: Arc::new(Mutex::new(StreamState::Pending(req))) })
+}
+
 #[pymodule]
 fn woollama_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("InferenceError", m.py().get_type::<InferenceError>())?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
     m.add_function(wrap_pyfunction!(complete_sync, m)?)?;
+    m.add_function(wrap_pyfunction!(complete_stream, m)?)?;
     m.add_function(wrap_pyfunction!(provider_names, m)?)?;
+    m.add_class::<DeltaStream>()?;
     Ok(())
 }

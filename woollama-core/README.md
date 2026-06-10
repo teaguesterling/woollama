@@ -20,8 +20,12 @@ Callback-free, and enough to fully serve lackpy (which only needs `complete`):
   **awaitable** (`await complete(...)`, the drop-in for async embedders like
   lackpy), backed by async `reqwest` on a tokio runtime (pyo3-async-runtimes);
 - **`complete_sync(...)`** — the blocking variant (HTTP off the GIL);
-- both do ollama-native `num_ctx` routing (→ `/api/chat`), top-level `params`
-  (temperature, …), and per-call `api_key`/`base_url` overrides;
+- **`complete_stream(model, messages, …)`** — an **async iterator** over assistant
+  text deltas (`async for d in complete_stream(...)`): the `/v1` SSE, parsed in
+  Rust, yielded incrementally (num_ctx-native routing is non-stream only, matching
+  Python; a setup error raises on the first pull);
+- all do ollama-native `num_ctx` routing (→ `/api/chat`, non-stream), top-level
+  `params` (temperature, …), and per-call `api_key`/`base_url` overrides;
 - **`InferenceError`** + `provider_names()`.
 
 Behavior mirrors `woollama.core.complete` (Python) — verified by
@@ -33,9 +37,10 @@ case — lackpy always `await`s inside an async function).
 
 ## Deferred (later slices)
 
-`complete_stream` (SSE), config-file (`inferencers.toml`) loading, an explicit
-`ModelRegistry`, structured `InferenceError` fields (kind/status/payload), and the
-recipe loop + the Python `ToolProvider` callback.
+Config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`; structured
+`InferenceError` fields (kind/status/payload); packaging so this provides
+`woollama.core` for consumers; and (server-port territory) the recipe loop + the
+Python `ToolProvider` callback.
 
 ## Build & test
 
