@@ -333,14 +333,6 @@ def test_events_max_turns_raises_during_iteration(base_url):
         _events(recipe, prov, base_url, api_key="k")
 
 
-def test_events_stream_true_raises():
-    # delta events from streamed turns are a later slice — opting in is an explicit error.
-    prov = MockProvider({})
-    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": []}
-    with pytest.raises(wc.InferenceError, match="not yet implemented"):
-        wc.orchestrate_events(recipe, MSGS, prov, stream=True)
-
-
 def test_events_unsupported_inferencer_raises_before_iter():
     # setup is eager (a deliberate divergence from Python's lazy generator) — raises
     # on the call, not on first `__anext__`.
@@ -348,3 +340,108 @@ def test_events_unsupported_inferencer_raises_before_iter():
     recipe = {"inferencer": "bogus/m", "system": "s", "tools": []}
     with pytest.raises(wc.InferenceError):
         wc.orchestrate_events(recipe, MSGS, prov)
+
+
+# --- streaming (stream=True): delta events + SSE per-turn tool_call reassembly ---
+
+def _sse(*chunks):
+    return "".join("data: " + json.dumps(c) + "\n\n" for c in chunks) + "data: [DONE]\n\n"
+
+
+def _content_chunk(text):
+    return {"choices": [{"delta": {"content": text}}]}
+
+
+def _tc_chunk(idx, **fields):
+    tc = {"index": idx}
+    tc.update(fields)
+    return {"choices": [{"delta": {"tool_calls": [tc]}}]}
+
+
+class _SSELoopMock(BaseHTTPRequestHandler):
+    script: list = []        # (status, sse_body) per streamed turn
+    requests: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        _SSELoopMock.requests.append(body)
+        status, sse = _SSELoopMock.script[len(_SSELoopMock.requests) - 1]
+        raw = sse.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+@pytest.fixture
+def sse_url():
+    _SSELoopMock.script, _SSELoopMock.requests = [], []
+    srv = HTTPServer(("127.0.0.1", 0), _SSELoopMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    finally:
+        srv.shutdown()
+
+
+def _stream_events(recipe, prov, sse_url, **kw):
+    async def go():
+        return [ev async for ev in
+                wc.orchestrate_events(recipe, MSGS, prov, base_url=sse_url, stream=True, **kw)]
+    return asyncio.run(go())
+
+
+def test_stream_yields_delta_events_then_synthesized_final(sse_url):
+    _SSELoopMock.script = [(200, _sse(_content_chunk("Hel"), _content_chunk("lo"), _content_chunk("!")))]
+    prov = MockProvider({})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": []}
+
+    evs = _stream_events(recipe, prov, sse_url, api_key="k")
+
+    assert [e["content"] for e in evs if e["type"] == "delta"] == ["Hel", "lo", "!"]
+    fin = [e for e in evs if e["type"] == "final"][0]["response"]
+    # the final is SYNTHESIZED from the deltas (no single upstream object exists)
+    assert fin["object"] == "chat.completion"
+    choice = fin["choices"][0]
+    assert choice["message"]["content"] == "Hello!"
+    assert choice["message"]["tool_calls"] is None       # `calls or None`
+    assert choice["finish_reason"] == "stop"
+
+
+def test_stream_reassembles_fragmented_tool_call_and_dispatches(sse_url):
+    # turn 1 streams ONE tool call: id+name in one chunk, `arguments` split across two
+    # (the bug-prone path). turn 2 streams the final text.
+    _SSELoopMock.script = [
+        (200, _sse(
+            _tc_chunk(0, id="cZ", function={"name": "hello.count_to"}),
+            _tc_chunk(0, function={"arguments": '{"n":'}),
+            _tc_chunk(0, function={"arguments": "3}"}),
+        )),
+        (200, _sse(_content_chunk("did 3"))),
+    ]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("123")])})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    evs = _stream_events(recipe, prov, sse_url, api_key="k")
+
+    assert prov.dispatched == [("hello.count_to", {"n": 3})]   # args reassembled, then parsed
+    assert [e["type"] for e in evs] == ["tool_call", "tool_result", "delta", "final"]
+    tc = [e for e in evs if e["type"] == "tool_call"][0]
+    assert tc["name"] == "hello.count_to" and tc["args"] == {"n": 3}
+    # turn 2's request carried the assistant tool_call (reassembled id "cZ") + tool msg
+    tool_msgs = [m for m in _SSELoopMock.requests[1]["messages"] if m.get("role") == "tool"]
+    assert tool_msgs[0]["tool_call_id"] == "cZ" and tool_msgs[0]["content"] == "123"
+    assert [e for e in evs if e["type"] == "final"][0]["response"]["choices"][0]["message"]["content"] == "did 3"
+
+
+def test_stream_upstream_error_raises(sse_url):
+    _SSELoopMock.script = [(503, '{"error": "down"}')]
+    prov = MockProvider({})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": []}
+
+    with pytest.raises(wc.InferenceError):
+        _stream_events(recipe, prov, sse_url, api_key="k")

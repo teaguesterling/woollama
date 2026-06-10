@@ -6,16 +6,16 @@
 //! ollama-native num_ctx routing and per-call api_key/base_url overrides).
 //!
 //! Slice 2 (the recipe↔tool loop): `orchestrate_events` — the single source of
-//! truth, an async iterator of `tool_call`/`tool_result`/`final` events that runs a
-//! recipe against an inferencer, dispatching its allow-listed tools through a Python
-//! `ToolProvider` (the callback seam). `orchestrate` is the drainer over it (returns
-//! the final OpenAI dict). Non-streaming turns only so far (no `delta` events).
+//! truth, an async iterator of `delta`/`tool_call`/`tool_result`/`final` events that
+//! runs a recipe against an inferencer, dispatching its allow-listed tools through a
+//! Python `ToolProvider` (the callback seam). `stream=True` runs turns over SSE
+//! (yielding `delta`s, reassembling fragmented tool_calls); `orchestrate` is the
+//! drainer over it (returns the final OpenAI dict).
 //!
 //! Behavior mirrors `woollama.core` in Python; its hermetic suite is the
-//! conformance oracle. Deferred (later slices): streamed turns (`stream=True`'s
-//! `delta` events + SSE per-turn tool_call reassembly); config-file
-//! (`inferencers.toml`) loading + an explicit `ModelRegistry`; structured
-//! `InferenceError` fields (kind/status/payload).
+//! conformance oracle. Deferred (later slices): config-file (`inferencers.toml`)
+//! loading + an explicit `ModelRegistry`; structured `InferenceError` fields
+//! (kind/status/payload).
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -338,7 +338,6 @@ fn render_tool_result_rs(result: &Bound<'_, PyAny>) -> PyResult<(String, bool)> 
 /// (`{"type": …}`) only at the Python boundary (`event_to_py`); the loop stays pure
 /// Rust. `Delta` is streaming-only (deferred — non-stream turns emit none).
 enum Event {
-    #[allow(dead_code)]
     Delta(String),
     ToolCall { turn: u32, name: String, args: Value },
     ToolResult { turn: u32, name: String, ok: bool },
@@ -472,6 +471,69 @@ async fn dispatch_and_render(tools: &Py<PyAny>, name: &str, args: &Value) -> (St
     }
 }
 
+/// One streamed tool call, reassembled across SSE chunks (its `id`/`name` arrive in
+/// one delta, its `arguments` dribble in piecemeal — orchestrate.py:190-199).
+#[derive(Default)]
+struct CallSlot {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+/// Fold one SSE `chunk`'s `delta.tool_calls` into the by-index accumulator.
+fn accumulate_tool_calls(chunk: &Value, slots: &mut std::collections::BTreeMap<i64, CallSlot>) {
+    let tcs = chunk
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("tool_calls"))
+        .and_then(Value::as_array);
+    let Some(tcs) = tcs else { return };
+    for tc in tcs {
+        let idx = tc.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let slot = slots.entry(idx).or_default();
+        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                slot.id = Some(id.to_string());
+            }
+        }
+        if let Some(f) = tc.get("function") {
+            if let Some(n) = f.get("name").and_then(Value::as_str) {
+                if !n.is_empty() {
+                    slot.name = n.to_string();
+                }
+            }
+            if let Some(a) = f.get("arguments").and_then(Value::as_str) {
+                slot.arguments.push_str(a);
+            }
+        }
+    }
+}
+
+/// Finalize the accumulator into OpenAI tool_call dicts (sorted by index; missing id
+/// → `call_{idx}`, matching `s["id"] or f"call_{idx}"`).
+fn synthesize_calls(slots: std::collections::BTreeMap<i64, CallSlot>) -> Vec<Value> {
+    slots
+        .into_iter()
+        .map(|(idx, s)| {
+            json!({
+                "id": s.id.unwrap_or_else(|| format!("call_{idx}")),
+                "type": "function",
+                "function": {"name": s.name, "arguments": s.arguments},
+            })
+        })
+        .collect()
+}
+
+fn chunk_content(chunk: &Value) -> Option<&str> {
+    chunk
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("content"))
+        .and_then(Value::as_str)
+}
+
 /// The recipe↔tool loop as a stream of `Event`s — the SINGLE source of truth (the
 /// drainer + the `EventIter` both consume it; do NOT reimplement). Non-streaming
 /// turns only for now (no `Delta` events; streamed turns are a later slice). Offers
@@ -479,8 +541,9 @@ async fn dispatch_and_render(tools: &Py<PyAny>, name: &str, args: &Value) -> (St
 /// repeats (≤8 turns). The allow-list is a BOUNDARY: an off-list call is refused
 /// WITHOUT dispatching and the refusal is fed back so the loop recovers. Yields
 /// `ToolCall`/`ToolResult` progress and a terminal `Final`, or an `Err` (inferencer
-/// error / max turns).
-fn events_stream(setup: Setup) -> impl Stream<Item = PyResult<Event>> + Send {
+/// error / max turns). `stream_mode` switches the per-turn transport: SSE (emitting
+/// `Delta` events, synthesizing the response) vs. a single non-stream POST.
+fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult<Event>> + Send {
     let Setup {
         url, headers, model, schemas, allowed, sorted_allowed, messages, extra_body, params, tools,
     } = setup;
@@ -491,8 +554,8 @@ fn events_stream(setup: Setup) -> impl Stream<Item = PyResult<Event>> + Send {
             Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
         };
         for turn in 1..=8u32 {
-            // body = {model, messages, tools, stream:false, **extra_body, **params}
-            let mut body = json!({"model": model, "messages": messages, "tools": schemas, "stream": false});
+            // body = {model, messages, tools, stream, **extra_body, **params}
+            let mut body = json!({"model": model, "messages": messages, "tools": schemas, "stream": stream_mode});
             if let Some(o) = extra_body.as_object() { for (k, v) in o { body[k] = v.clone(); } }
             if let Some(o) = params.as_ref().and_then(Value::as_object) { for (k, v) in o { body[k] = v.clone(); } }
 
@@ -502,21 +565,76 @@ fn events_stream(setup: Setup) -> impl Stream<Item = PyResult<Event>> + Send {
                 Ok(r) => r,
                 Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
             };
-            let data: Value = match resp.json().await {
-                Ok(d) => d,
-                Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
-            };
-            if data.get("choices").is_none() {
-                yield Err(InferenceError::new_err(format!("inferencer error: {data}")));
-                return;
+
+            // Resolve this turn into (content, calls, response). STREAMING yields the
+            // assistant content deltas as `Delta` events and SYNTHESIZES the response
+            // dict (no single upstream object exists — orchestrate.py:209-217), with
+            // tool_calls reassembled across chunks; NON-STREAM uses the raw response.
+            let content: String;
+            let calls: Vec<Value>;
+            let response: Value;
+            if stream_mode {
+                if resp.status().as_u16() >= 400 {
+                    let err_body = resp.text().await.unwrap_or_default();
+                    yield Err(InferenceError::new_err(format!("inferencer error: {err_body}")));
+                    return;
+                }
+                let mut resp = resp;
+                let mut buf = String::new();
+                let mut parts: Vec<String> = Vec::new();
+                let mut slots: std::collections::BTreeMap<i64, CallSlot> = std::collections::BTreeMap::new();
+                'read: loop {
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        let line = line.trim();
+                        let Some(payload) = line.strip_prefix("data:") else { continue };
+                        let payload = payload.trim();
+                        if payload == "[DONE]" { break 'read; }
+                        let Ok(chunk) = serde_json::from_str::<Value>(payload) else { continue };
+                        if let Some(piece) = chunk_content(&chunk) {
+                            if !piece.is_empty() {
+                                let piece = piece.to_string();
+                                parts.push(piece.clone());
+                                yield Ok(Event::Delta(piece));
+                            }
+                        }
+                        accumulate_tool_calls(&chunk, &mut slots);
+                    }
+                    match resp.chunk().await {
+                        Ok(Some(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                        Ok(None) => break 'read,
+                        Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+                    }
+                }
+                content = parts.join("");
+                calls = synthesize_calls(slots);
+                response = json!({
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content,
+                                    "tool_calls": if calls.is_empty() { Value::Null } else { Value::Array(calls.clone()) }},
+                        "finish_reason": if calls.is_empty() { "stop" } else { "tool_calls" },
+                    }],
+                });
+            } else {
+                let data: Value = match resp.json().await {
+                    Ok(d) => d,
+                    Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+                };
+                if data.get("choices").is_none() {
+                    yield Err(InferenceError::new_err(format!("inferencer error: {data}")));
+                    return;
+                }
+                let msg = &data["choices"][0]["message"];
+                calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+                content = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+                response = data;
             }
-            let msg = &data["choices"][0]["message"];
-            let calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
-            let content = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
 
             if calls.is_empty() {
                 // no tool calls → this turn's whole response IS the final answer
-                yield Ok(Event::Final(data));
+                yield Ok(Event::Final(response));
                 return;
             }
             // Owned per-call metadata so we never borrow `calls` across the awaits below.
@@ -566,7 +684,7 @@ fn orchestrate<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
     future_into_py(py, async move {
-        let mut s = Box::pin(events_stream(setup));
+        let mut s = Box::pin(events_stream(setup, false));
         while let Some(item) = s.next().await {
             if let Event::Final(resp) = item? {
                 return Python::with_gil(|py| Ok(pythonize::pythonize(py, &resp)?.unbind()));
@@ -604,8 +722,8 @@ impl EventIter {
 }
 
 /// The recipe loop as an async iterator of progress + `final` events (the server's
-/// surface). Setup is eager (raises on the call). `stream=True` (delta events from
-/// streamed turns) is a later slice — passing it raises.
+/// surface). Setup is eager (raises on the call). With `stream=True`, turns run over
+/// SSE and the iterator also yields `delta` (assistant content) events.
 #[pyfunction]
 #[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, stream=false))]
 fn orchestrate_events<'py>(
@@ -617,13 +735,8 @@ fn orchestrate_events<'py>(
     base_url: Option<String>,
     stream: bool,
 ) -> PyResult<EventIter> {
-    if stream {
-        return Err(InferenceError::new_err(
-            "streamed orchestration (delta events) is not yet implemented in the Rust core",
-        ));
-    }
     let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
-    Ok(EventIter { inner: Arc::new(Mutex::new(Box::pin(events_stream(setup)))) })
+    Ok(EventIter { inner: Arc::new(Mutex::new(Box::pin(events_stream(setup, stream)))) })
 }
 
 // --- streaming ---------------------------------------------------------------

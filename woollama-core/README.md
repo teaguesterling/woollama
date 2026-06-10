@@ -51,6 +51,11 @@ generator).
   the Python `tools` **`ToolProvider`** (sync `tools_for(allow) -> [ToolSpec]`,
   **async** `dispatch(name, args) -> ToolResult`), feeds results back, repeats (≤8
   turns). This is the server's surface.
+- **`stream=True`** runs each turn over **SSE**: the iterator also yields `delta`
+  (assistant content) events as they arrive, fragmented `tool_calls` are reassembled
+  by index across chunks, and the `final` `response` is *synthesized*
+  (`{object:"chat.completion", …, finish_reason}`) since no single upstream object
+  exists. `stream=False` does one non-stream POST and passes the raw response through.
 - **`orchestrate(recipe, user_msgs, tools, *, api_key, base_url)`** — the awaitable
   drainer returning just the final OpenAI dict (Python's `core.orchestrate`).
 - The **allow-list is a boundary, not a hint**: a tool_call for anything off it is
@@ -66,16 +71,19 @@ generator).
 - **Eager setup** (a deliberate divergence from Python's lazy generator): an
   unsupported inferencer / missing key raises on the *call*, not on first `__anext__`.
 
-Two novel mechanics, each spiked in isolation first: awaiting the Python `dispatch`
+Three novel mechanics, each spiked in isolation first: awaiting the Python `dispatch`
 coroutine from inside the Rust async loop (`pyo3_async_runtimes`' `into_future`,
-task-locals propagated through `future_into_py`), and a `stream!`-backed async-
-iterator pyclass that yields across `__anext__` calls with an `await` between yields.
-Verified by `tests/test_orchestrate_conformance.py` (25 tests: dispatch→final, the
-out-of-list refusal, `is_error`/exception rendering, parallel tool_calls, max-turns,
-`extra_body`/`params` merge, the event sequence + `ok` flags, `stream=True` rejected,
-eager-raise) with a mock `ToolProvider` + scripted inferencer, and **live against
-ollama**: a `math.add` recipe → qwen3 calls the tool → `tool_call`/`tool_result`/
-`final` → `"…is 42."`.
+task-locals propagated through `future_into_py`); a `stream!`-backed async-iterator
+pyclass that yields across `__anext__` calls with an `await` between yields; and the
+fragmented-tool_call reassembly (id/name in one SSE chunk, `arguments` dribbling
+across the next). Verified by `tests/test_orchestrate_conformance.py` (27 tests:
+dispatch→final, the out-of-list refusal, `is_error`/exception rendering, parallel
+tool_calls, max-turns, `extra_body`/`params` merge, the event sequence + `ok` flags,
+eager-raise, and streaming — `delta` events, the synthesized final, a tool call whose
+`arguments` are split across chunks, the SSE error) with mock `ToolProvider` +
+scripted (JSON & SSE) inferencers, and **live against ollama**: a `math.add` recipe →
+qwen3 calls the tool → `tool_call`/`tool_result`/(`delta`×N)/`final` → `"…is 42."`,
+both non-stream and streamed.
 
 ## Proven with lackpy (the thesis)
 
@@ -103,13 +111,11 @@ this, so the server and lackpy both consume the Rust core directly.
 
 ## Deferred (later slices)
 
-Streamed turns — `orchestrate_events(stream=True)`'s `delta` events + the SSE
-per-turn `tool_call` reassembly (the part that lets the server's streaming
-`/v1/chat/completions` sit on the Rust core; passing `stream=True` raises for now);
-config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`
+Config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`
 (orchestration uses built-in inferencers only); structured `InferenceError` fields
 (kind/status/payload); and packaging so this provides `woollama.core` for the
-server dist (the dist-split).
+server dist (the dist-split). With the loop now streaming, the remaining gap before
+the server can sit on the core is the registry + dist-split, not the loop itself.
 
 ## Build & test
 
