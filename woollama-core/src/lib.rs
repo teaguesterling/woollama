@@ -534,6 +534,18 @@ fn chunk_content(chunk: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// Drain the next complete line (up to and incl. `\n`) from a RAW BYTE buffer,
+/// decoding only that complete line. Network chunks (`resp.chunk()`) split at
+/// arbitrary byte boundaries, so decoding each chunk eagerly would corrupt any
+/// multibyte UTF-8 char that straddles two chunks (each half → U+FFFD). Buffering
+/// bytes and decoding whole lines avoids that — a full `data:` line is valid UTF-8.
+/// Returns None when no complete line is buffered yet.
+fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let nl = buf.iter().position(|&b| b == b'\n')?;
+    let line: Vec<u8> = buf.drain(..=nl).collect();
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
 /// The recipe↔tool loop as a stream of `Event`s — the SINGLE source of truth (the
 /// drainer + the `EventIter` both consume it; do NOT reimplement). Non-streaming
 /// turns only for now (no `Delta` events; streamed turns are a later slice). Offers
@@ -580,12 +592,12 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
                     return;
                 }
                 let mut resp = resp;
-                let mut buf = String::new();
+                let mut buf: Vec<u8> = Vec::new();  // RAW bytes; decode whole lines (UTF-8 safety)
                 let mut parts: Vec<String> = Vec::new();
                 let mut slots: std::collections::BTreeMap<i64, CallSlot> = std::collections::BTreeMap::new();
+                let mut flushed = false;
                 'read: loop {
-                    while let Some(nl) = buf.find('\n') {
-                        let line: String = buf.drain(..=nl).collect();
+                    while let Some(line) = take_line(&mut buf) {
                         let line = line.trim();
                         let Some(payload) = line.strip_prefix("data:") else { continue };
                         let payload = payload.trim();
@@ -601,8 +613,13 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
                         accumulate_tool_calls(&chunk, &mut slots);
                     }
                     match resp.chunk().await {
-                        Ok(Some(bytes)) => buf.push_str(&String::from_utf8_lossy(&bytes)),
-                        Ok(None) => break 'read,
+                        Ok(Some(bytes)) => buf.extend_from_slice(&bytes),
+                        // EOF: flush a trailing newline-less line once (non-compliant tail),
+                        // then stop. Compliant SSE ends `\n\n` + [DONE] (handled above).
+                        Ok(None) => {
+                            if !buf.is_empty() && !flushed { flushed = true; buf.push(b'\n'); continue; }
+                            break 'read;
+                        }
                         Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
                     }
                 }
@@ -743,7 +760,7 @@ fn orchestrate_events<'py>(
 
 enum StreamState {
     Pending(Request),                                 // not yet POSTed
-    Active { resp: reqwest::Response, buf: String },  // reading SSE
+    Active { resp: reqwest::Response, buf: Vec<u8> },  // reading SSE (raw bytes)
     Done,
 }
 
@@ -754,10 +771,10 @@ enum Delta {
 }
 
 /// Pull the next non-empty `choices[0].delta.content` out of complete SSE lines in
-/// `buf` (consuming them); leaves any trailing partial line. `[DONE]` → `Done`.
-fn next_delta(buf: &mut String) -> Delta {
-    while let Some(nl) = buf.find('\n') {
-        let line: String = buf.drain(..=nl).collect();
+/// the RAW BYTE `buf` (consuming them, decoding whole lines — see `take_line`);
+/// leaves any trailing partial line. `[DONE]` → `Done`.
+fn next_delta(buf: &mut Vec<u8>) -> Delta {
+    while let Some(line) = take_line(buf) {
         let line = line.trim();
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.trim();
@@ -765,13 +782,7 @@ fn next_delta(buf: &mut String) -> Delta {
                 return Delta::Done;
             }
             if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                let d = chunk
-                    .get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .and_then(Value::as_str);
-                if let Some(piece) = d {
+                if let Some(piece) = chunk_content(&chunk) {
                     if !piece.is_empty() {
                         return Delta::Yield(piece.to_string());
                     }
@@ -822,7 +833,7 @@ impl DeltaStream {
                         let body = resp.text().await.unwrap_or_default();
                         return Err(InferenceError::new_err(format!("inferencer error: {body}")));
                     }
-                    *s = StreamState::Active { resp, buf: String::new() };
+                    *s = StreamState::Active { resp, buf: Vec::new() };
                 }
                 // 2. Serve a buffered delta, or read more bytes.
                 match &mut *s {
@@ -839,7 +850,7 @@ impl DeltaStream {
                             .await
                             .map_err(|e| InferenceError::new_err(e.to_string()))?
                         {
-                            Some(bytes) => buf.push_str(&String::from_utf8_lossy(&bytes)),
+                            Some(bytes) => buf.extend_from_slice(&bytes),
                             None => {
                                 *s = StreamState::Done;
                                 return Err(PyStopAsyncIteration::new_err(()));

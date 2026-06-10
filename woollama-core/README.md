@@ -76,14 +76,19 @@ coroutine from inside the Rust async loop (`pyo3_async_runtimes`' `into_future`,
 task-locals propagated through `future_into_py`); a `stream!`-backed async-iterator
 pyclass that yields across `__anext__` calls with an `await` between yields; and the
 fragmented-tool_call reassembly (id/name in one SSE chunk, `arguments` dribbling
-across the next). Verified by `tests/test_orchestrate_conformance.py` (27 tests:
-dispatch→final, the out-of-list refusal, `is_error`/exception rendering, parallel
-tool_calls, max-turns, `extra_body`/`params` merge, the event sequence + `ok` flags,
-eager-raise, and streaming — `delta` events, the synthesized final, a tool call whose
-`arguments` are split across chunks, the SSE error) with mock `ToolProvider` +
-scripted (JSON & SSE) inferencers, and **live against ollama**: a `math.add` recipe →
-qwen3 calls the tool → `tool_call`/`tool_result`/(`delta`×N)/`final` → `"…is 42."`,
-both non-stream and streamed.
+across the next). Verified by the conformance suite (dispatch→final, the out-of-list
+refusal, `is_error`/exception rendering, parallel tool_calls, max-turns,
+`extra_body`/`params` merge, the event sequence + `ok` flags, eager-raise, and
+streaming — `delta` events, the synthesized final, a tool call whose `arguments` are
+split across chunks, the SSE error) with mock `ToolProvider` + scripted (JSON & SSE)
+inferencers, and **live against ollama**: a `math.add` recipe → qwen3 calls the tool
+→ `tool_call`/`tool_result`/(`delta`×N)/`final` → `"…is 42."`, both non-stream and
+streamed.
+
+The SSE reader buffers **raw bytes** and decodes whole lines, so a multibyte UTF-8
+char split across network chunks (`resp.chunk()` boundaries don't align to chars) is
+never corrupted — regression-tested with a chunked mock that splits an em-dash, and
+the fix is shared with slice-1's `complete_stream`.
 
 ## Proven with lackpy (the thesis)
 

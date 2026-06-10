@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -170,3 +171,54 @@ def test_complete_stream_setup_error_raises(sse_url):
 
     with pytest.raises(wc.InferenceError):
         asyncio.run(go())
+
+
+# --- multibyte UTF-8 split across network chunks -----------------------------
+# `resp.chunk()` boundaries don't align to char boundaries. A naive per-chunk
+# `from_utf8_lossy` corrupts any multibyte char straddling two chunks (each half →
+# U+FFFD). This streams `a—b` (— = U+2014, bytes E2 80 94) via chunked encoding,
+# forcing the em-dash to split across two HTTP chunks with a gap so reqwest delivers
+# them separately. The SSE reader must buffer bytes and decode whole lines.
+
+class _SplitMultibyteMock(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"                 # chunked transfer-encoding needs 1.1
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        # ensure_ascii=False → the em-dash is emitted as RAW UTF-8 (what real servers
+        # stream), so its bytes can straddle a chunk boundary.
+        full = (("data: " + json.dumps({"choices": [{"delta": {"content": "a—b"}}]},
+                                        ensure_ascii=False)
+                 + "\n\n" + "data: [DONE]\n\n").encode("utf-8"))
+        i = full.index(b"\xe2\x80\x94")          # split INSIDE the em-dash (after its 1st byte)
+        for part in (full[:i + 1], full[i + 1:]):
+            self.wfile.write(b"%X\r\n%s\r\n" % (len(part), part))
+            self.wfile.flush()
+            time.sleep(0.05)                     # gap → reqwest sees separate chunks
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+
+@pytest.fixture
+def split_url():
+    srv = HTTPServer(("127.0.0.1", 0), _SplitMultibyteMock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
+    finally:
+        srv.shutdown()
+
+
+def test_complete_stream_multibyte_split_across_chunks(split_url):
+    async def go():
+        return [d async for d in
+                wc.complete_stream("openai/x", MSGS, base_url=split_url, api_key="k")]
+
+    assert "".join(asyncio.run(go())) == "a—b"   # em-dash intact, not garbled to U+FFFD
