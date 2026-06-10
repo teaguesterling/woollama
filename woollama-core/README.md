@@ -35,6 +35,30 @@ against ollama. One minor difference: the async awaitable binds to the running
 event loop at creation, so it must be created inside the loop (moot for the embed
 case — lackpy always `await`s inside an async function).
 
+## Proven with lackpy (the thesis)
+
+lackpy's `WoollamaProvider` runs on this Rust core **unchanged** — its provider
+does `from woollama.core import complete` and `await`s it, which is exactly the
+Rust surface. Verified live against ollama (the provider's prompt-building → Rust
+`complete` → ollama → a generated lackpy program):
+
+```python
+import sys, asyncio, woollama_core
+sys.modules["woollama.core"] = woollama_core          # point woollama.core at the Rust ext
+from lackpy.infer.providers.woollama import WoollamaProvider
+
+p = WoollamaProvider(model="ollama/qwen3:14b-iq4xs", temperature=0.2)
+out = asyncio.run(p.generate("count the rows",
+                  namespace_desc="kernel.select(expr)\nkernel.count()"))
+# -> 'count = kernel.count()\nprint(count)'   (generated via the Rust core)
+assert (__import__("woollama.core", fromlist=["complete"]).complete
+        is woollama_core.complete)
+```
+
+The `sys.modules` swap is the *proof*; productionizing it is the packaging step
+(below): make `woollama-core` provide the `woollama.core` import path so the
+server and lackpy both consume the Rust core directly.
+
 ## Deferred (later slices)
 
 Config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`; structured
