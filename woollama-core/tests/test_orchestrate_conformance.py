@@ -76,6 +76,15 @@ def _tool_call_resp(name, args, call_id="c1"):
                         "function": {"name": name, "arguments": json.dumps(args)}}]}}]}
 
 
+def _multi_tool_call_resp(calls):
+    # calls: list of (name, args, call_id) — a single assistant message, N tool_calls
+    return {"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": cid, "type": "function",
+                        "function": {"name": n, "arguments": json.dumps(a)}}
+                       for (n, a, cid) in calls]}}]}
+
+
 def _final_resp(text):
     return {"choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": text}}]}
@@ -205,6 +214,44 @@ def test_ollama_extra_body_nests_options(base_url):
     _run(recipe, prov, base_url)                          # no api_key — ollama needs none
 
     assert _LoopMock.requests[0]["options"] == {"temperature": 0}
+
+
+def test_multiple_tool_calls_in_one_turn(base_url):
+    # Models routinely emit PARALLEL tool calls in one assistant message. All must
+    # be dispatched (in order), and the next request must carry the single assistant
+    # message with BOTH calls plus one matching `tool` message per call_id.
+    _LoopMock.script = [
+        _multi_tool_call_resp([("hello.count_to", {"n": 1}, "c1"),
+                               ("math.add", {"a": 2, "b": 3}, "c2")]),
+        _final_resp("both done"),
+    ]
+    prov = MockProvider({
+        "hello.count_to": lambda a: _Result([_Block("one")]),
+        "math.add": lambda a: _Result([_Block("five")]),
+    })
+    recipe = {"inferencer": "openai/gpt-x", "system": "s",
+              "tools": ["hello.count_to", "math.add"]}
+
+    out = _run(recipe, prov, base_url, api_key="k")
+
+    assert out["choices"][0]["message"]["content"] == "both done"
+    assert prov.dispatched == [("hello.count_to", {"n": 1}), ("math.add", {"a": 2, "b": 3})]
+    second = _LoopMock.requests[1]["messages"]
+    asst = [m for m in second if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert len(asst) == 1 and len(asst[0]["tool_calls"]) == 2     # one msg, both calls
+    tms = _tool_msgs(_LoopMock.requests[1])
+    assert [(m["tool_call_id"], m["content"]) for m in tms] == [("c1", "one"), ("c2", "five")]
+
+
+def test_max_turns_exceeded_raises(base_url):
+    # The model never stops calling tools → the loop must give up at 8 turns.
+    _LoopMock.script = [_tool_call_resp("hello.count_to", {}, f"c{i}") for i in range(8)]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("x")])})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    with pytest.raises(wc.InferenceError, match="max turns"):
+        _run(recipe, prov, base_url, api_key="k")
+    assert len(_LoopMock.requests) == 8                            # exactly 8 turns, no 9th
 
 
 def test_unsupported_inferencer_raises_before_await():
