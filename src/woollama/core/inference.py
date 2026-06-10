@@ -68,19 +68,23 @@ def _headers(inf, api_key: str | None) -> dict[str, str]:
 
 
 async def complete(model: str, messages: list[dict], *, options: dict | None = None,
+                   params: dict | None = None,
                    api_key: str | None = None, base_url: str | None = None,
                    registry: "inferencers.ModelRegistry | None" = None) -> str:
     """Run one stateless turn against `<provider>/<model>` and return the assistant
     text. `options` carries ollama-native knobs (e.g. `num_ctx`): when present for
     the ollama provider the turn goes through the native `/api/chat` (which honors
-    them), translating the native reply back to text."""
+    them). `params` are top-level OpenAI request fields (e.g. `temperature`,
+    `max_tokens`) merged into the request — the per-call knobs an embedder needs."""
     provider = model.split("/", 1)[0]
     inf, bare, base = _resolve(model, base_url, registry)
     headers = _headers(inf, api_key)
 
     if provider == "ollama" and options and options.get("num_ctx") is not None:
+        # On the native path temperature et al. live inside `options`.
+        native_opts = {**options, **(params or {})}
         req = ollama_native.to_native_request(
-            {"model": bare, "messages": messages, "options": options, "stream": False})
+            {"model": bare, "messages": messages, "options": native_opts, "stream": False})
         async with httpx.AsyncClient(timeout=NATIVE_TIMEOUT) as c:
             r = await c.post(ollama_native.native_chat_url(base), json=req, headers=headers)
             data = r.json()
@@ -91,6 +95,8 @@ async def complete(model: str, messages: list[dict], *, options: dict | None = N
     body = {"model": bare, "messages": messages, "stream": False}
     if options:
         body["options"] = options
+    if params:
+        body.update(params)               # top-level OpenAI fields (temperature, …)
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as c:
         r = await c.post(f"{base}/chat/completions", json=body, headers=headers)
         data = r.json()

@@ -57,6 +57,15 @@ async def test_complete_returns_text(monkeypatch):
                             "stream": False}
 
 
+async def test_complete_merges_params_top_level(monkeypatch):
+    """`params` (temperature, max_tokens, …) are merged as top-level request fields
+    — the per-call knobs an embedder (lackpy) needs."""
+    _use_fake(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    await inference.complete("ollama/x", [{"role": "user", "content": "hi"}],
+                             params={"temperature": 0.2})
+    assert _Client.calls[-1]["json"]["temperature"] == 0.2
+
+
 async def test_complete_api_key_and_base_url_override(monkeypatch):
     """The new library knobs: a per-call key/url bypass env + configured base_url
     (so an embedder drives multiple keys/endpoints without touching global config)."""
