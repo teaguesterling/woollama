@@ -6,6 +6,19 @@ import json
 
 import pytest
 
+# --- path resolution --------------------------------------------------------
+
+def test_examples_dir_resolves(tmp_path):
+    """`_examples_dir()` must point at the REAL repo examples/ (the bundled default
+    mcp.json's ${WOOLLAMA_EXAMPLES_DIR} spawns servers from it). Move-sensitive:
+    this guards against a relocation of config.py silently shifting the parent walk
+    (which is exactly what broke when config.py moved into woollama/core/)."""
+    from woollama import config
+    d = config._examples_dir()
+    assert (d / "mcp-hello" / "server.py").is_file(), \
+        f"_examples_dir() resolved to {d}, which has no mcp-hello/server.py"
+
+
 # --- defaults fallback ------------------------------------------------------
 
 def test_mcp_defaults_when_no_user_config(monkeypatch, tmp_path):
