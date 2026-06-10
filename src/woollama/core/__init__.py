@@ -11,6 +11,7 @@ import-clean modules here. The historical top-level paths (`woollama.config`,
 `woollama.inferencers`, `woollama.recipes`, `woollama.ollama_native`) still work
 via alias shims; new code should import from `woollama.core`.
 """
-from . import config, inferencers, ollama_native, recipes  # noqa: F401
+from . import config, inference, inferencers, ollama_native, recipes  # noqa: F401
+from .inference import InferenceError, complete, complete_stream  # noqa: F401
 from .inferencers import Inferencer, InferencerError  # noqa: F401
 from .recipes import Recipe  # noqa: F401

@@ -36,26 +36,18 @@ from . import (
     recipes,
     responses,
 )
+from .core import inference as _inference
 from .manager import Registry, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
 log = logging.getLogger("woollama.router")
 
 
-class OrchestrationError(Exception):
-    """Raised by the transport-agnostic orchestration loop. Each transport
-    maps it to its own error surface (HTTP status / MCP error).
-
-    `payload` carries the raw upstream response when the inferencer itself
-    errored, so the HTTP surface can pass it through verbatim."""
-
-    def __init__(self, message: str, kind: str, status: int,
-                 payload: dict | None = None):
-        super().__init__(message)
-        self.message = message
-        self.kind = kind
-        self.status = status
-        self.payload = payload
+# The orchestration/inference error type now lives in the server-free core; the
+# router re-exports it under its historical name so every existing
+# `raise OrchestrationError(...)` / `except OrchestrationError` (and
+# `from .router import OrchestrationError`) keeps working — it's the SAME class.
+OrchestrationError = _inference.InferenceError
 
 
 # Module-level registry; SHARED by both surfaces — the OpenAI orchestration
@@ -499,41 +491,10 @@ async def complete_stateless(model: str, messages: list[dict], *,
         resp = await orchestrate(recipe, messages, registry)
         return resp["choices"][0]["message"].get("content") or ""
 
-    provider = model.split("/", 1)[0]
-    inf = inferencers.get(provider)
-    if inf is None:
-        raise OrchestrationError(
-            f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
-            f"'<provider>/<model>' for a known inferencer "
-            f"({', '.join(inferencers.names())}).", "invalid_request_error", 400)
-    bare = model.split("/", 1)[1] if "/" in model else ""
-    try:
-        headers = inf.headers()
-    except inferencers.InferencerError as e:
-        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
-
-    # Ollama honors num_ctx only on its native /api/chat (#1) — route there when a
-    # context size is requested, translating the native reply back to text.
-    if provider == "ollama" and options and options.get("num_ctx") is not None:
-        req = ollama_native.to_native_request(
-            {"model": bare, "messages": messages, "options": options, "stream": False})
-        async with httpx.AsyncClient(timeout=_OLLAMA_NATIVE_TIMEOUT) as c:
-            r = await c.post(ollama_native.native_chat_url(inf.base_url),
-                             json=req, headers=headers)
-            data = r.json()
-        if "message" not in data:
-            raise OrchestrationError("inferencer error", "server_error", 502, payload=data)
-        return (data.get("message") or {}).get("content") or ""
-
-    body = {"model": bare, "messages": messages, "stream": False}
-    if options:
-        body["options"] = options
-    async with httpx.AsyncClient(timeout=180) as c:
-        r = await c.post(inf.chat_url(), json=body, headers=headers)
-        data = r.json()
-    if "choices" not in data:
-        raise OrchestrationError("inferencer error", "server_error", 502, payload=data)
-    return data["choices"][0]["message"].get("content") or ""
+    # A directly-addressed inferencer (`<provider>/<model>`) → the server-free core
+    # primitive (incl. ollama-native num_ctx routing). InferenceError IS this
+    # module's OrchestrationError, so callers' error mapping is unchanged.
+    return await _inference.complete(model, messages, options=options)
 
 
 async def complete_stream(model: str, messages: list[dict]):
@@ -555,49 +516,10 @@ async def complete_stream(model: str, messages: list[dict]):
                 yield ev["content"]
         return
 
-    provider = model.split("/", 1)[0]
-    inf = inferencers.get(provider)
-    if inf is None:
-        raise OrchestrationError(
-            f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
-            f"'<provider>/<model>' for a known inferencer "
-            f"({', '.join(inferencers.names())}).", "invalid_request_error", 400)
-    bare = model.split("/", 1)[1] if "/" in model else ""
-    try:
-        headers = inf.headers()
-    except inferencers.InferencerError as e:
-        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
-    req = {"model": bare, "messages": messages, "stream": True}
-    client = httpx.AsyncClient(timeout=180)
-    cm = client.stream("POST", inf.chat_url(), json=req, headers=headers)
-    r = await cm.__aenter__()
-    if r.status_code >= 400:
-        raw = await r.aread()
-        await cm.__aexit__(None, None, None)
-        await client.aclose()
-        try:
-            payload = json.loads(raw)
-        except (ValueError, TypeError):
-            payload = None
-        raise OrchestrationError("inferencer error", "server_error",
-                                 r.status_code, payload=payload)
-    try:
-        async for line in r.aiter_lines():
-            if not line.startswith("data: "):
-                continue
-            data = line[len("data: "):]
-            if data.strip() == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-            except ValueError:
-                continue
-            delta = (chunk.get("choices") or [{}])[0].get("delta", {}).get("content")
-            if delta:
-                yield delta
-    finally:
-        await cm.__aexit__(None, None, None)
-        await client.aclose()
+    # A directly-addressed inferencer → the server-free core streamer (raises
+    # InferenceError == OrchestrationError before the first delta on setup error).
+    async for delta in _inference.complete_stream(model, messages):
+        yield delta
 
 
 def _msg_item(item_id: str, text: str, *, done: bool) -> dict:
