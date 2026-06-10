@@ -15,7 +15,8 @@ import json
 
 import httpx
 
-from woollama import recipes, router
+from woollama import router
+from woollama.core import recipes
 
 
 class FakeRequest:

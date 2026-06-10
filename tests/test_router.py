@@ -19,7 +19,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from woollama import recipes, router
+from woollama import router
+from woollama.core import recipes
 from woollama.manager import Registry, ServerManager
 
 # ---------------------------------------------------------------------------

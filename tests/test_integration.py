@@ -901,7 +901,8 @@ async def test_claude_code_backend_completes_and_refuses_shell(tmp_path, monkeyp
     command even when explicitly asked — the --disallowedTools lockdown holds.
     The canary is an absolute path, so it catches execution regardless of the
     subprocess cwd."""
-    from woollama import recipes, router
+    from woollama import router
+    from woollama.core import recipes
 
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     recipes.reload()
@@ -947,7 +948,8 @@ async def test_claude_code_delegation_runs_tool_and_keeps_boundary(tmp_path, mon
     tools (Skill/Workflow/…) that used to contaminate a nested child, so the only
     tools the delegated Claude sees are the recipe's MCP tools (verified at the
     event level). WOOLLAMA_TEST_CLAUDE_CODE gates it (real `claude`, real cost)."""
-    from woollama import recipes, router
+    from woollama import router
+    from woollama.core import recipes
 
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))   # mcp falls back to bundled (hello)
     recipes.reload()
@@ -990,7 +992,8 @@ async def test_claude_code_delegation_denies_same_server_sibling(tmp_path, monke
     import os as _os
     import tempfile as _tempfile
 
-    from woollama import claude_code, recipes, router
+    from woollama import claude_code, router
+    from woollama.core import recipes
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     recipes.reload()
     rec = recipes.get("cc-counter")                         # allows only hello.count_to
@@ -1036,7 +1039,8 @@ async def test_anthropic_inferencer_completes_live(tmp_path, monkeypatch):
     orchestrates against Anthropic's OpenAI-compat endpoint and returns content.
     Proves auth + routing + the real round-trip (tool support over the compat
     endpoint is doc-confirmed; a tool-using live test can be added later)."""
-    from woollama import recipes, router
+    from woollama import router
+    from woollama.core import recipes
 
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cloud]\ninferencer="anthropic/claude-haiku-4-5"\ntools=[]\n'

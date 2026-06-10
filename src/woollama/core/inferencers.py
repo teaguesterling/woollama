@@ -139,3 +139,38 @@ def get(provider: str) -> Inferencer | None:
 
 def names() -> list[str]:
     return list(_registry().keys())
+
+
+class ModelRegistry:
+    """An explicit, instance-scoped provider set — the embeddable alternative to
+    the module-level `get`/`all`/`names` (which read `$WOOLLAMA_CONFIG_DIR`). An
+    embedder builds its providers in memory and never touches config files:
+
+        reg = ModelRegistry()                       # empty
+        reg.add(Inferencer("local", "http://…/v1"))
+        # or: ModelRegistry({"local": Inferencer(...)})
+        # or: ModelRegistry.from_config()           # built-ins + inferencers.toml
+
+    Passed to `core.complete` / `core.orchestrate` via `registry=`; when omitted
+    they fall back to the module-level (config-driven) lookup, so the server is
+    unchanged."""
+
+    def __init__(self, inferencers: dict[str, Inferencer] | None = None) -> None:
+        self._infs: dict[str, Inferencer] = dict(inferencers or {})
+
+    @classmethod
+    def from_config(cls) -> "ModelRegistry":
+        """Built-ins overlaid by `inferencers.toml` — the same set the server uses."""
+        return cls(_registry())
+
+    def add(self, inf: Inferencer) -> None:
+        self._infs[inf.name] = inf
+
+    def get(self, provider: str) -> Inferencer | None:
+        return self._infs.get(provider)
+
+    def all(self) -> dict[str, Inferencer]:  # noqa: A003
+        return dict(self._infs)
+
+    def names(self) -> list[str]:
+        return list(self._infs)

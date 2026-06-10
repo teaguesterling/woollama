@@ -19,6 +19,8 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from .core.tooling import ToolResult, ToolSpec
+
 log = logging.getLogger("woollama.manager")
 
 
@@ -160,3 +162,57 @@ class Registry:
         """Route a model-emitted tool_call to the owning manager."""
         mgr, bare, _ = self.lookup_tool(namespaced)
         return await mgr.call_tool(bare, args)
+
+
+class RegistryToolProvider:
+    """Adapts a `Registry` to the server-free `core.ToolProvider` seam, so the
+    core recipe loop can dispatch MCP tools without importing `manager`. It emits
+    LOSSLESS `ToolSpec` / `ToolResult` (carrying the downstream tool's
+    output_schema + annotations, and the call result's structuredContent + isError
+    + meta) — `core.render_tool_result` is the one place that narrows them. Keeps
+    `Registry.dispatch` itself unchanged (the MCP proxy path still gets the raw
+    `CallToolResult`)."""
+
+    def __init__(self, registry: "Registry") -> None:
+        self._reg = registry
+
+    def tools_for(self, allow):
+        out = []
+        for namespaced in allow:
+            try:
+                _, _, spec = self._reg.lookup_tool(namespaced)
+            except KeyError as e:
+                log.warning("recipe references unknown tool '%s': %s", namespaced, e)
+                continue
+            out.append(ToolSpec(
+                name=namespaced,
+                schema={
+                    "type": "function",
+                    "function": {
+                        "name": namespaced,          # namespaced name flows out
+                        "description": spec.description or "",
+                        "parameters": spec.inputSchema
+                        or {"type": "object", "properties": {}},
+                    },
+                },
+                source_name=namespaced,
+                output_schema=getattr(spec, "outputSchema", None),
+                annotations=_dump(getattr(spec, "annotations", None)),
+                meta=_dump(getattr(spec, "meta", None)),
+            ))
+        return out
+
+    async def dispatch(self, name: str, args: dict) -> ToolResult:
+        r = await self._reg.dispatch(name, args)        # raw CallToolResult
+        return ToolResult(
+            blocks=list(getattr(r, "content", None) or []),
+            structured=getattr(r, "structuredContent", None),
+            is_error=bool(getattr(r, "isError", False)),
+            meta=_dump(getattr(r, "meta", None)),
+        )
+
+
+def _dump(obj):
+    """A pydantic model → dict (for MCP annotations/meta), else passthrough/None."""
+    dump = getattr(obj, "model_dump", None)
+    return dump() if callable(dump) else obj
