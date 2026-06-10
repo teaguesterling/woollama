@@ -61,13 +61,23 @@ fn get_inferencer(provider: &str) -> Option<Inferencer> {
         extra_body: json!({"temperature": 0}),
     };
     match provider {
-        "ollama" => Some(Inferencer {
-            name: "ollama".to_string(),
-            base_url: std::env::var("WOOLLAMA_OLLAMA_URL")
-                .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
-            api_key_env: None,
-            extra_body: json!({"options": {"temperature": 0}}),
-        }),
+        "ollama" => {
+            // Python (`inferencers._registry`) takes `$WOOLLAMA_OLLAMA_URL` as the ROOT
+            // (default `http://localhost:11434`) and appends `/v1`. Mirror that —
+            // normalizing a trailing `/` and a trailing `/v1` first, so a value with or
+            // without `/v1` both resolve to `<root>/v1` (slightly more forgiving than
+            // Python's bare append, which would double a trailing `/v1` or `/`).
+            let raw = std::env::var("WOOLLAMA_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let root = raw.trim_end_matches('/');
+            let root = root.strip_suffix("/v1").unwrap_or(root).trim_end_matches('/');
+            Some(Inferencer {
+                name: "ollama".to_string(),
+                base_url: format!("{root}/v1"),
+                api_key_env: None,
+                extra_body: json!({"options": {"temperature": 0}}),
+            })
+        }
         "anthropic" => Some(Inferencer {
             name: "anthropic".to_string(),
             base_url: "https://api.anthropic.com/v1".to_string(),

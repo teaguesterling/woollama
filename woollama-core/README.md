@@ -98,8 +98,11 @@ config path so the server's `inferencers.toml` providers reach the Rust loop.
 - **`ModelRegistry.from_config()`** — built-ins overlaid by
   `$WOOLLAMA_CONFIG_DIR/inferencers.toml` (env precedence:
   `$WOOLLAMA_CONFIG_DIR` → `$XDG_CONFIG_HOME/woollama` → `~/.config/woollama`;
-  `${VAR}` expanded in values). Also `ModelRegistry()` + `add(name, base_url, *,
-  api_key_env, extra_body)` for in-memory building, and `get`/`names`/`all`.
+  `${VAR}` expanded in values — braced form only, a braceless `$VAR` is left
+  literal). The built-in `ollama` honors `$WOOLLAMA_OLLAMA_URL` as the *root* and
+  appends `/v1` (normalizing a trailing `/` or `/v1`), matching Python. Also
+  `ModelRegistry()` + `add(name, base_url, *, api_key_env, extra_body)` for
+  in-memory building, and `get`/`names`/`all`.
 - The merge is **field-by-field** (mirrors `inferencers._registry`), with the
   oracle's two inheritance idioms preserved faithfully: `base_url`/`extra_body`
   inherit on **falsy** (a config `extra_body = {}` keeps the built-in's), while

@@ -108,6 +108,29 @@ def test_missing_config_file_is_builtins_only(tmp_path, monkeypatch):
     assert set(wc.ModelRegistry.from_config().names()) == BUILTINS
 
 
+def test_base_url_override_on_builtin(tmp_path, monkeypatch):
+    # falsy-or for base_url: a non-empty value on a built-in replaces it.
+    _write_cfg(tmp_path, """
+[inferencers.openai]
+base_url = "https://proxy.internal/v1"
+""", monkeypatch)
+
+    o = wc.ModelRegistry.from_config().get("openai")
+    assert o["base_url"] == "https://proxy.internal/v1"
+    assert o["api_key_env"] == "OPENAI_API_KEY"               # absence-inherit
+
+
+@pytest.mark.parametrize("env_url", ["http://h:9", "http://h:9/", "http://h:9/v1"])
+def test_ollama_url_env_normalized_to_v1(tmp_path, monkeypatch, env_url):
+    # Python takes $WOOLLAMA_OLLAMA_URL as the ROOT and appends /v1; we normalize a
+    # trailing / and /v1 so any of these forms resolves to <root>/v1. (Without this,
+    # a remote ollama URL would build a request MISSING /v1.)
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))   # no toml
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", env_url)
+
+    assert wc.ModelRegistry.from_config().get("ollama")["base_url"] == "http://h:9/v1"
+
+
 def test_registry_add_and_accessors():
     reg = wc.ModelRegistry()
     reg.add("local", "http://x/v1", api_key_env=None, extra_body={"temperature": 0})
