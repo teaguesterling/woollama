@@ -160,6 +160,15 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      back to cosmic-fabric (#2) — then a thin fabric provider + the wiring.
 4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
 
+Planned (designed, not yet built):
+- **`woollama.core` library extraction** — split a server-free `woollama.core`
+  subpackage (config + provider/model routing + the recipe loop) out from the
+  FastAPI/MCP router, so other Python projects (first: **lackpy**) embed woollama
+  for model management instead of running it as a sidecar. Includes the lossless
+  MCP↔OpenAI tool seam (`ToolProvider`/`ToolSpec`/`ToolResult` + per-model
+  renderer) and per-call key/base_url overrides. Full design + phased plan:
+  **[Core library extraction](core-extraction.md)**.
+
 Smaller follow-ons (not blocking):
 - ~~**Honor `num_ctx` for ollama**~~ (#1) — ✅ DONE 2026-06-07. `ollama/<model>`
   passthrough with `options.num_ctx` routes to ollama's native `/api/chat`

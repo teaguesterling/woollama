@@ -49,6 +49,7 @@ nav:
       - Security model: security.md
   - Design:
       - Conversations API: conversations-api-design.md
+      - Core library extraction: core-extraction.md
       - Rust transition: rust-transition.md
   - Project:
       - Roadmap: roadmap.md
