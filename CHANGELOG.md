@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## v0.4.0 — 2026-06-10
+
+Still the Python prototype (v1.0 is the Rust rewrite). The big shift: woollama is
+now **embeddable as a library** — a server-free `woollama.core` other Python
+projects import for model management — alongside an external conversation-store
+family that makes non-claude models stateful without woollama ever owning bytes.
+Authoritative live status is `docs/roadmap.md`.
+
+- **Embeddable `woollama.core` library.** The model-management core — config +
+  provider/model routing (`complete`/`complete_stream`, per-call `api_key`/
+  `base_url`), `ModelRegistry`, recipes, and the recipe orchestration loop — is
+  extracted into a server-free `woollama.core` subpackage so other projects embed
+  it instead of running a sidecar. The FastAPI/MCP router now layers on top; the
+  boundary is enforced by a test (importing `woollama.core` pulls in no
+  FastAPI/uvicorn/MCP). The MCP↔OpenAI tool seam is explicit and lossless
+  (`ToolProvider`/`ToolSpec`/`ToolResult` + a per-model renderer; carries MCP
+  `isError`, fixing a silent tool-failure). Design: `docs/core-extraction.md`.
+  **Note:** the old top-level module paths (`woollama.config`,
+  `woollama.inferencers`, `woollama.recipes`, `woollama.ollama_native`) are gone —
+  import from `woollama.core` (the server's public surface — the CLI + HTTP — is
+  unchanged).
+- **Pluggable conversation stores** (#2): non-claude models (ollama, cloud,
+  recipes) become stateful through `/v1/responses` + `/v1/conversations` via an
+  **external** store woollama is only a client to — it never owns transcript
+  bytes (the conv-5 principle). Two reference providers prove the seam is
+  transport-agnostic: an **MCP** store (`examples/mcp-convstore`) and a **REST**
+  file store (`examples/rest-convstore`, persistent). Selected by the
+  `conversationStore` key in `mcp.json` (a server name, or `{type:"mcp"|"http"}`);
+  unset ⇒ stateless (no behavior change). A flaky store surfaces as a clean `502`.
+- **Durable conversation handle table.** The `conversation_id → backend + native
+  id` routing table is persisted (`$XDG_STATE_HOME/woollama/conversations.json`),
+  so a client's conversation id keeps resolving across a woollama restart. Routing
+  state only — never transcripts.
+- **Attach by external key.** `POST /v1/conversations` and `/v1/responses` accept
+  a caller-owned `key` (e.g. a session name): create-or-attach, idempotent — the
+  caller drives turns by its own key and keeps no `key → id` map of its own.
 - **Cloud models discoverable in `GET /v1/models`** (#3): each inferencer can opt
   in via `inferencers.toml` — a static `models = [...]` list and/or live
   `discover = true` that queries the provider's own `/v1/models`, filtered by
