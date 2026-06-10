@@ -13,7 +13,8 @@ import json
 
 import httpx
 
-from woollama import ollama_native, router
+from woollama import router
+from woollama.core import ollama_native
 
 
 class FakeRequest:

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 
-from woollama import recipes, responses, router
+from woollama import responses, router
+from woollama.core import recipes
 from woollama.manager import Registry
 
 # ---------------------------------------------------------------------------
