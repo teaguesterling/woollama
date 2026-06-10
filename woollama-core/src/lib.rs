@@ -5,20 +5,25 @@
 //! + `complete` / `complete_sync` / `complete_stream` (HTTP inference, incl.
 //! ollama-native num_ctx routing and per-call api_key/base_url overrides).
 //!
-//! Slice 2 (the recipe↔tool loop): `orchestrate` — the drainer that runs a recipe
-//! against an inferencer, dispatching its allow-listed tools through a Python
-//! `ToolProvider` (the callback seam) and returning the final OpenAI dict.
+//! Slice 2 (the recipe↔tool loop): `orchestrate_events` — the single source of
+//! truth, an async iterator of `tool_call`/`tool_result`/`final` events that runs a
+//! recipe against an inferencer, dispatching its allow-listed tools through a Python
+//! `ToolProvider` (the callback seam). `orchestrate` is the drainer over it (returns
+//! the final OpenAI dict). Non-streaming turns only so far (no `delta` events).
 //!
 //! Behavior mirrors `woollama.core` in Python; its hermetic suite is the
-//! conformance oracle. Deferred (later slices): the per-event generator
-//! (`orchestrate_events`) + streamed orchestration; config-file
+//! conformance oracle. Deferred (later slices): streamed turns (`stream=True`'s
+//! `delta` events + SSE per-turn tool_call reassembly); config-file
 //! (`inferencers.toml`) loading + an explicit `ModelRegistry`; structured
 //! `InferenceError` fields (kind/status/payload).
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_stream::stream;
+use futures::stream::{Stream, StreamExt};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyStopAsyncIteration};
 use pyo3::prelude::*;
@@ -280,10 +285,11 @@ fn pyerr_brief(e: &PyErr) -> String {
 }
 
 /// Render a Python `ToolResult` (duck-typed: `.blocks` list, `.is_error` bool; each
-/// block has `.text` and/or `.model_dump()`) into the `tool` message content —
-/// reproducing `tooling.render_tool_result` for text-only `DEFAULT_CAPS`.
-/// Reimplemented in Rust (reading attrs) so the core never imports Python woollama.
-fn render_tool_result_rs(result: &Bound<'_, PyAny>) -> PyResult<String> {
+/// block has `.text` and/or `.model_dump()`) into `(content, is_error)` — the `tool`
+/// message content per `tooling.render_tool_result` for text-only `DEFAULT_CAPS`,
+/// plus the `is_error` flag (the loop's `ok = !is_error`). Reimplemented in Rust
+/// (reading attrs) so the core never imports Python woollama.
+fn render_tool_result_rs(result: &Bound<'_, PyAny>) -> PyResult<(String, bool)> {
     let is_error: bool = result
         .getattr("is_error")
         .and_then(|v| v.extract())
@@ -323,32 +329,65 @@ fn render_tool_result_rs(result: &Bound<'_, PyAny>) -> PyResult<String> {
     if is_error {
         body = if body.is_empty() { "[tool error]".to_string() } else { format!("[tool error] {body}") };
     }
-    Ok(body)
+    Ok((body, is_error))
 }
 
-/// Run a recipe end-to-end and return the final OpenAI-shaped response dict (the
-/// drainer — `core.orchestrate`, NOT the event generator `orchestrate_events`).
-///
-/// Prepends the recipe's system prompt, offers its allow-listed tools, dispatches
-/// the ones the model calls through the Python `tools` `ToolProvider`
-/// (`tools_for(allow) -> [ToolSpec]`, async `dispatch(name, args) -> ToolResult`),
-/// feeds results back, repeats (≤8 turns). The allow-list is a BOUNDARY: a call for
-/// anything off it is refused (the refusal is fed back as the tool result so the
-/// loop recovers); a dispatch that raises becomes an `ERROR: …` tool result, never
-/// propagating (matches orchestrate.py:139-141). Built-in inferencers only; an
-/// explicit `registry`, streaming, and the per-event generator are deferred.
-#[pyfunction]
-#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None))]
-fn orchestrate<'py>(
-    py: Python<'py>,
-    recipe: Bound<'py, PyAny>,
-    user_msgs: Bound<'py, PyAny>,
-    tools: Bound<'py, PyAny>,
+// --- the recipe↔tool loop: one source of truth (orchestrate_events) + drainer --
+
+/// One progress event from the loop. Converted to the OpenAI-ish event dict
+/// (`{"type": …}`) only at the Python boundary (`event_to_py`); the loop stays pure
+/// Rust. `Delta` is streaming-only (deferred — non-stream turns emit none).
+enum Event {
+    #[allow(dead_code)]
+    Delta(String),
+    ToolCall { turn: u32, name: String, args: Value },
+    ToolResult { turn: u32, name: String, ok: bool },
+    Final(Value),
+}
+
+fn pyval(v: &Value) -> PyResult<Py<PyAny>> {
+    Python::with_gil(|py| Ok(pythonize::pythonize(py, v)?.unbind()))
+}
+
+fn event_to_py(ev: &Event) -> PyResult<Py<PyAny>> {
+    let v = match ev {
+        Event::Delta(c) => json!({"type": "delta", "content": c}),
+        Event::ToolCall { turn, name, args } =>
+            json!({"type": "tool_call", "turn": turn, "name": name, "args": args}),
+        Event::ToolResult { turn, name, ok } =>
+            json!({"type": "tool_result", "turn": turn, "name": name, "ok": ok}),
+        Event::Final(resp) => json!({"type": "final", "response": resp}),
+    };
+    pyval(&v)
+}
+
+/// Everything the loop needs, resolved EAGERLY (under the GIL) before any async work
+/// — so an unsupported inferencer / missing key / bad `tools_for` raises on the call,
+/// not lazily on first iteration. A deliberate divergence from the Python generator's
+/// lazy timing (matches the committed `orchestrate` behavior, and keeps the sync
+/// fail-fast tests green).
+struct Setup {
+    url: String,
+    headers: HashMap<String, String>,
+    model: String,
+    schemas: Vec<Value>,
+    allowed: std::collections::HashSet<String>,
+    sorted_allowed: Vec<String>,
+    messages: Vec<Value>,
+    extra_body: Value,
+    params: Option<Value>,
+    tools: Py<PyAny>,
+}
+
+fn build_setup(
+    py: Python<'_>,
+    recipe: &Bound<'_, PyAny>,
+    user_msgs: &Bound<'_, PyAny>,
+    tools: &Bound<'_, PyAny>,
     api_key: Option<String>,
     base_url: Option<String>,
-) -> PyResult<Bound<'py, PyAny>> {
-    // --- synchronous setup (under GIL); fail fast before going async ---
-    let rv: Value = pythonize::depythonize(&recipe)?;
+) -> PyResult<Setup> {
+    let rv: Value = pythonize::depythonize(recipe)?;
     let inferencer = rv
         .get("inferencer")
         .and_then(Value::as_str)
@@ -390,43 +429,86 @@ fn orchestrate<'py>(
     sorted_allowed.sort();
 
     // messages = [system] + user_msgs
-    let user_list: Value = pythonize::depythonize(&user_msgs)?;
+    let user_list: Value = pythonize::depythonize(user_msgs)?;
     let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
     if let Some(arr) = user_list.as_array() {
         messages.extend(arr.iter().cloned());
     }
 
-    let extra_body = inf.extra_body.clone();
-    let tools: Py<PyAny> = tools.unbind();
+    Ok(Setup {
+        url,
+        headers,
+        model,
+        schemas,
+        allowed,
+        sorted_allowed,
+        messages,
+        extra_body: inf.extra_body.clone(),
+        params,
+        tools: tools.clone().unbind(),
+    })
+}
 
-    future_into_py(py, async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(180))
-            .build()
-            .map_err(|e| InferenceError::new_err(e.to_string()))?;
+/// Dispatch ONE tool call through the Python `ToolProvider` and render the result.
+/// Build the awaitable + future under the GIL, await it off-GIL. A `dispatch` that
+/// raises is CAUGHT and returned as `(ERROR: …, false)` — never propagated
+/// (orchestrate.py:139-141). Returns `(rendered, ok)` with `ok = !is_error`.
+async fn dispatch_and_render(tools: &Py<PyAny>, name: &str, args: &Value) -> (String, bool) {
+    let built = Python::with_gil(|py| -> PyResult<_> {
+        let args_py = pythonize::pythonize(py, args)?;
+        let awaitable = tools.bind(py).call_method1("dispatch", (name, args_py))?;
+        pyo3_async_runtimes::tokio::into_future(awaitable)
+    });
+    let fut = match built {
+        Ok(f) => f,
+        Err(e) => return (format!("ERROR: {}", pyerr_brief(&e)), false),
+    };
+    match fut.await {
+        Err(e) => (format!("ERROR: {}", pyerr_brief(&e)), false),
+        Ok(tr) => match Python::with_gil(|py| render_tool_result_rs(tr.bind(py))) {
+            Ok((body, is_error)) => (body, !is_error),
+            Err(e) => (format!("ERROR: {}", pyerr_brief(&e)), false),
+        },
+    }
+}
+
+/// The recipe↔tool loop as a stream of `Event`s — the SINGLE source of truth (the
+/// drainer + the `EventIter` both consume it; do NOT reimplement). Non-streaming
+/// turns only for now (no `Delta` events; streamed turns are a later slice). Offers
+/// the allow-listed tools, dispatches the ones the model calls, feeds results back,
+/// repeats (≤8 turns). The allow-list is a BOUNDARY: an off-list call is refused
+/// WITHOUT dispatching and the refusal is fed back so the loop recovers. Yields
+/// `ToolCall`/`ToolResult` progress and a terminal `Final`, or an `Err` (inferencer
+/// error / max turns).
+fn events_stream(setup: Setup) -> impl Stream<Item = PyResult<Event>> + Send {
+    let Setup {
+        url, headers, model, schemas, allowed, sorted_allowed, messages, extra_body, params, tools,
+    } = setup;
+    stream! {
+        let mut messages = messages;
+        let client = match reqwest::Client::builder().timeout(Duration::from_secs(180)).build() {
+            Ok(c) => c,
+            Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+        };
         for turn in 1..=8u32 {
             // body = {model, messages, tools, stream:false, **extra_body, **params}
-            let mut body = json!({
-                "model": model, "messages": messages, "tools": schemas, "stream": false,
-            });
-            if let Some(o) = extra_body.as_object() {
-                for (k, v) in o {
-                    body[k] = v.clone();
-                }
-            }
-            if let Some(o) = params.as_ref().and_then(Value::as_object) {
-                for (k, v) in o {
-                    body[k] = v.clone();
-                }
-            }
+            let mut body = json!({"model": model, "messages": messages, "tools": schemas, "stream": false});
+            if let Some(o) = extra_body.as_object() { for (k, v) in o { body[k] = v.clone(); } }
+            if let Some(o) = params.as_ref().and_then(Value::as_object) { for (k, v) in o { body[k] = v.clone(); } }
+
             let mut rb = client.post(&url).json(&body);
-            for (k, v) in &headers {
-                rb = rb.header(k, v);
-            }
-            let resp = rb.send().await.map_err(|e| InferenceError::new_err(e.to_string()))?;
-            let data: Value = resp.json().await.map_err(|e| InferenceError::new_err(e.to_string()))?;
+            for (k, v) in &headers { rb = rb.header(k, v); }
+            let resp = match rb.send().await {
+                Ok(r) => r,
+                Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+            };
+            let data: Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+            };
             if data.get("choices").is_none() {
-                return Err(InferenceError::new_err(format!("inferencer error: {data}")));
+                yield Err(InferenceError::new_err(format!("inferencer error: {data}")));
+                return;
             }
             let msg = &data["choices"][0]["message"];
             let calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -434,57 +516,114 @@ fn orchestrate<'py>(
 
             if calls.is_empty() {
                 // no tool calls → this turn's whole response IS the final answer
-                return Python::with_gil(|py| Ok(pythonize::pythonize(py, &data)?.unbind()));
+                yield Ok(Event::Final(data));
+                return;
             }
-            messages.push(json!({"role": "assistant", "content": content, "tool_calls": calls.clone()}));
-            for call in &calls {
+            // Owned per-call metadata so we never borrow `calls` across the awaits below.
+            let metas: Vec<(String, Value, String)> = calls.iter().map(|call| {
                 let func = call.get("function");
-                let namespaced = func
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let name = func.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
                 // OpenAI gives `arguments` as a JSON STRING; parse before dispatch.
-                let args: Value = match func.and_then(|f| f.get("arguments")) {
+                let args = match func.and_then(|f| f.get("arguments")) {
                     Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
                     Some(v) => v.clone(),
                     None => json!({}),
                 };
-                let call_id = call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("call_{turn}_{namespaced}"));
+                let id = call.get("id").and_then(Value::as_str).map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{turn}_{name}"));
+                (name, args, id)
+            }).collect();
+            messages.push(json!({"role": "assistant", "content": content, "tool_calls": calls}));
 
-                let result: String = if !allowed.contains(&namespaced) {
+            for (name, args, call_id) in &metas {
+                yield Ok(Event::ToolCall { turn, name: name.clone(), args: args.clone() });
+                let (result, ok) = if !allowed.contains(name) {
                     // refuse, but feed the refusal back (every tool_call needs a tool message)
-                    format!(
-                        "ERROR: tool '{namespaced}' is not permitted by this recipe \
-                         (allowed: {sorted_allowed:?})"
-                    )
+                    (format!("ERROR: tool '{name}' is not permitted by this recipe (allowed: {sorted_allowed:?})"), false)
                 } else {
-                    // dispatch: build the awaitable + future under the GIL, await off-GIL.
-                    let fut = Python::with_gil(|py| -> PyResult<_> {
-                        let args_py = pythonize::pythonize(py, &args)?;
-                        let awaitable =
-                            tools.bind(py).call_method1("dispatch", (namespaced.clone(), args_py))?;
-                        pyo3_async_runtimes::tokio::into_future(awaitable)
-                    });
-                    match fut {
-                        Err(e) => format!("ERROR: {}", pyerr_brief(&e)),
-                        Ok(fut) => match fut.await {
-                            // a dispatch that raises becomes an ERROR result, never propagates
-                            Err(e) => format!("ERROR: {}", pyerr_brief(&e)),
-                            Ok(tr) => Python::with_gil(|py| render_tool_result_rs(tr.bind(py)))
-                                .unwrap_or_else(|e| format!("ERROR: {}", pyerr_brief(&e))),
-                        },
-                    }
+                    dispatch_and_render(&tools, name, args).await
                 };
+                yield Ok(Event::ToolResult { turn, name: name.clone(), ok });
                 messages.push(json!({"role": "tool", "content": result, "tool_call_id": call_id}));
             }
         }
-        Err(InferenceError::new_err("max turns (8) exceeded"))
+        yield Err(InferenceError::new_err("max turns (8) exceeded"));
+    }
+}
+
+/// Run a recipe and return the final OpenAI response dict — the drainer over
+/// `events_stream` (Python's `core.orchestrate`). Setup is eager (raises on the
+/// call); the loop runs in the awaitable, and progress events are discarded.
+#[pyfunction]
+#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None))]
+fn orchestrate<'py>(
+    py: Python<'py>,
+    recipe: Bound<'py, PyAny>,
+    user_msgs: Bound<'py, PyAny>,
+    tools: Bound<'py, PyAny>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
+    future_into_py(py, async move {
+        let mut s = Box::pin(events_stream(setup));
+        while let Some(item) = s.next().await {
+            if let Event::Final(resp) = item? {
+                return Python::with_gil(|py| Ok(pythonize::pythonize(py, &resp)?.unbind()));
+            }
+        }
+        Err(InferenceError::new_err("orchestrate: loop ended without a final response"))
     })
+}
+
+/// An async iterator over the recipe loop's progress events — `async for ev in
+/// orchestrate_events(...)`. Each `ev` is a dict: `tool_call` / `tool_result`
+/// progress and a terminal `final` (`{"type": "final", "response": <openai dict>}`);
+/// raises `InferenceError` on inferencer error / max turns.
+#[pyclass]
+struct EventIter {
+    inner: Arc<Mutex<Pin<Box<dyn Stream<Item = PyResult<Event>> + Send>>>>,
+}
+
+#[pymethods]
+impl EventIter {
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let mut s = inner.lock().await;
+            match s.next().await {
+                Some(Ok(ev)) => event_to_py(&ev),
+                Some(Err(e)) => Err(e),
+                None => Err(PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+}
+
+/// The recipe loop as an async iterator of progress + `final` events (the server's
+/// surface). Setup is eager (raises on the call). `stream=True` (delta events from
+/// streamed turns) is a later slice — passing it raises.
+#[pyfunction]
+#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, stream=false))]
+fn orchestrate_events<'py>(
+    py: Python<'py>,
+    recipe: Bound<'py, PyAny>,
+    user_msgs: Bound<'py, PyAny>,
+    tools: Bound<'py, PyAny>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    stream: bool,
+) -> PyResult<EventIter> {
+    if stream {
+        return Err(InferenceError::new_err(
+            "streamed orchestration (delta events) is not yet implemented in the Rust core",
+        ));
+    }
+    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
+    Ok(EventIter { inner: Arc::new(Mutex::new(Box::pin(events_stream(setup)))) })
 }
 
 // --- streaming ---------------------------------------------------------------
@@ -632,6 +771,8 @@ fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(complete_stream, m)?)?;
     m.add_function(wrap_pyfunction!(provider_names, m)?)?;
     m.add_function(wrap_pyfunction!(orchestrate, m)?)?;
+    m.add_function(wrap_pyfunction!(orchestrate_events, m)?)?;
+    m.add_class::<EventIter>()?;
     m.add_class::<DeltaStream>()?;
     Ok(())
 }

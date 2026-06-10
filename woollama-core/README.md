@@ -35,36 +35,47 @@ against ollama. One minor difference: the async awaitable binds to the running
 event loop at creation, so it must be created inside the loop (moot for the embed
 case — lackpy always `await`s inside an async function).
 
-## Slice 2 — the recipe↔tool loop (`orchestrate`)
+## Slice 2 — the recipe↔tool loop (`orchestrate_events` + `orchestrate`)
 
 The first **callback** slice: the core now drives the inferencer↔tool loop and
-calls *back* into Python for the tools.
+calls *back* into Python for the tools. There is **one loop** —
+`orchestrate_events`, authored as a Rust `stream!` of events — and `orchestrate`
+drains it (matching how Python's `orchestrate` is a thin drainer over the
+generator).
 
-- **`orchestrate(recipe, user_msgs, tools, *, api_key, base_url)`** — an awaitable
-  returning the final OpenAI response dict. It prepends `recipe["system"]`, offers
-  the recipe's allow-listed tools, dispatches the ones the model calls through the
-  Python `tools` **`ToolProvider`** (sync `tools_for(allow) -> [ToolSpec]`, **async**
-  `dispatch(name, args) -> ToolResult`), feeds results back, and repeats (≤8 turns).
-  This is the Python port's `core.orchestrate` (the drainer over
-  `orchestrate_events`).
+- **`orchestrate_events(recipe, user_msgs, tools, *, api_key, base_url, stream=False)`**
+  — an **async iterator** (`async for ev in …`) of progress dicts: `tool_call`
+  (`turn`/`name`/`args`), `tool_result` (`turn`/`name`/`ok`), and a terminal `final`
+  (`{"type":"final","response": <openai dict>}`). It prepends `recipe["system"]`,
+  offers the recipe's allow-listed tools, dispatches the ones the model calls through
+  the Python `tools` **`ToolProvider`** (sync `tools_for(allow) -> [ToolSpec]`,
+  **async** `dispatch(name, args) -> ToolResult`), feeds results back, repeats (≤8
+  turns). This is the server's surface.
+- **`orchestrate(recipe, user_msgs, tools, *, api_key, base_url)`** — the awaitable
+  drainer returning just the final OpenAI dict (Python's `core.orchestrate`).
 - The **allow-list is a boundary, not a hint**: a tool_call for anything off it is
-  *refused without dispatching* and the refusal is fed back as the tool result (so
-  the loop recovers) — the adversarial property, enforced in Rust.
-- A `dispatch` that **raises** becomes an `ERROR: {Type}: {msg}` tool result and the
-  loop continues — it never propagates (matches `orchestrate.py`).
+  *refused without dispatching* (the `tool_result` carries `ok: false`) and the
+  refusal is fed back so the loop recovers — the adversarial property, in Rust.
+- A `dispatch` that **raises** becomes an `ERROR: {Type}: {msg}` tool result
+  (`ok: false`) and the loop continues — it never propagates (matches `orchestrate.py`).
 - Built-in inferencers carry `extra_body` merged into each orchestration request
   (ollama → `{"options":{"temperature":0}}`, anthropic → `max_tokens`, clouds →
   `temperature:0`); the recipe's `params` override it. `ToolResult` rendering
   (text-join, JSON fallback, `[tool error]` prefix) is reimplemented in Rust over
   duck-typed `.blocks`/`.is_error`, so the core still imports no Python woollama.
+- **Eager setup** (a deliberate divergence from Python's lazy generator): an
+  unsupported inferencer / missing key raises on the *call*, not on first `__anext__`.
 
-The genuinely novel mechanic — awaiting the Python `dispatch` coroutine from inside
-the Rust async loop (`pyo3_async_runtimes`' `into_future`, task-locals propagated
-through `future_into_py`) — was spiked in isolation first. Verified by
-`tests/test_orchestrate_conformance.py` (dispatch→final, the out-of-list refusal,
-`is_error`/exception rendering, `extra_body`/`params` merge, unsupported inferencer)
-with a mock `ToolProvider` + scripted inferencer, and **live against ollama**: a
-`math.add` recipe → qwen3 calls the tool → Rust dispatches it → `"…is 42."`.
+Two novel mechanics, each spiked in isolation first: awaiting the Python `dispatch`
+coroutine from inside the Rust async loop (`pyo3_async_runtimes`' `into_future`,
+task-locals propagated through `future_into_py`), and a `stream!`-backed async-
+iterator pyclass that yields across `__anext__` calls with an `await` between yields.
+Verified by `tests/test_orchestrate_conformance.py` (25 tests: dispatch→final, the
+out-of-list refusal, `is_error`/exception rendering, parallel tool_calls, max-turns,
+`extra_body`/`params` merge, the event sequence + `ok` flags, `stream=True` rejected,
+eager-raise) with a mock `ToolProvider` + scripted inferencer, and **live against
+ollama**: a `math.add` recipe → qwen3 calls the tool → `tool_call`/`tool_result`/
+`final` → `"…is 42."`.
 
 ## Proven with lackpy (the thesis)
 
@@ -92,11 +103,13 @@ this, so the server and lackpy both consume the Rust core directly.
 
 ## Deferred (later slices)
 
-The per-event generator (`orchestrate_events` — `delta`/`tool_call`/`tool_result`
-progress events) and streamed orchestration; config-file (`inferencers.toml`)
-loading + an explicit `ModelRegistry` (`orchestrate` uses built-in inferencers
-only); structured `InferenceError` fields (kind/status/payload); and packaging so
-this provides `woollama.core` for the server dist (the dist-split).
+Streamed turns — `orchestrate_events(stream=True)`'s `delta` events + the SSE
+per-turn `tool_call` reassembly (the part that lets the server's streaming
+`/v1/chat/completions` sit on the Rust core; passing `stream=True` raises for now);
+config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`
+(orchestration uses built-in inferencers only); structured `InferenceError` fields
+(kind/status/payload); and packaging so this provides `woollama.core` for the
+server dist (the dist-split).
 
 ## Build & test
 

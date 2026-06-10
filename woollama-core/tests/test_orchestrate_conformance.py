@@ -260,3 +260,91 @@ def test_unsupported_inferencer_raises_before_await():
     recipe = {"inferencer": "bogus/m", "system": "s", "tools": []}
     with pytest.raises(wc.InferenceError):
         orchestrate(recipe, MSGS, prov)
+
+
+# --- orchestrate_events (the per-event generator the server consumes) ---------
+
+def _events(recipe, prov, base_url, **kw):
+    async def go():
+        return [ev async for ev in
+                wc.orchestrate_events(recipe, MSGS, prov, base_url=base_url, **kw)]
+    return asyncio.run(go())
+
+
+def test_events_emits_tool_call_result_final_in_order(base_url):
+    _LoopMock.script = [_tool_call_resp("hello.count_to", {"n": 3}), _final_resp("counted to 3")]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("1 2 3")])})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    evs = _events(recipe, prov, base_url, api_key="k")
+
+    assert [e["type"] for e in evs] == ["tool_call", "tool_result", "final"]
+    tc, tr, fin = evs
+    assert (tc["turn"], tc["name"], tc["args"]) == (1, "hello.count_to", {"n": 3})
+    assert (tr["turn"], tr["name"], tr["ok"]) == (1, "hello.count_to", True)
+    assert fin["response"]["choices"][0]["message"]["content"] == "counted to 3"
+
+
+def test_events_tool_result_ok_false_on_is_error(base_url):
+    _LoopMock.script = [_tool_call_resp("hello.count_to", {}), _final_resp("ok")]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("boom")], is_error=True)})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    evs = _events(recipe, prov, base_url, api_key="k")
+
+    assert [e for e in evs if e["type"] == "tool_result"][0]["ok"] is False
+
+
+def test_events_parallel_calls_emit_two_pairs_in_order(base_url):
+    _LoopMock.script = [
+        _multi_tool_call_resp([("hello.count_to", {}, "c1"), ("math.add", {}, "c2")]),
+        _final_resp("done"),
+    ]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("x")]),
+                         "math.add": lambda a: _Result([_Block("y")])})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s",
+              "tools": ["hello.count_to", "math.add"]}
+
+    evs = _events(recipe, prov, base_url, api_key="k")
+
+    assert [e["type"] for e in evs] == \
+        ["tool_call", "tool_result", "tool_call", "tool_result", "final"]
+    assert [e["name"] for e in evs if e["type"] == "tool_call"] == ["hello.count_to", "math.add"]
+
+
+def test_events_refusal_emits_tool_result_ok_false_without_dispatch(base_url):
+    _LoopMock.script = [_tool_call_resp("evil.rm", {}), _final_resp("done")]
+    prov = MockProvider({})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    evs = _events(recipe, prov, base_url, api_key="k")
+
+    assert prov.dispatched == []
+    tr = [e for e in evs if e["type"] == "tool_result"][0]
+    assert tr["name"] == "evil.rm" and tr["ok"] is False
+
+
+def test_events_max_turns_raises_during_iteration(base_url):
+    _LoopMock.script = [_tool_call_resp("hello.count_to", {}, f"c{i}") for i in range(8)]
+    prov = MockProvider({"hello.count_to": lambda a: _Result([_Block("x")])})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": ["hello.count_to"]}
+
+    with pytest.raises(wc.InferenceError, match="max turns"):
+        _events(recipe, prov, base_url, api_key="k")
+
+
+def test_events_stream_true_raises():
+    # delta events from streamed turns are a later slice — opting in is an explicit error.
+    prov = MockProvider({})
+    recipe = {"inferencer": "openai/gpt-x", "system": "s", "tools": []}
+    with pytest.raises(wc.InferenceError, match="not yet implemented"):
+        wc.orchestrate_events(recipe, MSGS, prov, stream=True)
+
+
+def test_events_unsupported_inferencer_raises_before_iter():
+    # setup is eager (a deliberate divergence from Python's lazy generator) — raises
+    # on the call, not on first `__anext__`.
+    prov = MockProvider({})
+    recipe = {"inferencer": "bogus/m", "system": "s", "tools": []}
+    with pytest.raises(wc.InferenceError):
+        wc.orchestrate_events(recipe, MSGS, prov)
