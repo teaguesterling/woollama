@@ -12,10 +12,15 @@
 //! (yielding `delta`s, reassembling fragmented tool_calls); `orchestrate` is the
 //! drainer over it (returns the final OpenAI dict).
 //!
+//! Slice 3 (config-driven inferencers): `ModelRegistry` + `inferencers.toml`
+//! loading (`ModelRegistry.from_config()` = built-ins overlaid by config, merged
+//! field-by-field). Passed to `orchestrate`/`orchestrate_events` via `registry=`;
+//! omitting it uses the built-ins (the hermetic default).
+//!
 //! Behavior mirrors `woollama.core` in Python; its hermetic suite is the
-//! conformance oracle. Deferred (later slices): config-file (`inferencers.toml`)
-//! loading + an explicit `ModelRegistry`; structured `InferenceError` fields
-//! (kind/status/payload).
+//! conformance oracle. Deferred (later slices): the registry's discovery fields
+//! (`models`/`discover`/`model_patterns`) + `/v1/models`; structured
+//! `InferenceError` fields (kind/status/payload).
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -268,6 +273,213 @@ fn provider_names() -> Vec<String> {
     known_providers().iter().map(|s| s.to_string()).collect()
 }
 
+// --- config-driven inferencers (inferencers.toml) + ModelRegistry -------------
+
+fn expanduser(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    } else if p == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    }
+    p.to_string()
+}
+
+/// `$config/woollama` — `$WOOLLAMA_CONFIG_DIR` → `$XDG_CONFIG_HOME/woollama` →
+/// `~/.config/woollama` (mirrors `config.config_dir`).
+fn config_dir() -> std::path::PathBuf {
+    if let Ok(o) = std::env::var("WOOLLAMA_CONFIG_DIR") {
+        if !o.is_empty() {
+            return std::path::PathBuf::from(expanduser(&o));
+        }
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
+    std::path::PathBuf::from(base).join("woollama")
+}
+
+/// Expand `${VAR}` from the environment (unset → empty), matching the braced form of
+/// `os.path.expandvars`. (Braceless `$VAR` is left as-is — a minor divergence.)
+fn expand_env(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("${") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        match after.find('}') {
+            Some(end) => {
+                out.push_str(&std::env::var(&after[..end]).unwrap_or_default());
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[pos..]); // no closing brace → literal
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse `$config/inferencers.toml` into `{name: <spec table>}` (only the keys the
+/// TOML sets — present/absent preserved for the registry merge). Missing file → `{}`.
+fn load_inferencers_toml() -> PyResult<HashMap<String, serde_json::Map<String, Value>>> {
+    let path = config_dir().join("inferencers.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(HashMap::new()), // not a file / unreadable → none (matches is_file gate)
+    };
+    let v: Value = toml::from_str(&expand_env(&text)).map_err(|e| {
+        InferenceError::new_err(format!("inferencers.toml parse error in {}: {e}", path.display()))
+    })?;
+    let raw = match v.get("inferencers") {
+        None => return Ok(HashMap::new()),
+        Some(Value::Object(o)) => o,
+        Some(_) => {
+            return Err(InferenceError::new_err(format!(
+                "inferencers.toml {}: 'inferencers' must be a table",
+                path.display()
+            )))
+        }
+    };
+    let mut out = HashMap::new();
+    for (name, entry) in raw {
+        let obj = entry.as_object().ok_or_else(|| {
+            InferenceError::new_err(format!(
+                "inferencers.toml {}: '{name}' must be a table",
+                path.display()
+            ))
+        })?;
+        out.insert(name.clone(), obj.clone());
+    }
+    Ok(out)
+}
+
+/// Built-ins overlaid by `inferencers.toml`, merged FIELD BY FIELD (mirrors
+/// `inferencers._registry`). The inheritance idiom differs per field, faithfully:
+/// `base_url`/`extra_body` inherit on FALSY (`spec or base`); `api_key_env` inherits
+/// on ABSENCE (`spec.get(k, base)`). A new provider must supply `base_url`. (The
+/// discovery fields `models`/`discover`/`model_patterns` are deferred — they serve
+/// `/v1/models`, not the loop.)
+fn build_config_registry() -> PyResult<HashMap<String, Inferencer>> {
+    let mut reg: HashMap<String, Inferencer> = HashMap::new();
+    for name in known_providers() {
+        if let Some(inf) = get_inferencer(name) {
+            reg.insert(name.to_string(), inf);
+        }
+    }
+    for (name, spec) in load_inferencers_toml()? {
+        let base = reg.get(&name).cloned();
+        // base_url: falsy-or; required if not extending a built-in.
+        let base_url = spec
+            .get("base_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| base.as_ref().map(|b| b.base_url.clone()))
+            .ok_or_else(|| {
+                InferenceError::new_err(format!(
+                    "inferencer '{name}' has no base_url and is not a known built-in to \
+                     extend — add base_url in inferencers.toml"
+                ))
+            })?;
+        // api_key_env: absence-inherit. Present (even "") wins; "" → no auth (falsy in headers).
+        let api_key_env = if spec.contains_key("api_key_env") {
+            spec.get("api_key_env")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        } else {
+            base.as_ref().and_then(|b| b.api_key_env.clone())
+        };
+        // extra_body: falsy-or — a present-but-empty table inherits the built-in's.
+        let extra_body = spec
+            .get("extra_body")
+            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+            .cloned()
+            .unwrap_or_else(|| base.as_ref().map_or_else(|| json!({}), |b| b.extra_body.clone()));
+        reg.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body });
+    }
+    Ok(reg)
+}
+
+fn inferencer_to_json(inf: &Inferencer) -> Value {
+    json!({
+        "name": inf.name,
+        "base_url": inf.base_url,
+        "api_key_env": inf.api_key_env,
+        "extra_body": inf.extra_body,
+    })
+}
+
+/// An explicit, instance-scoped inferencer set — the embeddable alternative to the
+/// built-in lookup. Pass to `orchestrate`/`orchestrate_events` via `registry=` to
+/// resolve config-file inferencers (`ModelRegistry.from_config()`); omitting it uses
+/// the built-ins only (the hermetic default). Mirrors `inferencers.ModelRegistry`.
+#[pyclass]
+struct ModelRegistry {
+    infs: HashMap<String, Inferencer>,
+}
+
+#[pymethods]
+impl ModelRegistry {
+    #[new]
+    fn new() -> Self {
+        ModelRegistry { infs: HashMap::new() }
+    }
+
+    /// Built-ins overlaid by `inferencers.toml` — the same set the server resolves.
+    #[staticmethod]
+    fn from_config() -> PyResult<ModelRegistry> {
+        Ok(ModelRegistry { infs: build_config_registry()? })
+    }
+
+    #[pyo3(signature = (name, base_url, *, api_key_env=None, extra_body=None))]
+    fn add(
+        &mut self,
+        name: String,
+        base_url: String,
+        api_key_env: Option<String>,
+        extra_body: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let extra_body = match extra_body {
+            Some(b) => pythonize::depythonize(&b)?,
+            None => json!({}),
+        };
+        self.infs.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body });
+        Ok(())
+    }
+
+    /// The resolved inferencer as a dict (`name`/`base_url`/`api_key_env`/`extra_body`),
+    /// or None.
+    fn get(&self, provider: &str) -> PyResult<Option<Py<PyAny>>> {
+        match self.infs.get(provider) {
+            Some(inf) => Ok(Some(pyval(&inferencer_to_json(inf))?)),
+            None => Ok(None),
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut n: Vec<String> = self.infs.keys().cloned().collect();
+        n.sort();
+        n
+    }
+
+    fn all(&self) -> PyResult<Py<PyAny>> {
+        let map: serde_json::Map<String, Value> = self
+            .infs
+            .iter()
+            .map(|(k, inf)| (k.clone(), inferencer_to_json(inf)))
+            .collect();
+        pyval(&Value::Object(map))
+    }
+}
+
 // --- orchestrate (the recipe↔tool loop) --------------------------------------
 
 /// `"{TypeName}: {message}"` for a caught Python error — matches the Python loop's
@@ -385,6 +597,7 @@ fn build_setup(
     tools: &Bound<'_, PyAny>,
     api_key: Option<String>,
     base_url: Option<String>,
+    registry: Option<&ModelRegistry>,
 ) -> PyResult<Setup> {
     let rv: Value = pythonize::depythonize(recipe)?;
     let inferencer = rv
@@ -401,10 +614,18 @@ fn build_setup(
     let params: Option<Value> = rv.get("params").filter(|v| !v.is_null()).cloned();
 
     let (provider, model) = split_model(&inferencer);
-    let inf = get_inferencer(&provider).ok_or_else(|| {
+    // Resolve against the explicit registry when given, else the built-ins.
+    let inf = match registry {
+        Some(reg) => reg.infs.get(&provider).cloned(),
+        None => get_inferencer(&provider),
+    }
+    .ok_or_else(|| {
+        let known = match registry {
+            Some(reg) => reg.names().join(", "),
+            None => known_providers().join(", "),
+        };
         InferenceError::new_err(format!(
-            "unsupported inferencer '{inferencer}' (supported providers: {}, claude-code)",
-            known_providers().join(", ")
+            "unsupported inferencer '{inferencer}' (supported providers: {known}, claude-code)"
         ))
     })?;
     let headers = build_headers(&inf, api_key.as_deref()).map_err(InferenceError::new_err)?;
@@ -690,7 +911,7 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
 /// `events_stream` (Python's `core.orchestrate`). Setup is eager (raises on the
 /// call); the loop runs in the awaitable, and progress events are discarded.
 #[pyfunction]
-#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None))]
+#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, registry=None))]
 fn orchestrate<'py>(
     py: Python<'py>,
     recipe: Bound<'py, PyAny>,
@@ -698,8 +919,9 @@ fn orchestrate<'py>(
     tools: Bound<'py, PyAny>,
     api_key: Option<String>,
     base_url: Option<String>,
+    registry: Option<PyRef<'py, ModelRegistry>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
+    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url, registry.as_deref())?;
     future_into_py(py, async move {
         let mut s = Box::pin(events_stream(setup, false));
         while let Some(item) = s.next().await {
@@ -742,7 +964,7 @@ impl EventIter {
 /// surface). Setup is eager (raises on the call). With `stream=True`, turns run over
 /// SSE and the iterator also yields `delta` (assistant content) events.
 #[pyfunction]
-#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, stream=false))]
+#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, registry=None, stream=false))]
 fn orchestrate_events<'py>(
     py: Python<'py>,
     recipe: Bound<'py, PyAny>,
@@ -750,9 +972,10 @@ fn orchestrate_events<'py>(
     tools: Bound<'py, PyAny>,
     api_key: Option<String>,
     base_url: Option<String>,
+    registry: Option<PyRef<'py, ModelRegistry>>,
     stream: bool,
 ) -> PyResult<EventIter> {
-    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url)?;
+    let setup = build_setup(py, &recipe, &user_msgs, &tools, api_key, base_url, registry.as_deref())?;
     Ok(EventIter { inner: Arc::new(Mutex::new(Box::pin(events_stream(setup, stream)))) })
 }
 
@@ -897,6 +1120,7 @@ fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(orchestrate, m)?)?;
     m.add_function(wrap_pyfunction!(orchestrate_events, m)?)?;
     m.add_class::<EventIter>()?;
+    m.add_class::<ModelRegistry>()?;
     m.add_class::<DeltaStream>()?;
     Ok(())
 }

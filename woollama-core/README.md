@@ -90,6 +90,35 @@ char split across network chunks (`resp.chunk()` boundaries don't align to chars
 never corrupted — regression-tested with a chunked mock that splits an em-dash, and
 the fix is shared with slice-1's `complete_stream`.
 
+## Slice 3 — config-driven inferencers (`ModelRegistry`)
+
+Until now the loop resolved built-in providers only. **`ModelRegistry`** adds the
+config path so the server's `inferencers.toml` providers reach the Rust loop.
+
+- **`ModelRegistry.from_config()`** — built-ins overlaid by
+  `$WOOLLAMA_CONFIG_DIR/inferencers.toml` (env precedence:
+  `$WOOLLAMA_CONFIG_DIR` → `$XDG_CONFIG_HOME/woollama` → `~/.config/woollama`;
+  `${VAR}` expanded in values). Also `ModelRegistry()` + `add(name, base_url, *,
+  api_key_env, extra_body)` for in-memory building, and `get`/`names`/`all`.
+- The merge is **field-by-field** (mirrors `inferencers._registry`), with the
+  oracle's two inheritance idioms preserved faithfully: `base_url`/`extra_body`
+  inherit on **falsy** (a config `extra_body = {}` keeps the built-in's), while
+  `api_key_env` inherits on **absence** (extend `anthropic` with only an
+  `extra_body` and it still resolves `ANTHROPIC_API_KEY`). A *new* provider must
+  supply `base_url`, else an error. Parsing into a JSON value (not a defaulted
+  struct) is what preserves present-vs-absent.
+- Pass it to **`orchestrate`/`orchestrate_events` via `registry=`**; omitting it
+  uses the built-ins (the hermetic default — so a server migration must pass
+  `ModelRegistry.from_config()` or it silently regresses to built-ins).
+
+Verified by `tests/test_registry_conformance.py` (both merge idioms, new-provider
+`base_url` error, `${VAR}` expansion, missing-file → built-ins, and the loop
+resolving a **config-only** provider through `registry=` with *no* `base_url`
+override — so registry resolution is genuinely exercised), and **live**:
+`ModelRegistry.from_config()` resolves `ollama` and the request reaches it. The
+discovery fields (`models`/`discover`/`model_patterns`) and `/v1/models` are
+deferred (they don't feed the loop).
+
 ## Proven with lackpy (the thesis)
 
 lackpy's `WoollamaProvider` runs on this Rust core **unchanged** — its provider
@@ -116,11 +145,12 @@ this, so the server and lackpy both consume the Rust core directly.
 
 ## Deferred (later slices)
 
-Config-file (`inferencers.toml`) loading + an explicit `ModelRegistry`
-(orchestration uses built-in inferencers only); structured `InferenceError` fields
-(kind/status/payload); and packaging so this provides `woollama.core` for the
-server dist (the dist-split). With the loop now streaming, the remaining gap before
-the server can sit on the core is the registry + dist-split, not the loop itself.
+The registry's discovery fields (`models`/`discover`/`model_patterns`) + a
+`/v1/models` surface (they don't feed the recipe loop); structured `InferenceError`
+fields (kind/status/payload); and packaging so this provides `woollama.core` for the
+server dist (the **dist-split**). With the loop streaming *and* config-driven, the
+last gate before the server can sit on the core is the dist-split — the server just
+has to pass `ModelRegistry.from_config()` (opt-in, else it regresses to built-ins).
 
 ## Build & test
 
