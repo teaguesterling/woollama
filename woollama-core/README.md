@@ -43,21 +43,21 @@ Rust surface. Verified live against ollama (the provider's prompt-building → R
 `complete` → ollama → a generated lackpy program):
 
 ```python
-import sys, asyncio, woollama_core
-sys.modules["woollama.core"] = woollama_core          # point woollama.core at the Rust ext
-from lackpy.infer.providers.woollama import WoollamaProvider
+import asyncio
+from lackpy.infer.providers.woollama import WoollamaProvider  # does `from woollama.core import complete`
 
 p = WoollamaProvider(model="ollama/qwen3:14b-iq4xs", temperature=0.2)
 out = asyncio.run(p.generate("count the rows",
                   namespace_desc="kernel.select(expr)\nkernel.count()"))
 # -> 'count = kernel.count()\nprint(count)'   (generated via the Rust core)
-assert (__import__("woollama.core", fromlist=["complete"]).complete
-        is woollama_core.complete)
 ```
 
-The `sys.modules` swap is the *proof*; productionizing it is the packaging step
-(below): make `woollama-core` provide the `woollama.core` import path so the
-server and lackpy both consume the Rust core directly.
+The maturin build ships the extension at the `woollama.core` import path directly
+(`module-name = "woollama.core"`, a submodule of the PEP 420 `woollama`
+namespace), so `from woollama.core import complete` resolves to the Rust `complete`
+with no `sys.modules` swap. Productionizing is the remaining packaging step
+(below): make the server dist stop shipping its own `woollama.core` and depend on
+this, so the server and lackpy both consume the Rust core directly.
 
 ## Deferred (later slices)
 
@@ -70,6 +70,6 @@ Python `ToolProvider` callback.
 
 ```sh
 uv venv && uv pip install maturin pytest
-maturin develop                      # builds + installs `woollama_core` into the venv
+maturin develop                      # builds + installs `woollama.core` into the venv
 python -m pytest tests/ -q
 ```

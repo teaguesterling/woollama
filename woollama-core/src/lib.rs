@@ -23,7 +23,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-create_exception!(woollama_core, InferenceError, PyException);
+create_exception!(core, InferenceError, PyException);
 
 /// A resolved inference backend (OpenAI-compatible endpoint).
 #[derive(Clone)]
@@ -378,10 +378,16 @@ fn complete_stream(
     Ok(DeltaStream { state: Arc::new(Mutex::new(StreamState::Pending(req))) })
 }
 
+// `module-name = "woollama.core"` (pyproject) → the init symbol must be `PyInit_core`,
+// so this fn is named `core` (the last dotted component); `woollama` is the PEP 420 namespace.
 #[pymodule]
-fn woollama_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add("InferenceError", m.py().get_type::<InferenceError>())?;
+    // `create_exception!` can't take a dotted module ident, so its `__module__` is the bare
+    // `core`; relabel it to the real import path for clean reprs / pickling.
+    let exc = m.py().get_type::<InferenceError>();
+    exc.setattr("__module__", "woollama.core")?;
+    m.add("InferenceError", exc)?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
     m.add_function(wrap_pyfunction!(complete_sync, m)?)?;
     m.add_function(wrap_pyfunction!(complete_stream, m)?)?;

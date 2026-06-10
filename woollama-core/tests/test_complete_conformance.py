@@ -1,4 +1,4 @@
-"""Conformance tests for the Rust `woollama_core` — it must behave like
+"""Conformance tests for the Rust `woollama.core` — it must behave like
 `woollama.core` (Python), the oracle. We assert the same things the Python
 hermetic suite asserts (request shape, routing, params, auth, errors) against a
 threaded mock HTTP server.
@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-import woollama_core as wc
+from woollama import core as wc
 
 
 class _Mock(BaseHTTPRequestHandler):

@@ -1,1 +1,4 @@
 /target
+# maturin develop drops the compiled extension into the source tree:
+python/woollama/*.so
+__pycache__/

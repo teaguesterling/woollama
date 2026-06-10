@@ -1,0 +1,4 @@
+# PEP 420 namespace package dir for `woollama` — intentionally NO __init__.py.
+# maturin (python-source = "python") nests the compiled `core` extension here as
+# `core.*.so`. This .gitkeep only preserves the dir on checkout; the .so is a
+# build artifact (gitignored).

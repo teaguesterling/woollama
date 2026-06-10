@@ -13,7 +13,17 @@ classifiers = [
 ]
 
 [tool.maturin]
-# Pure-Rust extension; the module is the Cargo lib name (woollama_core).
+# Ship the extension as `woollama.core` — a submodule of the PEP 420 `woollama`
+# namespace (no woollama/__init__.py), so it IS the import the server + lackpy use:
+# `from woollama.core import complete`. The dist is `woollama-core`; the import is
+# `woollama.core`. (The server dist stops shipping its own woollama.core and depends
+# on this — the actual dist-split — as the productionization step.)
+module-name = "woollama.core"
+# The `woollama` parent is a PEP 420 namespace package provided by this source tree
+# (python/woollama/, no __init__.py). maturin nests the compiled `core` extension under
+# it → `woollama/core.*.so`, so `from woollama.core import complete` resolves to the
+# Rust ext directly (and `woollama` stays a shared namespace the server can also populate).
+python-source = "python"
 strip = true
 
 [tool.pytest.ini_options]
