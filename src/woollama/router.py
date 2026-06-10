@@ -37,7 +37,8 @@ from . import (
     responses,
 )
 from .core import inference as _inference
-from .manager import Registry, ServerManager
+from .core import orchestrate as _core_orchestrate
+from .manager import Registry, RegistryToolProvider, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
 log = logging.getLogger("woollama.router")
@@ -840,179 +841,12 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
         yield {"type": "final", "response": resp}
         return
 
-    inf = inferencers.get(provider)
-    if inf is None:
-        raise OrchestrationError(
-            f"unsupported inferencer '{inferencer}' (supported providers: "
-            f"{', '.join(inferencers.names())}, claude-code)", "not_implemented", 501)
-    try:
-        headers = inf.headers()           # fail fast on a missing API key
-    except inferencers.InferencerError as e:
-        raise OrchestrationError(str(e), "invalid_request_error", 400) from e
-
-    messages = [{"role": "system", "content": recipe["system"]}] + list(user_msgs)
-    inferencer_model = inferencer.split("/", 1)[1]
-
-    tools = reg.openai_tools_for(recipe["tools"])
-    # The recipe's allow-list is a BOUNDARY, not a hint: only these tools are
-    # offered to the model AND only these may be dispatched. If the model emits
-    # a tool_call for anything else (hallucination, or a name it shouldn't know),
-    # we refuse it below rather than reaching across to a provider the recipe was
-    # never granted. `openai_tools_for` preserves the namespaced name as the
-    # function name, so membership matches the emitted name directly.
-    allowed = set(recipe["tools"])
-    log.info("orchestrating: tools=%s inferencer=%s stream=%s",
-             [t["function"]["name"] for t in tools], inferencer, stream)
-
-    for turn in range(1, 9):
-        req = {
-            "model": inferencer_model,
-            "messages": messages,
-            "tools": tools,
-            "stream": bool(stream),
-            **inf.extra_body,             # provider-specific (Ollama options / Anthropic max_tokens)
-        }
-        if stream:
-            # Surface content deltas live; `acc` is filled with the turn's full
-            # message once the upstream stream ends.
-            acc: dict = {}
-            async for piece in _stream_turn(inf, req, headers, acc):
-                yield {"type": "delta", "content": piece}
-            content, calls, resp = acc["content"], acc["calls"], acc["response"]
-        else:
-            async with httpx.AsyncClient(timeout=180) as c:
-                r = await c.post(inf.chat_url(), json=req, headers=headers)
-                resp = r.json()
-            if "choices" not in resp:
-                log.warning("inferencer error: %s", resp)
-                raise OrchestrationError("inferencer error", "server_error", 502,
-                                         payload=resp)
-            msg = resp["choices"][0]["message"]
-            calls = msg.get("tool_calls") or []
-            content = msg.get("content") or ""
-
-        log.info("turn %d: content[%d] tool_calls=%d",
-                 turn, len(content), len(calls))
-
-        if not calls:
-            yield {"type": "final", "response": resp}
-            return
-
-        messages.append({"role": "assistant", "content": content,
-                         "tool_calls": calls})
-        for call in calls:
-            fn = call.get("function") or {}
-            namespaced = fn.get("name", "")
-            raw_args = fn.get("arguments") or "{}"
-            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            log.info("  → %s(%s)", namespaced, json.dumps(args)[:120])
-            # Tool-phase progress events (slice streaming-3): surfaced by the MCP
-            # `chat` tool as `ctx.info(...)` notifications. The HTTP adapters and
-            # the non-streaming drainer ignore every non-delta/final event, so
-            # these are free for those paths. Emitted in BOTH modes — the loop is
-            # mode-agnostic here, and the MCP path runs stream=False.
-            yield {"type": "tool_call", "turn": turn,
-                   "name": namespaced, "args": args}
-            if namespaced not in allowed:
-                # Refuse and feed the refusal back as the tool result (every
-                # tool_call needs a matching tool message, including denied
-                # ones) so the loop continues and the model can recover.
-                log.warning("recipe denied out-of-list tool '%s' (allow-list: %s)",
-                            namespaced, sorted(allowed))
-                ok = False
-                result = (f"ERROR: tool '{namespaced}' is not permitted by this "
-                          f"recipe (allowed: {sorted(allowed)})")
-            else:
-                try:
-                    r2 = await reg.dispatch(namespaced, args)
-                    parts = [c.text for c in r2.content if hasattr(c, "text")]
-                    result = "\n".join(parts) if parts else json.dumps(
-                        [c.model_dump() for c in r2.content], default=str)
-                    ok = True
-                except Exception as e:
-                    ok = False
-                    result = f"ERROR: {type(e).__name__}: {e}"
-            preview = (result[:80] + "…") if len(result) > 80 else result
-            log.info("  ← %s", preview)
-            yield {"type": "tool_result", "turn": turn,
-                   "name": namespaced, "ok": ok}
-            messages.append({
-                "role": "tool",
-                "content": result,
-                "tool_call_id": call.get("id", f"call_{turn}_{namespaced}"),
-            })
-
-    raise OrchestrationError("max turns (8) exceeded", "server_error", 500)
-
-
-async def _stream_turn(inf: inferencers.Inferencer, req: dict, headers: dict,
-                       acc: dict):
-    """Stream ONE inferencer turn over SSE. Yields assistant content delta
-    strings as they arrive; on completion fills `acc` with the turn's
-    accumulated `{content, calls, response}`.
-
-    Two things this owns: (1) the upstream per-turn `finish_reason` and `[DONE]`
-    are CONSUMED here and never surfaced — the orchestration stream is closed by
-    exactly one synthesized terminator regardless of turn count. (2) tool_call
-    deltas arrive FRAGMENTED across chunks (the `id` in one, `arguments`
-    piecemeal), so they're reassembled by `index`."""
-    content_parts: list[str] = []
-    calls_by_index: dict[int, dict] = {}
-    async with httpx.AsyncClient(timeout=180) as c:
-        async with c.stream("POST", inf.chat_url(), json=req, headers=headers) as r:
-            if r.status_code >= 400:
-                raw = await r.aread()
-                try:
-                    payload = json.loads(raw)
-                except (ValueError, TypeError):
-                    payload = {"error": {"message": raw.decode("utf-8", "replace")
-                                         or "inferencer error", "type": "server_error"}}
-                raise OrchestrationError("inferencer error", "server_error", 502,
-                                         payload=payload)
-            async for line in r.aiter_lines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
-                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
-                piece = delta.get("content")
-                if piece:
-                    content_parts.append(piece)
-                    yield piece
-                for tc in delta.get("tool_calls") or []:
-                    slot = calls_by_index.setdefault(
-                        tc.get("index", 0), {"id": None, "name": "", "arguments": ""})
-                    if tc.get("id"):
-                        slot["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        slot["name"] = fn["name"]
-                    if fn.get("arguments"):
-                        slot["arguments"] += fn["arguments"]
-
-    content = "".join(content_parts)
-    calls = [
-        {"id": s["id"] or f"call_{idx}", "type": "function",
-         "function": {"name": s["name"], "arguments": s["arguments"]}}
-        for idx, s in sorted(calls_by_index.items())
-    ]
-    acc["content"] = content
-    acc["calls"] = calls
-    acc["response"] = {
-        "object": "chat.completion",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content,
-                        "tool_calls": calls or None},
-            "finish_reason": "tool_calls" if calls else "stop",
-        }],
-    }
+    # The generic inferencer↔tool loop is the server-free core's job; the MCP
+    # tools reach it through the RegistryToolProvider adapter. (claude-code above
+    # is the one woollama-specific executor that stays here.)
+    async for ev in _core_orchestrate.orchestrate_events(
+            recipe, user_msgs, tools=RegistryToolProvider(reg), stream=stream):
+        yield ev
 
 
 async def _orchestrate_recipe(recipe: recipes.Recipe, body: dict) -> JSONResponse:
