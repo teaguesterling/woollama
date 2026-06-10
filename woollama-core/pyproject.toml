@@ -15,3 +15,7 @@ classifiers = [
 [tool.maturin]
 # Pure-Rust extension; the module is the Cargo lib name (woollama_core).
 strip = true
+
+[tool.pytest.ini_options]
+# Self-contained: don't inherit the parent woollama pyproject's pytest config.
+testpaths = ["tests"]

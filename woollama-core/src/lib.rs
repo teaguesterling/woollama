@@ -2,13 +2,15 @@
 //! of the woollama v1.0 Rust port.
 //!
 //! Slice 1 scope (callback-free, fully serves lackpy): the built-in inferencer
-//! registry + `complete` (HTTP inference, incl. ollama-native num_ctx routing and
-//! per-call api_key/base_url overrides). Behavior mirrors `woollama.core.complete`
-//! in Python; the Python hermetic suite is the conformance oracle.
+//! registry + `complete` (async) / `complete_sync` (HTTP inference, incl.
+//! ollama-native num_ctx routing and per-call api_key/base_url overrides).
+//! Behavior mirrors `woollama.core.complete` in Python; the Python hermetic suite
+//! is the conformance oracle.
 //!
-//! Deferred (later slices): config-file (`inferencers.toml`) loading, an explicit
-//! `ModelRegistry` object, `complete_stream` (SSE), structured `InferenceError`
-//! fields (kind/status/payload), and the recipe loop + Python `ToolProvider`.
+//! Deferred (later slices): `complete_stream` (SSE), config-file
+//! (`inferencers.toml`) loading, an explicit `ModelRegistry`, structured
+//! `InferenceError` fields (kind/status/payload), and the recipe loop + the Python
+//! `ToolProvider`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -16,6 +18,7 @@ use std::time::Duration;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
+use pyo3_async_runtimes::tokio::future_into_py;
 use serde_json::{json, Value};
 
 create_exception!(woollama_core, InferenceError, PyException);
@@ -56,8 +59,6 @@ fn known_providers() -> &'static [&'static str] {
     &["ollama", "anthropic", "openai", "groq", "together", "openrouter"]
 }
 
-/// Auth headers; a per-call `api_key` overrides the env lookup (fail-fast with a
-/// clear message if the configured key env is unset).
 fn build_headers(inf: &Inferencer, api_key: Option<&str>) -> Result<HashMap<String, String>, String> {
     if let Some(k) = api_key {
         return Ok(HashMap::from([("Authorization".to_string(), format!("Bearer {k}"))]));
@@ -80,29 +81,30 @@ fn split_model(model: &str) -> (String, String) {
     }
 }
 
-fn as_object(v: &Option<Value>) -> Option<&serde_json::Map<String, Value>> {
+fn obj(v: &Option<Value>) -> Option<&serde_json::Map<String, Value>> {
     v.as_ref().and_then(Value::as_object)
 }
 
-/// Run one stateless turn against `<provider>/<model>` and return the assistant
-/// text. `options` carries ollama-native knobs (e.g. `num_ctx` → native /api/chat);
-/// `params` are top-level OpenAI request fields (temperature, …).
-#[pyfunction]
-#[pyo3(signature = (model, messages, *, options=None, params=None, api_key=None, base_url=None))]
-fn complete(
-    py: Python<'_>,
-    model: String,
-    messages: Bound<'_, PyAny>,
-    options: Option<Bound<'_, PyAny>>,
-    params: Option<Bound<'_, PyAny>>,
-    api_key: Option<String>,
-    base_url: Option<String>,
-) -> PyResult<String> {
-    let msgs: Value = pythonize::depythonize(&messages)?;
-    let opts: Option<Value> = options.map(|o| pythonize::depythonize(&o)).transpose()?;
-    let prms: Option<Value> = params.map(|p| pythonize::depythonize(&p)).transpose()?;
+/// Everything needed to issue one request — all `Send`, so it can move into the
+/// async block. Building it is synchronous and can raise (unknown provider /
+/// missing key), which we do BEFORE going async.
+struct Request {
+    url: String,
+    body: Value,
+    headers: HashMap<String, String>,
+    timeout: u64,
+    native: bool,
+}
 
-    let (provider, bare) = split_model(&model);
+fn build_request(
+    model: &str,
+    msgs: Value,
+    opts: Option<Value>,
+    prms: Option<Value>,
+    api_key: Option<&str>,
+    base_url: Option<String>,
+) -> PyResult<Request> {
+    let (provider, bare) = split_model(model);
     let inf = get_inferencer(&provider).ok_or_else(|| {
         InferenceError::new_err(format!(
             "unknown model namespace: '{model}'. Use 'woollama/<recipe>' or \
@@ -114,17 +116,14 @@ fn complete(
         .unwrap_or_else(|| inf.base_url.clone())
         .trim_end_matches('/')
         .to_string();
-    let headers = build_headers(&inf, api_key.as_deref()).map_err(InferenceError::new_err)?;
+    let headers = build_headers(&inf, api_key).map_err(InferenceError::new_err)?;
 
     let native = provider == "ollama"
-        && as_object(&opts)
-            .and_then(|o| o.get("num_ctx"))
-            .map_or(false, |v| !v.is_null());
+        && obj(&opts).and_then(|o| o.get("num_ctx")).map_or(false, |v| !v.is_null());
 
     let (url, body, timeout) = if native {
-        // On the native path temperature et al. live inside `options`.
         let mut native_opts = opts.clone().unwrap_or_else(|| json!({}));
-        if let (Some(no), Some(po)) = (native_opts.as_object_mut(), as_object(&prms)) {
+        if let (Some(no), Some(po)) = (native_opts.as_object_mut(), obj(&prms)) {
             for (k, v) in po {
                 no.insert(k.clone(), v.clone());
             }
@@ -140,30 +139,19 @@ fn complete(
         if let Some(o) = &opts {
             body["options"] = o.clone();
         }
-        if let Some(po) = as_object(&prms) {
+        if let Some(po) = obj(&prms) {
             for (k, v) in po {
                 body[k] = v.clone(); // top-level OpenAI fields (temperature, …)
             }
         }
         (format!("{base}/chat/completions"), body, 180)
     };
+    Ok(Request { url, body, headers, timeout, native })
+}
 
-    // Blocking HTTP off the GIL so Python stays responsive.
-    let data: Value = py
-        .allow_threads(move || -> Result<Value, String> {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let mut req = client.post(&url).json(&body);
-            for (k, v) in &headers {
-                req = req.header(k, v);
-            }
-            let resp = req.send().map_err(|e| e.to_string())?;
-            resp.json::<Value>().map_err(|e| e.to_string())
-        })
-        .map_err(|e| InferenceError::new_err(format!("inferencer error: {e}")))?;
-
+/// Pull the assistant text out of the (native or /v1) response, or `Err(msg)` on
+/// the upstream-error case. `Send` error so it works inside the async block.
+fn parse_response(data: &Value, native: bool) -> Result<String, String> {
     let content = if native {
         data.get("message").and_then(|m| m.get("content")).and_then(Value::as_str)
     } else {
@@ -173,17 +161,80 @@ fn complete(
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str)
     };
+    let present = if native { data.get("message").is_some() } else { data.get("choices").is_some() };
     match content {
         Some(s) => Ok(s.to_string()),
-        // Python returns "" when content is present-but-null; an absent
-        // message/choices is the upstream-error case.
-        None if (native && data.get("message").is_some())
-            || (!native && data.get("choices").is_some()) =>
-        {
-            Ok(String::new())
-        }
-        None => Err(InferenceError::new_err(format!("inferencer error: {data}"))),
+        None if present => Ok(String::new()), // content present-but-null → ""
+        None => Err(format!("inferencer error: {data}")),
     }
+}
+
+fn depy(v: &Option<Bound<'_, PyAny>>) -> PyResult<Option<Value>> {
+    v.as_ref().map(pythonize::depythonize).transpose().map_err(Into::into)
+}
+
+/// Run one stateless turn against `<provider>/<model>` and return the assistant
+/// text — an awaitable (so `await complete(...)` works for async embedders).
+#[pyfunction]
+#[pyo3(signature = (model, messages, *, options=None, params=None, api_key=None, base_url=None))]
+fn complete<'py>(
+    py: Python<'py>,
+    model: String,
+    messages: Bound<'py, PyAny>,
+    options: Option<Bound<'py, PyAny>>,
+    params: Option<Bound<'py, PyAny>>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let msgs: Value = pythonize::depythonize(&messages)?;
+    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url)?;
+    future_into_py(py, async move {
+        let out: Result<String, String> = async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(req.timeout))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let mut rb = client.post(&req.url).json(&req.body);
+            for (k, v) in &req.headers {
+                rb = rb.header(k, v);
+            }
+            let resp = rb.send().await.map_err(|e| e.to_string())?;
+            let data: Value = resp.json().await.map_err(|e| e.to_string())?;
+            parse_response(&data, req.native)
+        }
+        .await;
+        out.map_err(InferenceError::new_err)
+    })
+}
+
+/// Synchronous variant — for non-async embedders. HTTP runs off the GIL.
+#[pyfunction]
+#[pyo3(signature = (model, messages, *, options=None, params=None, api_key=None, base_url=None))]
+fn complete_sync(
+    py: Python<'_>,
+    model: String,
+    messages: Bound<'_, PyAny>,
+    options: Option<Bound<'_, PyAny>>,
+    params: Option<Bound<'_, PyAny>>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> PyResult<String> {
+    let msgs: Value = pythonize::depythonize(&messages)?;
+    let req = build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url)?;
+    py.allow_threads(move || -> Result<String, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(req.timeout))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut rb = client.post(&req.url).json(&req.body);
+        for (k, v) in &req.headers {
+            rb = rb.header(k, v);
+        }
+        let resp = rb.send().map_err(|e| e.to_string())?;
+        let data = resp.json::<Value>().map_err(|e| e.to_string())?;
+        parse_response(&data, req.native)
+    })
+    .map_err(InferenceError::new_err)
 }
 
 /// The built-in provider names (introspection / parity with `inferencers.names()`).
@@ -197,6 +248,7 @@ fn woollama_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("InferenceError", m.py().get_type::<InferenceError>())?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
+    m.add_function(wrap_pyfunction!(complete_sync, m)?)?;
     m.add_function(wrap_pyfunction!(provider_names, m)?)?;
     Ok(())
 }

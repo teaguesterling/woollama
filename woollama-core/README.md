@@ -16,22 +16,26 @@ Callback-free, and enough to fully serve lackpy (which only needs `complete`):
 
 - the **built-in inferencer registry** (ollama / anthropic / openai / groq /
   together / openrouter; ollama honors `$WOOLLAMA_OLLAMA_URL`);
-- **`complete(model, messages, *, options, params, api_key, base_url)`** — one
-  stateless turn against `<provider>/<model>`, with ollama-native `num_ctx`
-  routing (→ `/api/chat`), top-level `params` (temperature, …), and per-call
-  `api_key`/`base_url` overrides; HTTP runs off the GIL;
+- **`complete(model, messages, *, options, params, api_key, base_url)`** — an
+  **awaitable** (`await complete(...)`, the drop-in for async embedders like
+  lackpy), backed by async `reqwest` on a tokio runtime (pyo3-async-runtimes);
+- **`complete_sync(...)`** — the blocking variant (HTTP off the GIL);
+- both do ollama-native `num_ctx` routing (→ `/api/chat`), top-level `params`
+  (temperature, …), and per-call `api_key`/`base_url` overrides;
 - **`InferenceError`** + `provider_names()`.
 
-Behavior mirrors `woollama.core.complete` (Python) exactly — verified by
+Behavior mirrors `woollama.core.complete` (Python) — verified by
 `tests/test_complete_conformance.py` (request shape, routing, params, auth,
-fail-fast on missing key, unknown provider) and live against ollama.
+fail-fast on missing key, unknown provider; sync + the async awaitable) and live
+against ollama. One minor difference: the async awaitable binds to the running
+event loop at creation, so it must be created inside the loop (moot for the embed
+case — lackpy always `await`s inside an async function).
 
 ## Deferred (later slices)
 
-`complete_stream` (SSE), async bindings (pyo3-async-runtimes, so `await complete`
-works unchanged for embedders), config-file (`inferencers.toml`) loading, an
-explicit `ModelRegistry`, structured `InferenceError` fields (kind/status/payload),
-and the recipe loop + the Python `ToolProvider` callback.
+`complete_stream` (SSE), config-file (`inferencers.toml`) loading, an explicit
+`ModelRegistry`, structured `InferenceError` fields (kind/status/payload), and the
+recipe loop + the Python `ToolProvider` callback.
 
 ## Build & test
 
