@@ -144,11 +144,20 @@ is not ignored; it has a precedence, chosen so a lackpy interpreter whose
 - `complete` (raw, no recipe) does **no** system handling — the caller's
   `messages` are authoritative and carry their own system if they want one.
 
-So a static prompt lives in `Recipe.system`; a dynamic prompt is passed per call
-via `system=`; the recipe is the *vehicle* and the caller owns it. (Current code:
-`recipes.Recipe` is a TypedDict `{inferencer, tools, system}` loaded from
-`recipes.toml`; the move makes it an in-memory-constructible dataclass with the
-TOML loader as just one producer.)
+So a static prompt lives in the recipe's `system`; a dynamic prompt is just set
+on the recipe the caller builds per run; the recipe is the *vehicle* and the
+caller owns it.
+
+> **Implemented (Phase 4) — refinement from the sketch above.** `Recipe` stays a
+> **TypedDict**, not a dataclass: it's a plain dict, so it's *already*
+> in-memory-constructible (tests pass literal dicts to `orchestrate`), and a
+> dataclass would have churned every `recipe["..."]` access site plus the
+> `inferencer`→`model` rename for ~zero gain. So: the field stays `inferencer`
+> (it already *is* `"provider/model"`); an optional `params` (merged into each
+> request) is added; `core.make_recipe(inferencer, system, tools, params)` is the
+> ergonomic constructor; and the per-call `system=` override was dropped as
+> redundant — a per-run prompt is just `recipe["system"]` on the freshly-built
+> recipe. The TOML loader is now one of several producers, as intended.
 
 `orchestrate_events` stays the **single source of truth** for the loop
 (system-prepend, allow-list boundary, tool dispatch, max-turns guard); the
@@ -288,19 +297,28 @@ once, in its `tools_for`/`dispatch` adapter — woollama-core never sees the mes
 
 Each step ships independently; the hermetic suite stays green throughout.
 
-1. **Create `woollama/core/`; move the import-clean modules** (`config`,
+1. ✅ **Create `woollama/core/`; move the import-clean modules** (`config`,
    `inferencers`, `recipes`, `ollama_native`) in, leaving re-export shims at the
-   old paths (zero behaviour change). Add `test_core_is_server_free.py`.
-2. **Extract `core/inference.py`** (`complete` / `complete_stream`) from the
+   old paths (zero behaviour change). Add `test_core_is_server_free.py`. *(Shims
+   are `sys.modules` aliases — same module object, so monkeypatch targets are
+   shared.)*
+2. ✅ **Extract `core/inference.py`** (`complete` / `complete_stream`) from the
    router's non-recipe path; the router calls it. Add per-call `api_key`/`base_url`.
-3. **Move `orchestrate` / `orchestrate_events` → `core/orchestrate.py`**,
+3. ✅ **Move `orchestrate` / `orchestrate_events` → `core/orchestrate.py`**,
    parameterised on `ToolProvider`; define `ToolProvider`/`ToolSpec`/`ToolResult`/
    `Capabilities` + `TextRenderer` in `core/tooling.py`; adapt `manager.Registry`
-   to satisfy the protocol (incl. the `server.tool ↔ server__tool` name round-trip
-   and carrying `isError`/`annotations`).
-4. **Add `ModelRegistry`, the in-memory `Recipe` dataclass, sync wrappers.**
-5. **Delete the shims; update server imports to `woollama.core`.** Optionally split
-   a `woollama-core` distribution once the boundary has held.
+   via a `RegistryToolProvider` adapter (Registry itself unchanged — the MCP proxy
+   still gets the raw `CallToolResult`); carries `isError`/`annotations`. *(The
+   `server.tool → server__tool` name round-trip is DEFERRED: dotted names work
+   with ollama and renaming risks the allow-list/recipe matching — a later
+   improvement.)* The claude-code executor stays server-side; the router
+   dispatches to core for everything else.
+4. ✅ **Add `ModelRegistry` + sync wrapper (`complete_sync`); keep `Recipe` a
+   TypedDict** (already embeddable) with an optional `params` + `make_recipe`
+   constructor — see the Phase 4 note under "Recipes" for why the dataclass was
+   dropped.
+5. ⬜ **Delete the shims; update server imports to `woollama.core`.** Optionally
+   split a `woollama-core` distribution once the boundary has held.
 
 ## Decisions
 

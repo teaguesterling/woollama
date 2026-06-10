@@ -180,10 +180,15 @@ def load_recipes() -> dict[str, recipes_module.Recipe]:
         if not isinstance(entry["tools"], list):
             raise ValueError(
                 f"recipes.toml {source}: recipe '{name}': 'tools' must be a list")
+        params = entry.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError(
+                f"recipes.toml {source}: recipe '{name}': 'params' must be a table")
         out[name] = {
             "inferencer": entry["inferencer"],
             "tools": list(entry["tools"]),
             "system": entry["system"].strip(),
+            "params": params,
         }
     log.info("loaded %d recipe(s) from %s: %s",
              len(out), source, list(out.keys()))

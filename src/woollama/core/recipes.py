@@ -11,16 +11,27 @@ at dispatch time and routes to the owning server.
 """
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class Recipe(TypedDict):
     """A composed addressable thing: a system prompt + an inferencer + an
-    allow-list of namespaced tools the model may use."""
+    allow-list of namespaced tools the model may use. A plain dict — so an embedder
+    builds one in code (or via `make_recipe`); the TOML loader is just one producer."""
 
     inferencer: str        # "<provider>/<model>" — only "ollama/X" in v0.1
     system: str            # system prompt prepended to the conversation
     tools: list[str]       # `<server>.<tool>` names — see manager.Registry
+    params: NotRequired[dict]   # per-recipe inference overrides (temperature, …)
+
+
+def make_recipe(inferencer: str, system: str = "", tools=(),
+                params: dict | None = None) -> Recipe:
+    """Build a `Recipe` in code (for embedders — no TOML). `tools` is the allow-list
+    of namespaced `<server>.<tool>` names; `params` are per-recipe inference
+    overrides merged into each request."""
+    return {"inferencer": inferencer, "system": system,
+            "tools": list(tools), "params": dict(params or {})}
 
 
 # Populated lazily on first access; reloaded if `reload()` is called.

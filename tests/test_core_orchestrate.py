@@ -113,6 +113,15 @@ async def test_orchestrate_runs_tool_then_finalizes(monkeypatch):
     assert _SeqClient.posts[0]["messages"][0] == {"role": "system", "content": "sys"}
 
 
+async def test_orchestrate_merges_recipe_params(monkeypatch):
+    """A recipe's optional `params` (e.g. temperature) are merged into the request."""
+    _seq(monkeypatch, [_final_turn("ok")])
+    recipe = {"inferencer": "ollama/qwen3", "system": "s", "tools": [],
+              "params": {"temperature": 0.5}}
+    await _drain(recipe, FakeTools(ToolResult()))
+    assert _SeqClient.posts[0]["temperature"] == 0.5
+
+
 async def test_orchestrate_no_tools_single_turn(monkeypatch):
     _seq(monkeypatch, [_final_turn("hello")])
     events = await _drain({"inferencer": "ollama/qwen3", "system": "s", "tools": []},

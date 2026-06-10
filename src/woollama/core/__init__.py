@@ -11,12 +11,17 @@ paths (`woollama.config`, `woollama.inferencers`, `woollama.recipes`,
 `woollama.ollama_native`) still work via alias shims (see `docs/core-extraction.md`).
 """
 from . import config, inference, inferencers, ollama_native, orchestrate, recipes  # noqa: F401
-from .inference import InferenceError, complete, complete_stream  # noqa: F401
-from .inferencers import Inferencer, InferencerError  # noqa: F401
+from .inference import (  # noqa: F401
+    InferenceError,
+    complete,
+    complete_stream,
+    complete_sync,
+)
+from .inferencers import Inferencer, InferencerError, ModelRegistry  # noqa: F401
 from .orchestrate import (
     orchestrate_events,  # noqa: F401  (the `orchestrate()` drainer is core.orchestrate.orchestrate)
 )
-from .recipes import Recipe  # noqa: F401
+from .recipes import Recipe, make_recipe  # noqa: F401
 from .tooling import (  # noqa: F401
     Capabilities,
     ToolProvider,

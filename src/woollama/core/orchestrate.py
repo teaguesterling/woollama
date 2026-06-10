@@ -31,11 +31,13 @@ _HTTP_TIMEOUT = 180.0
 
 
 async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict], *,
-                      tools: ToolProvider) -> dict:
+                      tools: ToolProvider,
+                      registry: "inferencers.ModelRegistry | None" = None) -> dict:
     """Run a recipe end-to-end and return the final OpenAI-shaped response dict.
     A thin drainer over `orchestrate_events` (keeps the terminal `final`)."""
     final: dict | None = None
-    async for ev in orchestrate_events(recipe, user_msgs, tools=tools, stream=False):
+    async for ev in orchestrate_events(recipe, user_msgs, tools=tools,
+                                       registry=registry, stream=False):
         if ev["type"] == "final":
             final = ev["response"]
     assert final is not None, "orchestrate_events always yields a final or raises"
@@ -44,19 +46,24 @@ async def orchestrate(recipe: recipes.Recipe, user_msgs: list[dict], *,
 
 async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict], *,
                              tools: ToolProvider,
+                             registry: "inferencers.ModelRegistry | None" = None,
                              stream: bool = False) -> AsyncIterator[dict]:
     """The recipe loop as an async generator. Yields `delta` (content, stream
     only), `tool_call` / `tool_result` (progress, both modes), and one terminal
     `final` (the OpenAI response dict). Raises `InferenceError` on unsupported
-    inferencer / inferencer error / max turns. (See module docstring.)"""
+    inferencer / inferencer error / max turns. Resolves the inferencer against an
+    explicit `registry` when given, else the module-level (config) lookup. The
+    recipe's optional `params` (e.g. `{"temperature": 0.2}`) are merged into each
+    request. (See module docstring.)"""
     inferencer = recipe["inferencer"]
     provider = inferencer.split("/", 1)[0]
 
-    inf = inferencers.get(provider)
+    inf = registry.get(provider) if registry is not None else inferencers.get(provider)
     if inf is None:
+        known = registry.names() if registry is not None else inferencers.names()
         raise InferenceError(
             f"unsupported inferencer '{inferencer}' (supported providers: "
-            f"{', '.join(inferencers.names())}, claude-code)", "not_implemented", 501)
+            f"{', '.join(known)}, claude-code)", "not_implemented", 501)
     try:
         headers = inf.headers()           # fail fast on a missing API key
     except inferencers.InferencerError as e:
@@ -82,6 +89,7 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict], *,
             "tools": schemas,
             "stream": bool(stream),
             **inf.extra_body,             # provider-specific (Ollama options / Anthropic max_tokens)
+            **(recipe.get("params") or {}),   # per-recipe overrides (temperature, …)
         }
         if stream:
             acc: dict = {}

@@ -12,6 +12,7 @@ env-var-only model was a real library limitation).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -40,16 +41,19 @@ class InferenceError(Exception):
         self.payload = payload
 
 
-def _resolve(model: str, base_url: str | None) -> tuple:
+def _resolve(model: str, base_url: str | None,
+             registry: "inferencers.ModelRegistry | None") -> tuple:
     """Return `(inferencer, bare_model, effective_base)` for a `<provider>/<model>`
-    id, or raise `InferenceError` if the provider is unknown."""
+    id, or raise `InferenceError` if the provider is unknown. Resolves against an
+    explicit `registry` when given, else the module-level (config) lookup."""
     provider = model.split("/", 1)[0]
-    inf = inferencers.get(provider)
+    inf = registry.get(provider) if registry is not None else inferencers.get(provider)
     if inf is None:
+        known = registry.names() if registry is not None else inferencers.names()
         raise InferenceError(
             f"unknown model namespace: '{model}'. Use 'woollama/<recipe>' or "
             f"'<provider>/<model>' for a known inferencer "
-            f"({', '.join(inferencers.names())}).", "invalid_request_error", 400)
+            f"({', '.join(known)}).", "invalid_request_error", 400)
     bare = model.split("/", 1)[1] if "/" in model else ""
     return inf, bare, (base_url or inf.base_url).rstrip("/")
 
@@ -64,13 +68,14 @@ def _headers(inf, api_key: str | None) -> dict[str, str]:
 
 
 async def complete(model: str, messages: list[dict], *, options: dict | None = None,
-                   api_key: str | None = None, base_url: str | None = None) -> str:
+                   api_key: str | None = None, base_url: str | None = None,
+                   registry: "inferencers.ModelRegistry | None" = None) -> str:
     """Run one stateless turn against `<provider>/<model>` and return the assistant
     text. `options` carries ollama-native knobs (e.g. `num_ctx`): when present for
     the ollama provider the turn goes through the native `/api/chat` (which honors
     them), translating the native reply back to text."""
     provider = model.split("/", 1)[0]
-    inf, bare, base = _resolve(model, base_url)
+    inf, bare, base = _resolve(model, base_url, registry)
     headers = _headers(inf, api_key)
 
     if provider == "ollama" and options and options.get("num_ctx") is not None:
@@ -96,12 +101,14 @@ async def complete(model: str, messages: list[dict], *, options: dict | None = N
 
 async def complete_stream(model: str, messages: list[dict], *,
                           api_key: str | None = None,
-                          base_url: str | None = None) -> AsyncIterator[str]:
+                          base_url: str | None = None,
+                          registry: "inferencers.ModelRegistry | None" = None
+                          ) -> AsyncIterator[str]:
     """Yield assistant TEXT DELTAS for one stateless turn against
     `<provider>/<model>` (the inferencer's `/v1` SSE; `num_ctx`-native routing is
     non-stream only for now). Raises `InferenceError` before the first yield for the
     setup / upstream-status error cases, so the caller can map it to a status."""
-    inf, bare, base = _resolve(model, base_url)
+    inf, bare, base = _resolve(model, base_url, registry)
     headers = _headers(inf, api_key)
     req = {"model": bare, "messages": messages, "stream": True}
     client = httpx.AsyncClient(timeout=_HTTP_TIMEOUT)
@@ -134,3 +141,11 @@ async def complete_stream(model: str, messages: list[dict], *,
     finally:
         await cm.__aexit__(None, None, None)
         await client.aclose()
+
+
+def complete_sync(model: str, messages: list[dict], **kwargs) -> str:
+    """Synchronous wrapper over `complete` for non-async embedders — spins a fresh
+    event loop via `asyncio.run`. Raises `RuntimeError` if called from inside a
+    running loop (use the async `complete` there). Accepts the same keyword args
+    (`options` / `api_key` / `base_url` / `registry`)."""
+    return asyncio.run(complete(model, messages, **kwargs))
