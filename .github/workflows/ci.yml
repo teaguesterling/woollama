@@ -7,6 +7,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]          # a vX.Y.Z tag runs the gate, then publishes (below)
   pull_request:
 
 concurrency:
@@ -44,3 +45,31 @@ jobs:
       # `integration` marker, so CI needs no Ollama / Claude / API keys.
       - name: Hermetic tests
         run: uv run --extra dev pytest
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Publishes to PyPI on a `vX.Y.Z` tag, AFTER the gate passes, via PyPI      │
+  # │ Trusted Publishing (OIDC — no token in the repo). ONE-TIME SETUP before   │
+  # │ the first tagged publish works:                                           │
+  # │   1. PyPI → the `woollama` project → Publishing → add a GitHub Actions    │
+  # │      trusted publisher: owner `teaguesterling`, repo `woollama`,          │
+  # │      workflow `ci.yml`, environment `pypi`.                               │
+  # │   2. GitHub → repo Settings → Environments → create `pypi`.               │
+  # │ Until both exist, this job fails (harmlessly) — publish that release      │
+  # │ manually with `uv publish`.                                               │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # OIDC: mint the short-lived PyPI token
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: uv build
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
