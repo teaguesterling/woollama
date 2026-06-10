@@ -1,16 +1,19 @@
 //! woollama-core (Rust) — the embeddable model-management core, the first slice
 //! of the woollama v1.0 Rust port.
 //!
-//! Slice 1 scope (callback-free, fully serves lackpy): the built-in inferencer
-//! registry + `complete` (async) / `complete_sync` (HTTP inference, incl.
+//! Slice 1 (callback-free, fully serves lackpy): the built-in inferencer registry
+//! + `complete` / `complete_sync` / `complete_stream` (HTTP inference, incl.
 //! ollama-native num_ctx routing and per-call api_key/base_url overrides).
-//! Behavior mirrors `woollama.core.complete` in Python; the Python hermetic suite
-//! is the conformance oracle.
 //!
-//! Deferred (later slices): `complete_stream` (SSE), config-file
-//! (`inferencers.toml`) loading, an explicit `ModelRegistry`, structured
-//! `InferenceError` fields (kind/status/payload), and the recipe loop + the Python
-//! `ToolProvider`.
+//! Slice 2 (the recipe↔tool loop): `orchestrate` — the drainer that runs a recipe
+//! against an inferencer, dispatching its allow-listed tools through a Python
+//! `ToolProvider` (the callback seam) and returning the final OpenAI dict.
+//!
+//! Behavior mirrors `woollama.core` in Python; its hermetic suite is the
+//! conformance oracle. Deferred (later slices): the per-event generator
+//! (`orchestrate_events`) + streamed orchestration; config-file
+//! (`inferencers.toml`) loading + an explicit `ModelRegistry`; structured
+//! `InferenceError` fields (kind/status/payload).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,15 +34,21 @@ struct Inferencer {
     name: String,
     base_url: String,
     api_key_env: Option<String>,
+    /// Provider-specific request fields merged into each ORCHESTRATION request
+    /// (NOT into `complete` — there the caller owns the body). Mirrors
+    /// `inferencers.Inferencer.extra_body`: ollama keeps its native `options`,
+    /// anthropic gets a sane max_tokens, clouds get temperature=0 for determinism.
+    extra_body: Value,
 }
 
-/// The built-in providers — same set/URLs as `woollama.core.inferencers`. ollama's
-/// base honors `$WOOLLAMA_OLLAMA_URL`. (Config-file providers are a later slice.)
+/// The built-in providers — same set/URLs/extra_body as `woollama.core.inferencers`.
+/// ollama's base honors `$WOOLLAMA_OLLAMA_URL`. (Config-file providers are a later slice.)
 fn get_inferencer(provider: &str) -> Option<Inferencer> {
-    let owned = |n: &str, b: &str, k: Option<&str>| Inferencer {
+    let cloud = |n: &str, b: &str, k: &str| Inferencer {
         name: n.to_string(),
         base_url: b.to_string(),
-        api_key_env: k.map(str::to_string),
+        api_key_env: Some(k.to_string()),
+        extra_body: json!({"temperature": 0}),
     };
     match provider {
         "ollama" => Some(Inferencer {
@@ -47,12 +56,18 @@ fn get_inferencer(provider: &str) -> Option<Inferencer> {
             base_url: std::env::var("WOOLLAMA_OLLAMA_URL")
                 .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             api_key_env: None,
+            extra_body: json!({"options": {"temperature": 0}}),
         }),
-        "anthropic" => Some(owned("anthropic", "https://api.anthropic.com/v1", Some("ANTHROPIC_API_KEY"))),
-        "openai" => Some(owned("openai", "https://api.openai.com/v1", Some("OPENAI_API_KEY"))),
-        "groq" => Some(owned("groq", "https://api.groq.com/openai/v1", Some("GROQ_API_KEY"))),
-        "together" => Some(owned("together", "https://api.together.ai/v1", Some("TOGETHER_API_KEY"))),
-        "openrouter" => Some(owned("openrouter", "https://openrouter.ai/api/v1", Some("OPENROUTER_API_KEY"))),
+        "anthropic" => Some(Inferencer {
+            name: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            extra_body: json!({"temperature": 0, "max_tokens": 4096}),
+        }),
+        "openai" => Some(cloud("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")),
+        "groq" => Some(cloud("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")),
+        "together" => Some(cloud("together", "https://api.together.ai/v1", "TOGETHER_API_KEY")),
+        "openrouter" => Some(cloud("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY")),
         _ => None,
     }
 }
@@ -248,6 +263,230 @@ fn provider_names() -> Vec<String> {
     known_providers().iter().map(|s| s.to_string()).collect()
 }
 
+// --- orchestrate (the recipe↔tool loop) --------------------------------------
+
+/// `"{TypeName}: {message}"` for a caught Python error — matches the Python loop's
+/// `f"{type(e).__name__}: {e}"` when a dispatch raises (orchestrate.py:141).
+fn pyerr_brief(e: &PyErr) -> String {
+    Python::with_gil(|py| {
+        let tn = e
+            .get_type(py)
+            .name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "Error".to_string());
+        let val = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
+        format!("{tn}: {val}")
+    })
+}
+
+/// Render a Python `ToolResult` (duck-typed: `.blocks` list, `.is_error` bool; each
+/// block has `.text` and/or `.model_dump()`) into the `tool` message content —
+/// reproducing `tooling.render_tool_result` for text-only `DEFAULT_CAPS`.
+/// Reimplemented in Rust (reading attrs) so the core never imports Python woollama.
+fn render_tool_result_rs(result: &Bound<'_, PyAny>) -> PyResult<String> {
+    let is_error: bool = result
+        .getattr("is_error")
+        .and_then(|v| v.extract())
+        .unwrap_or(false);
+    let blocks = result.getattr("blocks")?;
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut dumped: Vec<Value> = Vec::new(); // the JSON fallback (used only if no text block)
+    let mut any_block = false;
+    for b in blocks.try_iter()? {
+        let b = b?;
+        any_block = true;
+        // text block: `.text` that is a str → goes to the join (matches `_block_text`)
+        if let Ok(t) = b.getattr("text") {
+            if let Ok(s) = t.extract::<String>() {
+                text_parts.push(s);
+                continue;
+            }
+        }
+        // non-text: `_block_dump` = model_dump() if callable, else the block itself
+        let v: Value = match b.getattr("model_dump") {
+            Ok(md) if md.is_callable() => md
+                .call0()
+                .ok()
+                .and_then(|d| pythonize::depythonize(&d).ok())
+                .unwrap_or(Value::Null),
+            _ => pythonize::depythonize(&b).unwrap_or(Value::Null),
+        };
+        dumped.push(v);
+    }
+    let mut body = if !text_parts.is_empty() {
+        text_parts.join("\n")
+    } else if any_block {
+        serde_json::to_string(&dumped).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if is_error {
+        body = if body.is_empty() { "[tool error]".to_string() } else { format!("[tool error] {body}") };
+    }
+    Ok(body)
+}
+
+/// Run a recipe end-to-end and return the final OpenAI-shaped response dict (the
+/// drainer — `core.orchestrate`, NOT the event generator `orchestrate_events`).
+///
+/// Prepends the recipe's system prompt, offers its allow-listed tools, dispatches
+/// the ones the model calls through the Python `tools` `ToolProvider`
+/// (`tools_for(allow) -> [ToolSpec]`, async `dispatch(name, args) -> ToolResult`),
+/// feeds results back, repeats (≤8 turns). The allow-list is a BOUNDARY: a call for
+/// anything off it is refused (the refusal is fed back as the tool result so the
+/// loop recovers); a dispatch that raises becomes an `ERROR: …` tool result, never
+/// propagating (matches orchestrate.py:139-141). Built-in inferencers only; an
+/// explicit `registry`, streaming, and the per-event generator are deferred.
+#[pyfunction]
+#[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None))]
+fn orchestrate<'py>(
+    py: Python<'py>,
+    recipe: Bound<'py, PyAny>,
+    user_msgs: Bound<'py, PyAny>,
+    tools: Bound<'py, PyAny>,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // --- synchronous setup (under GIL); fail fast before going async ---
+    let rv: Value = pythonize::depythonize(&recipe)?;
+    let inferencer = rv
+        .get("inferencer")
+        .and_then(Value::as_str)
+        .ok_or_else(|| InferenceError::new_err("recipe missing 'inferencer'"))?
+        .to_string();
+    let system = rv.get("system").and_then(Value::as_str).unwrap_or("").to_string();
+    let tool_names: Vec<String> = rv
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let params: Option<Value> = rv.get("params").filter(|v| !v.is_null()).cloned();
+
+    let (provider, model) = split_model(&inferencer);
+    let inf = get_inferencer(&provider).ok_or_else(|| {
+        InferenceError::new_err(format!(
+            "unsupported inferencer '{inferencer}' (supported providers: {}, claude-code)",
+            known_providers().join(", ")
+        ))
+    })?;
+    let headers = build_headers(&inf, api_key.as_deref()).map_err(InferenceError::new_err)?;
+    let base = base_url
+        .unwrap_or_else(|| inf.base_url.clone())
+        .trim_end_matches('/')
+        .to_string();
+    let url = format!("{base}/chat/completions");
+
+    // tools_for(allow) → the model-facing schemas (lossless seam; we read only .schema).
+    let allow_list = pyo3::types::PyList::new(py, &tool_names)?;
+    let specs = tools.call_method1("tools_for", (allow_list,))?;
+    let mut schemas: Vec<Value> = Vec::new();
+    for s in specs.try_iter()? {
+        schemas.push(pythonize::depythonize(&s?.getattr("schema")?)?);
+    }
+    // The allow-list is the BOUNDARY (only these may be dispatched); the schema's
+    // function name IS the namespaced allow-list name, so membership matches directly.
+    let allowed: std::collections::HashSet<String> = tool_names.iter().cloned().collect();
+    let mut sorted_allowed: Vec<String> = tool_names.clone();
+    sorted_allowed.sort();
+
+    // messages = [system] + user_msgs
+    let user_list: Value = pythonize::depythonize(&user_msgs)?;
+    let mut messages: Vec<Value> = vec![json!({"role": "system", "content": system})];
+    if let Some(arr) = user_list.as_array() {
+        messages.extend(arr.iter().cloned());
+    }
+
+    let extra_body = inf.extra_body.clone();
+    let tools: Py<PyAny> = tools.unbind();
+
+    future_into_py(py, async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .build()
+            .map_err(|e| InferenceError::new_err(e.to_string()))?;
+        for turn in 1..=8u32 {
+            // body = {model, messages, tools, stream:false, **extra_body, **params}
+            let mut body = json!({
+                "model": model, "messages": messages, "tools": schemas, "stream": false,
+            });
+            if let Some(o) = extra_body.as_object() {
+                for (k, v) in o {
+                    body[k] = v.clone();
+                }
+            }
+            if let Some(o) = params.as_ref().and_then(Value::as_object) {
+                for (k, v) in o {
+                    body[k] = v.clone();
+                }
+            }
+            let mut rb = client.post(&url).json(&body);
+            for (k, v) in &headers {
+                rb = rb.header(k, v);
+            }
+            let resp = rb.send().await.map_err(|e| InferenceError::new_err(e.to_string()))?;
+            let data: Value = resp.json().await.map_err(|e| InferenceError::new_err(e.to_string()))?;
+            if data.get("choices").is_none() {
+                return Err(InferenceError::new_err(format!("inferencer error: {data}")));
+            }
+            let msg = &data["choices"][0]["message"];
+            let calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+            let content = msg.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+
+            if calls.is_empty() {
+                // no tool calls → this turn's whole response IS the final answer
+                return Python::with_gil(|py| Ok(pythonize::pythonize(py, &data)?.unbind()));
+            }
+            messages.push(json!({"role": "assistant", "content": content, "tool_calls": calls.clone()}));
+            for call in &calls {
+                let func = call.get("function");
+                let namespaced = func
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // OpenAI gives `arguments` as a JSON STRING; parse before dispatch.
+                let args: Value = match func.and_then(|f| f.get("arguments")) {
+                    Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
+                    Some(v) => v.clone(),
+                    None => json!({}),
+                };
+                let call_id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{turn}_{namespaced}"));
+
+                let result: String = if !allowed.contains(&namespaced) {
+                    // refuse, but feed the refusal back (every tool_call needs a tool message)
+                    format!(
+                        "ERROR: tool '{namespaced}' is not permitted by this recipe \
+                         (allowed: {sorted_allowed:?})"
+                    )
+                } else {
+                    // dispatch: build the awaitable + future under the GIL, await off-GIL.
+                    let fut = Python::with_gil(|py| -> PyResult<_> {
+                        let args_py = pythonize::pythonize(py, &args)?;
+                        let awaitable =
+                            tools.bind(py).call_method1("dispatch", (namespaced.clone(), args_py))?;
+                        pyo3_async_runtimes::tokio::into_future(awaitable)
+                    });
+                    match fut {
+                        Err(e) => format!("ERROR: {}", pyerr_brief(&e)),
+                        Ok(fut) => match fut.await {
+                            // a dispatch that raises becomes an ERROR result, never propagates
+                            Err(e) => format!("ERROR: {}", pyerr_brief(&e)),
+                            Ok(tr) => Python::with_gil(|py| render_tool_result_rs(tr.bind(py)))
+                                .unwrap_or_else(|e| format!("ERROR: {}", pyerr_brief(&e))),
+                        },
+                    }
+                };
+                messages.push(json!({"role": "tool", "content": result, "tool_call_id": call_id}));
+            }
+        }
+        Err(InferenceError::new_err("max turns (8) exceeded"))
+    })
+}
+
 // --- streaming ---------------------------------------------------------------
 
 enum StreamState {
@@ -392,6 +631,7 @@ fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(complete_sync, m)?)?;
     m.add_function(wrap_pyfunction!(complete_stream, m)?)?;
     m.add_function(wrap_pyfunction!(provider_names, m)?)?;
+    m.add_function(wrap_pyfunction!(orchestrate, m)?)?;
     m.add_class::<DeltaStream>()?;
     Ok(())
 }
