@@ -137,10 +137,16 @@ woollama/                         (cargo workspace root = the woollama placehold
    integration tests vs a mock upstream. **Carved out to slice 3b:** native num_ctx
    STREAMING (NDJSON→SSE, the `sse_translator`) + Responses streaming/`items` — each a
    clear 501 today.
-4. **MCP aggregator (productionize the spike).** `manager` (downstream registry as
-   rmcp clients, `start_all`) + `mcp_server` (`/mcp` over **stdio AND** Streamable-HTTP,
-   re-export + schema mirroring). **Includes the one open lifecycle question:** a load
-   pass on the shared-downstream-across-sessions factory. Gate: the 4 MCP live tests.
+4. **MCP aggregator + orchestration.** Split into:
+   - **4a ✅ DONE** (commit `afaf4a7`) — the downstream MCP registry (rmcp child-process
+     **clients**) + `RegistryToolProvider` (the engine `ToolProvider` seam) + recipe/
+     `mcp.json` loading + `woollama/<recipe>` ORCHESTRATION on `/v1/chat/completions` and
+     stateless `/v1/responses` (non-stream). Gate: an end-to-end test driving a recipe
+     against a real stdio MCP fixture + a mock inferencer (tool_call → dispatch → final).
+   - **4b ⬜** — woollama-AS-an-MCP-server: the `/mcp` mount (stdio + Streamable-HTTP),
+     re-export + schema mirroring + the `chat` tool + recipe prompts (the rmcp spike
+     productionized). **Carries the open lifecycle question:** the shared-registry-
+     across-sessions stress test. Plus STREAMING orchestration. Gate: the MCP live tests.
 5. **claude-code executor.** `run_completion` + `run_delegated` + the `--tools ""`
    lockdown, via `tokio::process`. Gate: the 2 SDK-driven tests (claude-resume,
    conversations journey) repointed, **plus the 3 security gates rewritten as
