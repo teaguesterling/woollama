@@ -120,10 +120,16 @@ woollama/                         (cargo workspace root = the woollama placehold
    `stream!`. `woollama-core` is now a thin wrapper (incl. the `PyToolProvider`
    coroutine bridge). Gate met: conformance 42 + server 226 green; `woollama-server`
    links the engine with **no pyo3** in its dep tree.
-2. **Server skeleton.** `woollama-server` bin: axum, `binding` (TCP/UDS), `/v1/models`
-   (static+registry), `/v1/chat/completions` **passthrough** + **orchestration** via
-   the core. Gate: the HTTP/SDK live tests repointed at the Rust binary, **plus** a new
-   Rust integration test for `binding` (replaces the in-process `unix_socket` test).
+2. **Server skeleton.** ✅ DONE (commit `91c3ad9`). `woollama-server` is now a real axum
+   service over the engine: `resolve_tcp_target` + TCP bind, `GET /v1/models` (route +
+   list shape), `POST /v1/chat/completions` **passthrough** (bare-model rewrite + relay).
+   **Scope correction vs the original plan:** orchestration moved to slice 4 (it needs
+   the MCP registry), and the **gate is Rust integration tests against a mock upstream**,
+   not the repointed live suite — the live tests are interdependent (passthrough's test
+   picks a model from `/v1/models`, which needs discovery=slice 8; orchestration=slice 4),
+   so they can't go green until those land. The Rust test covers binding + `/v1/models` +
+   the bare-model rewrite/relay + the 501/400 deferrals; it also replaces the TCP half of
+   the in-process `unix_socket` test. (UDS still deferred.)
 3. **Native + Responses.** `ollama_native` translation, `/v1/responses` (stateless,
    `complete_stateless`), num_ctx native routing. Gate: the num_ctx + responses live tests.
 4. **MCP aggregator (productionize the spike).** `manager` (downstream registry as
