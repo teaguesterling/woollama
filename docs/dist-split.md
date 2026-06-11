@@ -1,7 +1,8 @@
 # Dist-split: server onto the Rust `woollama.core`
 
-Status: **in progress** (migration). This is the last gate before the server runs
-its inference/orchestration on the Rust core (slices 1–3, `woollama-core/`).
+Status: **done** (see the DONE section at the end). The server runs its
+inference/orchestration on the Rust core (slices 1–3, `woollama-core/`); the live
+integration gate is green. This document is kept as the migration record.
 
 ## The constraint (why this isn't a swap)
 
@@ -145,11 +146,26 @@ So greening the cutover needed, in addition to the harness rework:
 
 ## DONE ✅
 
-Both pieces landed. The server runs entirely on the Rust `woollama.core`:
-**225 server tests + 42 Rust conformance tests green**, ruff clean. The obsolete
-Python-engine tests (test_core_{inference,orchestrate,models}) were removed — their
-coverage is the Rust conformance suite + the (now wire-mocked) server integration
-tests; `make_recipe` coverage preserved in test_recipes.py.
+Both pieces landed. The server's **inference and orchestration run on the Rust
+`woollama.core`** (`complete`/`complete_stream`/`orchestrate_events` +
+`ModelRegistry` + structured `InferenceError`); the support surface stays Python —
+passthrough (`ollama_native`), `/v1/models` discovery (`woollama.inferencers`),
+recipes, config, tooling. ("Entirely on Rust" would overstate it.)
+
+**Verification:** 226 hermetic server tests + 42 Rust conformance green, ruff clean.
+The obsolete Python-engine tests (test_core_{inference,orchestrate,models}) were
+removed — their coverage is the Rust conformance suite + the (now wire-mocked) server
+integration tests; `make_recipe` coverage preserved in test_recipes.py. Packaging
+proven from a clean rebuild (`rm -rf .venv && uv sync --extra dev && pytest`).
+
+**Live integration gate: 25/25 green** (run against real Ollama + the user's Claude
+auth + the real Anthropic API): 17 free-tier (ollama orchestration incl. streaming
+tool-loop reassembly, store-backed journeys, MCP stdio+HTTP) + 5 claude-code (incl.
+the three delegation/lockdown security gates) + 3 anthropic (managed-agents journey,
+requires_action, anthropic-compat inferencer). The gate surfaced **one latent bug**
+(NOT a cutover regression — the deleted Python engine had it too): a tool-less recipe
+sent `tools: []`, which Anthropic's stricter endpoint rejects. Fixed by omitting the
+key when empty (commit `e221780`); conformance + the live test confirm it.
 
 Remaining deferred (named, NOT blocking the migration): the registry's discovery
 fields (`models`/`discover`/`model_patterns`) + a Rust `/v1/models` (still Python in
