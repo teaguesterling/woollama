@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -28,6 +29,25 @@ pytestmark = pytest.mark.integration
 
 OLLAMA_URL = "http://localhost:11434"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _woollama_argv(*extra):
+    """Full argv to launch woollama, with *extra appended (e.g. "mcp" for the
+    stdio MCP subcommand).
+
+    Default is the Python module (`python -m woollama`). Set WOOLLAMA_TEST_CMD
+    (shlex-split) to launch a different implementation — e.g. the Rust binary:
+
+        WOOLLAMA_TEST_CMD="$PWD/target/release/woollama-server"
+
+    That turns this suite into a DIFFERENTIAL ORACLE: the exact same live tests
+    run against both implementations, so a behavioral divergence shows up as a
+    test that passes on one and fails on the other. (The Rust binary also needs
+    WOOLLAMA_EXAMPLES_DIR exported so the bundled mcp.json can find the example
+    servers — the Python loader sets that itself; the Rust one does not yet.)"""
+    override = os.environ.get("WOOLLAMA_TEST_CMD")
+    base = shlex.split(override) if override else [sys.executable, "-m", "woollama"]
+    return [*base, *extra]
 
 
 def _ollama_reachable() -> bool:
@@ -85,7 +105,7 @@ def _spawn_woollama(tmp_path, *, extra_env=None):
         **(extra_env or {}),
     }
     proc = subprocess.Popen(
-        [sys.executable, "-m", "woollama"],
+        _woollama_argv(),
         cwd=REPO_ROOT,
         env=env,
         stdout=subprocess.DEVNULL,
@@ -742,9 +762,10 @@ async def test_mcp_stdio_surface_with_started_registry(tmp_path):
     from fastmcp import Client
     from fastmcp.client.transports import StdioTransport
 
+    _argv = _woollama_argv("mcp")
     transport = StdioTransport(
-        command=sys.executable,
-        args=["-m", "woollama", "mcp"],
+        command=_argv[0],
+        args=_argv[1:],
         env={**os.environ, "WOOLLAMA_CONFIG_DIR": str(tmp_path)},
         cwd=str(REPO_ROOT),
     )
@@ -820,9 +841,10 @@ async def test_mcp_stdio_chat_orchestrates_end_to_end(tmp_path):
     ):
         pytest.skip("qwen3:14b-iq4xs not available; bundled recipe needs it")
 
+    _argv = _woollama_argv("mcp")
     transport = StdioTransport(
-        command=sys.executable,
-        args=["-m", "woollama", "mcp"],
+        command=_argv[0],
+        args=_argv[1:],
         env={**os.environ, "WOOLLAMA_CONFIG_DIR": str(tmp_path)},
         cwd=str(REPO_ROOT),
     )

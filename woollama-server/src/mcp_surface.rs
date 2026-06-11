@@ -37,17 +37,36 @@ fn chat_tool() -> Tool {
         }))
         .unwrap(),
     );
+    // `chat` returns a plain string. FastMCP's reference client derives `result.data`
+    // from `structured_content` via the tool's output schema, so to keep parity with the
+    // Python `chat` (a `-> str` tool) we advertise FastMCP's own string-wrap convention:
+    // an object schema `{result: string}` flagged `x-fastmcp-wrap-result`, which the
+    // client unwraps back to the bare string. (Verified against the installed fastmcp.)
+    let out_schema: Arc<JsonObject> = Arc::new(
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {"result": {"type": "string"}},
+            "required": ["result"],
+            "x-fastmcp-wrap-result": true
+        }))
+        .unwrap(),
+    );
     Tool::new(
         "chat",
         "Run a woollama recipe end-to-end and return the final assistant message \
          (the inferencer<->tool loop stays hidden).",
         schema,
     )
+    .with_raw_output_schema(out_schema)
 }
 
 impl WoollamaMcp {
     async fn run_chat(&self, arguments: Option<JsonObject>) -> Result<CallToolResult, McpError> {
         let args = arguments.unwrap_or_default();
+        // Parity with the Python `chat` tool: bad recipe / orchestration failures are
+        // surfaced as TOOL-level errors (`isError` results — FastMCP turns its raised
+        // ValueErrors into these), NOT JSON-RPC protocol errors. A FastMCP client then
+        // raises `ToolError`, not the lower-level `McpError`.
         let recipe_name = args
             .get("recipe")
             .and_then(Value::as_str)
@@ -58,27 +77,42 @@ impl WoollamaMcp {
                     .and_then(Value::as_str)
                     .and_then(|m| m.strip_prefix("woollama/"))
                     .map(String::from)
-            })
-            .ok_or_else(|| {
-                McpError::invalid_params("chat requires a 'recipe' (or 'woollama/<recipe>' model)", None)
-            })?;
+            });
+        let Some(recipe_name) = recipe_name else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "chat requires a 'recipe' (or 'woollama/<recipe>' model)",
+            )]));
+        };
         let Some(recipe) = self.state.recipes.get(&recipe_name) else {
-            return Err(McpError::invalid_params(format!("unknown recipe '{recipe_name}'"), None));
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "unknown recipe '{recipe_name}'"
+            ))]));
         };
         let messages = args.get("messages").cloned().unwrap_or_else(|| json!([]));
         match crate::orchestrate_recipe(&self.state, recipe, &messages).await {
             Ok(resp) => {
                 let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+                // Mirror FastMCP's string wrap (see `chat_tool`'s output schema): the text
+                // rides BOTH the content block (for naive clients) and `structured_content`
+                // `{result: text}` (so a FastMCP client's `result.data` is the string).
+                let mut result = CallToolResult::success(vec![Content::text(text.clone())]);
+                result.structured_content = Some(json!({ "result": text }));
+                Ok(result)
             }
-            Err(e) => Err(McpError::internal_error(e.message, None)),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(e.message)])),
         }
     }
 }
 
 impl ServerHandler for WoollamaMcp {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::default()
+        // Advertise the tools + prompts capabilities on `initialize`. We override
+        // `list_tools`/`list_prompts`/`get_prompt` below, but a default ServerInfo reports
+        // no capabilities, so capability-checking clients (e.g. FastMCP) see an empty
+        // server. Declare what we actually serve.
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().enable_prompts().build();
+        info
     }
 
     async fn list_tools(

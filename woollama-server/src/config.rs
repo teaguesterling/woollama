@@ -47,6 +47,45 @@ fn read_user_or_default(filename: &str, default: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|_| default.to_string())
 }
 
+/// Resolve `WOOLLAMA_EXAMPLES_DIR` so the bundled-default `mcp.json`'s
+/// `${WOOLLAMA_EXAMPLES_DIR}/mcp-*/server.py` references expand to a real path. We set the
+/// process env (not just return a value) so the existing `engine::expand_env` picks it up —
+/// the same approach as Python `config._expand_env`. Precedence:
+///   1. an explicit `WOOLLAMA_EXAMPLES_DIR` (operator / config override) ALWAYS wins;
+///   2. examples shipped ALONGSIDE the binary (`<exe-dir>/examples`) — the default for a
+///      packaged install (the dir is 116K, so it ships with the binary);
+///   3. the source checkout's `examples/` (`<crate>/../examples`) — dev runs, `cargo run`,
+///      and the integration suite spawning `target/<profile>/woollama-server`.
+/// If none exist it stays unset, so the bundled example servers are cleanly SKIPPED rather
+/// than spawned from a bogus empty path (the bug the live oracle surfaced). Idempotent —
+/// resolves to a deterministic value, safe to call once per `build_state`.
+pub fn ensure_examples_dir() {
+    // A candidate counts only if it actually holds the example servers — guards against
+    // matching a bare `examples/` dir that means something else (notably cargo's reserved
+    // `target/<profile>/examples`, where `cargo build --example` artifacts land).
+    let is_examples = |p: &std::path::Path| p.join("mcp-hello").join("server.py").is_file();
+
+    if std::env::var("WOOLLAMA_EXAMPLES_DIR").map(|v| !v.is_empty()).unwrap_or(false) {
+        return; // (1) explicit override wins
+    }
+    // (2) shipped alongside the binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(cand) = exe.parent().map(|d| d.join("examples")) {
+            if is_examples(&cand) {
+                std::env::set_var("WOOLLAMA_EXAMPLES_DIR", cand);
+                return;
+            }
+        }
+    }
+    // (3) source checkout (dev / cargo run / integration suite)
+    let repo_examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("examples"));
+    if let Some(cand) = repo_examples {
+        if is_examples(&cand) {
+            std::env::set_var("WOOLLAMA_EXAMPLES_DIR", cand);
+        }
+    }
+}
+
 pub fn load_recipes() -> Result<HashMap<String, Recipe>, String> {
     let text = read_user_or_default("recipes.toml", DEFAULT_RECIPES);
     let v: Value = toml::from_str(&text).map_err(|e| format!("recipes.toml parse error: {e}"))?;

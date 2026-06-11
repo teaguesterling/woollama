@@ -73,6 +73,14 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
 
     let client = mcp_client(&base).await;
 
+    // initialize: the server must ADVERTISE the tools + prompts capabilities it serves.
+    // (A default ServerInfo reports neither — a capability-checking client like FastMCP
+    // would then see an empty server even though list_tools/list_prompts work. The live
+    // differential oracle caught exactly this; pin it here so it can't silently regress.)
+    let caps = &client.peer_info().expect("server info on initialize").capabilities;
+    assert!(caps.tools.is_some(), "tools capability must be advertised");
+    assert!(caps.prompts.is_some(), "prompts capability must be advertised");
+
     // tools/list: the `chat` verb + the re-exported downstream tool with output_schema mirrored.
     let tools = client.list_tools(None).await.unwrap();
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
@@ -111,6 +119,33 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
     let text: String =
         chat.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect();
     assert_eq!(text, "done counting");
+    // The answer ALSO rides structured_content under FastMCP's string-wrap convention, so a
+    // FastMCP client's `result.data` resolves to the bare string (the live oracle's `.data`
+    // assertion). chat advertises the matching wrap output_schema in tools/list.
+    assert_eq!(
+        chat.structured_content,
+        Some(json!({ "result": "done counting" })),
+        "chat result must carry FastMCP-wrapped structured_content"
+    );
+    let chat_tool = tools.tools.iter().find(|t| t.name == "chat").unwrap();
+    let chat_out = chat_tool.output_schema.as_ref().expect("chat output_schema");
+    assert_eq!(chat_out.get("x-fastmcp-wrap-result"), Some(&json!(true)), "wrap marker");
+
+    // A bad recipe is a TOOL-level error (isError result → FastMCP `ToolError`), NOT a
+    // JSON-RPC protocol error — matching the Python `chat` (which raises ValueError).
+    let bad = client
+        .call_tool(CallToolRequestParams::new("chat").with_arguments(
+            serde_json::from_value(json!({
+                "recipe": "_nope_", "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .await
+        .expect("unknown recipe is a tool-level error, not a transport error");
+    assert_eq!(bad.is_error, Some(true), "unknown recipe → isError result");
+    let bad_text: String =
+        bad.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect();
+    assert!(bad_text.contains("unknown recipe"), "error text; got {bad_text:?}");
 
     // Lifecycle: a SECOND concurrent session shares the one downstream registry — both
     // sessions' proxy calls succeed against the single underlying connection.

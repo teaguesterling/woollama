@@ -233,3 +233,75 @@ hermetic server suite guards the Python path until cutover.
 - The PyO3 wheel (auxiliary, permanent) — lackpy's embed surface.
 - The Python server stays runnable until slice 9, as the oracle.
 - Nothing is silently dropped: discovery (`/v1/models`) is slice 8, not abandoned.
+
+## Pre-cutover live review (slices 0–8 complete; the review the user asked for)
+
+The differential oracle was run for real: `tests/test_integration.py` repointed at the
+release Rust binary via a new `WOOLLAMA_TEST_CMD` env hook (`_woollama_argv`), against
+**live Ollama** and the **real OpenAI SDK** (every prior server-side test was gated by
+self-authored mocks). Command:
+
+```
+WOOLLAMA_TEST_CMD="$PWD/target/release/woollama-server" \
+WOOLLAMA_EXAMPLES_DIR="$PWD/examples" WOOLLAMA_OLLAMA_URL="http://localhost:11434" \
+uv run --extra dev pytest tests/test_integration.py -m integration -v
+```
+
+**Initial result: 13 passed / 4 failed / 8 skipped** (all 4 failures in the `/mcp`
+surface — see Findings below). After fixing findings 1+2: **17 passed / 0 failed / 8
+skipped.** Honest breakdown of the passes:
+
+- **12 genuine Rust-binary passes** — discovery, passthrough chat (+ streaming, 64 real
+  token deltas), native `num_ctx`, Responses stateless (+ streaming, + SDK), orchestration
+  non-stream + streaming, two-provider recipe, store-backed conversations (MCP + HTTP),
+  handle-table-survives-restart. All driven over HTTP/SDK against the spawned Rust process.
+- **1 non-Rust pass** — `test_unix_socket_serves_http_end_to_end` imports `woollama.binding`
+  in-process; it tested PYTHON, not the binary. Not Rust evidence (the Rust unix-socket
+  surface is still deferred). Already flagged above for re-expression.
+- **8 skipped** = the paid tiers, correctly auto-skipped (5 `@needs_claude_code`,
+  3 `@needs_anthropic`) — no hidden coverage.
+
+**Decisive tool-dispatch proof** (the orchestration "I have counted to N" answer is
+fabricatable by the model alone, so the green test is necessary-not-sufficient): an
+instrumented `count_to` server writing a sentinel confirmed the engine genuinely
+dispatched `count_to(n=7)` to a real MCP child process. Orchestration is verified live,
+not inferred.
+
+### Findings (4 failures = 3 root causes)
+
+1. **[FIXED] MCP surface didn't advertise capabilities** (`mcp_surface.rs` `get_info` →
+   `ServerInfo::default()`). The handler overrides `list_tools`/`list_prompts`, but the
+   `initialize` handshake reported `tools=None, prompts=None`. Capability-checking clients
+   saw no tools. (2 failures: stdio + HTTP `*_surface`/`*_shares`.) Fixed: `get_info`
+   builds `ServerCapabilities::builder().enable_tools().enable_prompts()`.
+2. **[FIXED] `chat` tool returned no structured content** (`mcp_surface.rs` `run_chat` →
+   `Content::text(text)` only). FastMCP's client `result.data` was None. The Python `chat`
+   is `-> str` via `Tool.from_function`, which FastMCP auto-wraps into
+   `structured_content {"result": text}` + an `x-fastmcp-wrap-result` output schema (shape
+   verified against the installed fastmcp). (2 failures: stdio + HTTP `*_chat`.) Fixed: the
+   chat tool now declares the wrap output_schema and returns `structured_content
+   {"result": text}`. **Adjacent fix surfaced during repair:** bad recipe / orchestration
+   failures were JSON-RPC `McpError`s; the Python `chat` raises `ValueError`, which FastMCP
+   turns into a TOOL-level `isError` result (client `ToolError`). Now matched — `run_chat`
+   returns `CallToolResult::error(..)` for those cases. All three contract points
+   (capabilities, wrapped structured_content, tool-level error) are now pinned in the
+   hermetic `mcp_surface.rs` test too, so they can't regress without Ollama in the loop.
+3. **[FIXED] `WOOLLAMA_EXAMPLES_DIR` not auto-resolved.** Python's `config._examples_dir()`
+   sets it from runtime `__file__`; the Rust binary left it unset, so the bundled
+   `mcp.json`'s example servers silently failed to spawn (→ orchestration recipes couldn't
+   dispatch). Decision (yours): **ship the examples alongside the binary as the default**,
+   with env/config override taking priority. Implemented as `config::ensure_examples_dir()`
+   (called first in `build_state`), precedence: (1) an explicit `WOOLLAMA_EXAMPLES_DIR`
+   wins; (2) `<exe-dir>/examples` (packaged install — examples are 116K, ship with the
+   binary); (3) the source checkout's `examples/` (dev / `cargo run` / the integration
+   suite). A candidate must contain `mcp-hello/server.py` to count — this guards against
+   cargo's reserved empty `target/<profile>/examples` dir (which the first naive attempt
+   wrongly matched). Proven: the FULL oracle passes (17/0/8) with `WOOLLAMA_EXAMPLES_DIR`
+   UNSET (auto-resolved via the dev-checkout fallback). **Packaging TODO:** the release/
+   install step must physically copy `examples/` beside the installed binary for precedence
+   (2) to fire in production; precedence (3) only covers in-repo runs.
+
+All four original failures were in the `/mcp` aggregator surface (slice 4b/5); the
+orchestration they wrap always worked end-to-end. None touched the OpenAI HTTP surface,
+which was green throughout. With findings 1+2 fixed, the only open item is finding 3
+(examples-dir resolution), which is a deliberate design decision rather than a bug.

@@ -74,6 +74,8 @@ impl AppState {
 /// Load config + connect the downstream MCP servers. Errors are logged and degraded to
 /// empty (the router still starts) rather than fatal.
 pub async fn build_state() -> AppState {
+    // Resolve WOOLLAMA_EXAMPLES_DIR before any config load — the bundled mcp.json expands it.
+    config::ensure_examples_dir();
     let recipes = config::load_recipes().unwrap_or_else(|e| {
         eprintln!("woollama-server: recipes load error: {e}");
         HashMap::new()
