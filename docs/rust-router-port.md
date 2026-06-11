@@ -67,8 +67,23 @@ Two implementors, one engine:
 - **`RegistryToolProvider`** (in the server) — dispatches to downstream MCP servers
   via rmcp clients (the spike's `Aggregator::call_tool` path).
 
-This is the linchpin slice. Once the engine is PyO3-free and trait-driven, every
-later slice is additive.
+This is the linchpin slice, and it is **bigger than the trait alone** — making the
+core a pure rlib means extracting pure-Rust equivalents for everything the engine
+currently expresses in PyO3:
+- `InferenceError` is a `#[pyclass]` → becomes a plain Rust error type in the core,
+  re-wrapped as the pyclass only in the cdylib.
+- `DeltaStream` / `EventIter` are pyclasses → become Rust `Stream`s in the core; the
+  cdylib wraps them as async-iterator pyclasses.
+- return values flow through `pythonize` / `Py<PyAny>` → the core speaks `serde_json`;
+  the cdylib does the Python translation at the boundary.
+- **the subtle one:** `PyToolProvider::dispatch` must bridge back to a Python
+  coroutine via `pyo3_async_runtimes` from inside an `async-trait` method. That works
+  in today's monolithic engine; **verify it still composes** once the engine is
+  generic and the bridge lives in the wrapper crate under the server's tokio runtime.
+
+Treat slice 1 as the expensive, risky one — this is where days go if it's mistaken
+for mechanical. Once the engine is PyO3-free and trait-driven, every later slice is
+additive.
 
 ## Target workspace layout
 
@@ -91,12 +106,18 @@ is slice 0.)
 ## Slice ordering (risk-front-loaded; each slice ships green)
 
 0. **Workspace split.** `woollama-core` → pure rlib; `woollama-py` cdylib wraps it.
-   No behavior change. Gate: conformance (42) + server suite green, wheel imports.
-1. **Trait-ize tool dispatch.** Introduce the Rust `ToolProvider` trait; engine
-   generic over it; `PyToolProvider` preserves the Python path. Gate: same suites green.
+   **Not a pure Cargo change** — it's a maturin/pyproject rewire (`module-name`, the
+   editable install, the `woollama.core` namespace merge must still resolve to the
+   cdylib). No behavior change. Gate: conformance (42) + server suite green, wheel imports.
+1. **Trait-ize tool dispatch + PyO3 extraction (the expensive slice).** Introduce the
+   Rust `ToolProvider` trait; engine generic over it; extract pure-Rust `InferenceError`
+   / `DeltaStream` / `EventIter` / serde return types into the core; `PyToolProvider`
+   in the cdylib preserves the Python path (incl. the coroutine bridge). Gate: same
+   suites green. **Budget real time here** (see the refactor section).
 2. **Server skeleton.** `woollama-server` bin: axum, `binding` (TCP/UDS), `/v1/models`
    (static+registry), `/v1/chat/completions` **passthrough** + **orchestration** via
-   the core. Gate: the **live integration gate run against the Rust binary** (below).
+   the core. Gate: the HTTP/SDK live tests repointed at the Rust binary, **plus** a new
+   Rust integration test for `binding` (replaces the in-process `unix_socket` test).
 3. **Native + Responses.** `ollama_native` translation, `/v1/responses` (stateless,
    `complete_stateless`), num_ctx native routing. Gate: the num_ctx + responses live tests.
 4. **MCP aggregator (productionize the spike).** `manager` (downstream registry as
@@ -104,13 +125,15 @@ is slice 0.)
    re-export + schema mirroring). **Includes the one open lifecycle question:** a load
    pass on the shared-downstream-across-sessions factory. Gate: the 4 MCP live tests.
 5. **claude-code executor.** `run_completion` + `run_delegated` + the `--tools ""`
-   lockdown, via `tokio::process`. Gate: the 5 claude-code live tests (incl. the 3
-   security gates) — **in a plain terminal**.
+   lockdown, via `tokio::process`. Gate: the 2 SDK-driven tests (claude-resume,
+   conversations journey) repointed, **plus the 3 security gates rewritten as
+   HTTP/recipe-driven** (canary/refusal asserted from outside) — **in a plain terminal**.
 6. **Conversation stores.** ConversationStore seam, durable handle table
    (`WOOLLAMA_STATE_DIR`), claude-resume + store-backed backends (MCP + REST clients).
    Gate: the store-backed + restart-survival live tests.
-7. **Managed agents.** Anthropic Managed Agents backend via raw REST. Gate: the 3
-   anthropic live tests.
+7. **Managed agents.** Anthropic Managed Agents backend via raw REST. Gate: the 2
+   SDK-driven anthropic tests (managed-agents journey, requires_action) repointed,
+   **plus the anthropic-inferencer gate rewritten as HTTP/recipe-driven**.
 8. **`/v1/models` discovery in Rust.** Static `models` + live `discover` +
    `model_patterns`; collapses the two-registry drift (the named deferred item).
 9. **Cutover.** `woollama` entrypoint = the Rust binary; Python server retired to
@@ -118,13 +141,31 @@ is slice 0.)
 
 ## Verification strategy (the strongest asset)
 
-The Python server **+ its 25-test live integration gate is the differential
-oracle.** Every server-facing slice is accepted by pointing the *existing*
-`test_integration.py` fixture's process spawn at the **Rust binary** instead of
-`python -m woollama` — same OpenAI-SDK clients, same assertions, same real Ollama /
-Claude / Anthropic backends. A slice is "done" when its slice of that suite passes
-against the Rust binary identically. This means we never hand-wave wire parity:
-the openai/anthropic SDKs themselves are the conformance check, run live.
+The Python server **+ most of its 25-test live integration gate is the differential
+oracle.** The **20 HTTP/SDK-driven tests** (the `woollama_server*` fixtures, plus the
+2 stdio-MCP tests that spawn `python -m woollama mcp`) are accepted by pointing the
+*existing* fixture's process spawn at the **Rust binary** (and its `mcp` subcommand)
+instead of `python -m woollama` — same OpenAI-SDK clients, same assertions, same real
+Ollama / Claude / Anthropic backends. For those, the openai/anthropic SDKs themselves
+are the live conformance check; we never hand-wave wire parity.
+
+**The oracle is NOT universal — 5 tests drive the Python API in-process and must be
+re-expressed, not repointed** (verified set):
+- `test_unix_socket_serves_http_end_to_end` (`binding.open_sockets()`) → slice 2:
+  becomes a Rust integration test of the `binding` module (`tokio::net`), not a
+  repointed Python test.
+- `test_claude_code_backend_completes_and_refuses_shell`,
+  `..._delegation_runs_tool_and_keeps_boundary`,
+  `..._delegation_denies_same_server_sibling` (call `router.orchestrate` /
+  `claude_code._*` directly) → slice 5: **rewrite as HTTP/recipe-driven gates** —
+  define the recipe, drive it over `/v1/chat/completions` against the Rust binary,
+  assert the canary/refusal from the *outside*. Without this, slice 5 (the security
+  gates) would ship with no live gate.
+- `test_anthropic_inferencer_completes_live` (`router.orchestrate`) → slice 7: same,
+  drive the cloud recipe over `/v1/chat/completions`.
+
+Re-express these **per slice as we reach them**, not up front — the HTTP oracle is the
+right design for the majority; it just isn't total.
 
 Plus: the Rust conformance suite (42) continues to pin engine behavior, and the
 hermetic server suite guards the Python path until cutover.
