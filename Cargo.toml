@@ -1,8 +1,11 @@
-# Placeholder Cargo manifest. The Rust implementation will land later;
-# this exists so we can publish a v0.0.1 placeholder crate to claim the
-# crates.io name alongside the PyPI one. The Python implementation in
-# src/woollama/ is v0.1's working code; Rust comes when the architecture
-# is stable enough to warrant the rewrite.
+# Cargo workspace root for the Rust port of the woollama router service
+# (see docs/rust-router-port.md). Members:
+#   woollama-core   — the engine cdylib/wheel (today; becomes a pure rlib in slice 1)
+#   woollama-server — the router-service binary (stub today; grows from slice 2)
+# The root `woollama` package below stays as the crates.io-name placeholder.
+[workspace]
+members = ["woollama-core", "woollama-server"]
+resolver = "2"
 
 [package]
 name = "woollama"

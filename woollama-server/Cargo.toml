@@ -1,0 +1,14 @@
+[package]
+name = "woollama-server"
+version = "0.4.0"
+edition = "2021"
+description = "The woollama router service (Rust). Stub — grows from slice 2 (see docs/rust-router-port.md)."
+license = "MIT"
+
+[[bin]]
+name = "woollama-server"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally empty for slice 0. Slice 2 adds axum/tokio and wires the engine
+# (woollama-core) once it is a pure rlib (slice 1).
