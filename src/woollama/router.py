@@ -32,9 +32,7 @@ from . import (
     managed_agents,
     responses,
 )
-from . import config, inferencers, ollama_native, recipes
-from .core import inference as _inference
-from .core import orchestrate as _core_orchestrate
+from . import config, core, inferencers, ollama_native, recipes
 from .manager import Registry, RegistryToolProvider, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 
@@ -45,7 +43,7 @@ log = logging.getLogger("woollama.router")
 # router re-exports it under its historical name so every existing
 # `raise OrchestrationError(...)` / `except OrchestrationError` (and
 # `from .router import OrchestrationError`) keeps working — it's the SAME class.
-OrchestrationError = _inference.InferenceError
+OrchestrationError = core.InferenceError
 
 
 # Module-level registry; SHARED by both surfaces — the OpenAI orchestration
@@ -492,7 +490,7 @@ async def complete_stateless(model: str, messages: list[dict], *,
     # A directly-addressed inferencer (`<provider>/<model>`) → the server-free core
     # primitive (incl. ollama-native num_ctx routing). InferenceError IS this
     # module's OrchestrationError, so callers' error mapping is unchanged.
-    return await _inference.complete(model, messages, options=options)
+    return await core.complete(model, messages, options=options)
 
 
 async def complete_stream(model: str, messages: list[dict]):
@@ -516,7 +514,7 @@ async def complete_stream(model: str, messages: list[dict]):
 
     # A directly-addressed inferencer → the server-free core streamer (raises
     # InferenceError == OrchestrationError before the first delta on setup error).
-    async for delta in _inference.complete_stream(model, messages):
+    async for delta in core.complete_stream(model, messages):
         yield delta
 
 
@@ -840,9 +838,12 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
 
     # The generic inferencer↔tool loop is the server-free core's job; the MCP
     # tools reach it through the RegistryToolProvider adapter. (claude-code above
-    # is the one woollama-specific executor that stays here.)
-    async for ev in _core_orchestrate.orchestrate_events(
-            recipe, user_msgs, tools=RegistryToolProvider(reg), stream=stream):
+    # is the one woollama-specific executor that stays here.) The inferencer
+    # registry is resolved from config and passed explicitly — the Rust core
+    # defaults to built-ins only, so omitting it would drop inferencers.toml.
+    async for ev in core.orchestrate_events(
+            recipe, user_msgs, tools=RegistryToolProvider(reg),
+            registry=core.ModelRegistry.from_config(), stream=stream):
         yield ev
 
 
