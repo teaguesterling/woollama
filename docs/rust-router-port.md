@@ -166,12 +166,18 @@ woollama/                         (cargo workspace root = the woollama placehold
      atomic rewrite, restart-survival) + per-conversation locks + the **claude-resume**
      backend + stateful `/v1/responses` + `/v1/conversations` CRUD. Gate: a hermetic e2e
      (fake `claude`) incl. restart survival. (`run_resumable` added to claude_code.)
-   - **6b ⬜** — store-backed statefulness for ollama/cloud/recipe models: the
-     `ConversationStore` provider seam + `McpStoreProvider`/`HttpStoreProvider` (MCP +
-     REST clients) + `/items` served from the store.
-7. **Managed agents.** Anthropic Managed Agents backend via raw REST. Gate: the 2
-   SDK-driven anthropic tests (managed-agents journey, requires_action) repointed,
-   **plus the anthropic-inferencer gate rewritten as HTTP/recipe-driven**.
+   - **6b ✅ DONE** (commit `e52a118`) — store-backed statefulness for ollama/cloud/recipe
+     models: the `StoreProvider` seam + `HttpStoreProvider`/`McpStoreProvider` (REST + MCP
+     clients) + `complete_stateless` + `/items` served from the store. Gate: a mock-REST-
+     store e2e proving prior reassembly + items + delete.
+7. **Managed agents.** ✅ DONE (woollama-side; commit `e178303`). The managed-agents
+   backend for claude-agent/* models: client (base-URL-mockable) + lazy agent/env cache +
+   the **requires_action pause/resume** path + `/items` from the event log + lifecycle.
+   Gate: a mock-Anthropic e2e drives create→turn→pause→answer→items→delete.
+   **⚠️ Caveat:** the Anthropic Managed Agents REST/streaming wire shapes aren't in the
+   repo (Python uses the SDK), so the client targets a SIMPLIFIED protocol exercised by
+   the mock — the real API must be reconciled before the opt-in live `@needs_anthropic`
+   test passes. The tested value is woollama's routing, not the Anthropic wire format.
 8. **`/v1/models` discovery in Rust.** Static `models` + live `discover` +
    `model_patterns`; collapses the two-registry drift (the named deferred item).
 9. **Cutover.** `woollama` entrypoint = the Rust binary; Python server retired to
