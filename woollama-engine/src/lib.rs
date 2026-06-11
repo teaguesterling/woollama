@@ -330,8 +330,9 @@ pub fn config_dir() -> std::path::PathBuf {
 }
 
 /// Expand `${VAR}` from the environment (unset → empty), matching the braced form of
-/// `os.path.expandvars`. (Braceless `$VAR` is left as-is — a minor divergence.)
-fn expand_env(text: &str) -> String {
+/// `os.path.expandvars`. (Braceless `$VAR` is left as-is — a minor divergence.) Public
+/// so the server's `mcp.json` loader can reuse it.
+pub fn expand_env(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {

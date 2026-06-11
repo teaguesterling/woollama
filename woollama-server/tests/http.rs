@@ -68,7 +68,15 @@ async fn http_surface_passthrough_native_and_responses() {
     let upstream_url = spawn(upstream).await;
     std::env::set_var("WOOLLAMA_OLLAMA_URL", &upstream_url);
 
-    let base = spawn(woollama_server::router()).await;
+    // Empty config dir (no MCP servers, no recipes) → empty registry. These tests only
+    // exercise passthrough / inferencer paths, not orchestration.
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+
+    let state = std::sync::Arc::new(woollama_server::build_state().await);
+    let base = spawn(woollama_server::router(state)).await;
     let c = reqwest::Client::new();
 
     // /v1/models → 200 list.
@@ -132,10 +140,11 @@ async fn http_surface_passthrough_native_and_responses() {
     assert_eq!(resp["status"], "completed");
     assert_eq!(resp["output"][0]["content"][0]["text"], "pong");
 
-    // Deferrals: woollama/<recipe> → 501; unknown ns → 400; stateful responses → 501.
+    // woollama/<recipe> is orchestrated now (slice 4a); with this empty config the
+    // recipe doesn't exist → 404. (Orchestration itself is covered in orchestrate.rs.)
     let r = c.post(format!("{base}/v1/chat/completions"))
         .json(&json!({"model": "woollama/streamer", "messages": []})).send().await.unwrap();
-    assert_eq!(r.status(), 501);
+    assert_eq!(r.status(), 404);
     let r = c.post(format!("{base}/v1/chat/completions"))
         .json(&json!({"model": "bogus/x", "messages": []})).send().await.unwrap();
     assert_eq!(r.status(), 400);

@@ -20,7 +20,18 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# MCP: downstream servers as rmcp child-process clients (slice 4) + the stdio test
+# fixture (server side). transport-io gives the stdio (stdin/stdout) server transport.
+rmcp = { version = "1.7", features = ["client", "server", "macros", "transport-child-process", "transport-async-rw", "transport-io"] }
+async-trait = "0.1"
+futures = "0.3"
+toml = "0.8"
+
+[[bin]]
+name = "mcp_fixture"
+path = "src/bin/mcp_fixture.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"

@@ -2,33 +2,65 @@
 //!
 //! Slices landed here:
 //!   2  — TCP binding, `GET /v1/models`, `POST /v1/chat/completions` passthrough.
-//!   3  — native num_ctx passthrough (non-stream), streaming passthrough (SSE relay),
-//!        stateless `POST /v1/responses` (non-stream).
+//!   3  — native num_ctx passthrough (non-stream), streaming passthrough, stateless
+//!        `POST /v1/responses` (non-stream).
+//!   4a — `woollama/<recipe>` ORCHESTRATION: a downstream MCP registry (rmcp
+//!        child-process clients) + `RegistryToolProvider` drives the engine recipe
+//!        loop, on `/v1/chat/completions` and stateless `/v1/responses` (non-stream).
 //!
-//! Deferred (each returns a clear 501, not a silent gap):
-//!   - native num_ctx STREAMING (NDJSON→SSE) + Responses streaming/items → slice 3b
-//!   - `woollama/<recipe>` orchestration (needs the MCP registry)        → slice 4
-//!   - stateful `/v1/responses` (conversation backends)                  → slices 6–7
-//!   - `/v1/models` discovery (catalog/recipes)                          → slice 8
-//!   - the Unix-socket surface                                           → later
-//!
-//! Behavior mirrors Python `router.py` / `ollama_native.py` / `responses.py`.
+//! Deferred (each a clear 501): native num_ctx STREAMING + Responses streaming/items
+//! (3b); STREAMING orchestration + the woollama-as-MCP `/mcp` surface (4b); stateful
+//! `/v1/responses` (6–7); `/v1/models` discovery (8); the Unix socket.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 use woollama_engine as engine;
 use engine::EngineError;
 
+mod config;
+mod mcp_registry;
 mod ollama_native;
 mod responses;
+
+pub use config::{load_mcp_servers, load_recipes};
+
+/// Shared, process-lifetime server state: loaded recipes, the connected downstream MCP
+/// registry, and the inferencer registry. Built once at startup, shared via axum state.
+pub struct AppState {
+    pub recipes: HashMap<String, config::Recipe>,
+    pub registry: Arc<mcp_registry::McpRegistry>,
+    pub inferencers: engine::Registry,
+}
+
+/// Load config + connect the downstream MCP servers. Errors are logged and degraded to
+/// empty (the router still starts) rather than fatal.
+pub async fn build_state() -> AppState {
+    let recipes = config::load_recipes().unwrap_or_else(|e| {
+        eprintln!("woollama-server: recipes load error: {e}");
+        HashMap::new()
+    });
+    let specs = config::load_mcp_servers().unwrap_or_else(|e| {
+        eprintln!("woollama-server: mcp.json load error: {e}");
+        HashMap::new()
+    });
+    let registry = Arc::new(mcp_registry::McpRegistry::connect(specs).await);
+    let inferencers = engine::Registry::from_config().unwrap_or_else(|e| {
+        eprintln!("woollama-server: inferencers load error: {e}");
+        engine::Registry::new()
+    });
+    AppState { recipes, registry, inferencers }
+}
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
 pub fn resolve_tcp_target() -> (String, u16) {
@@ -45,11 +77,12 @@ pub fn resolve_tcp_target() -> (String, u16) {
 }
 
 /// The axum app (shared by the binary and the integration tests).
-pub fn router() -> Router {
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_create))
+        .with_state(state)
 }
 
 // --- error helpers ------------------------------------------------------------
@@ -68,7 +101,6 @@ fn engine_err_response(e: EngineError) -> Response {
     }
 }
 
-/// POST `body` to `url` with `headers` and a timeout; map transport failure to a 502.
 async fn forward_post(
     url: String,
     body: &Value,
@@ -88,32 +120,68 @@ async fn forward_post(
         .map_err(|e| err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"))
 }
 
-/// Relay an upstream JSON response (status + body) verbatim.
 async fn relay_json(resp: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
     (status, Json(data)).into_response()
 }
 
+// --- orchestration (shared by chat-completions + responses) -------------------
+
+/// Run a recipe to completion and return the final OpenAI response dict, or an error
+/// Response. Tools are dispatched to the downstream MCP registry.
+async fn orchestrate_recipe(
+    state: &AppState,
+    recipe: &config::Recipe,
+    messages: &Value,
+) -> Result<Value, Response> {
+    let recipe_val = recipe.to_value();
+    let provider: Arc<dyn engine::ToolProvider> =
+        Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
+    let setup = engine::build_setup(&recipe_val, messages, provider, None, None, Some(&state.inferencers))
+        .map_err(engine_err_response)?;
+    let mut s = Box::pin(engine::events_stream(setup, false));
+    while let Some(item) = s.next().await {
+        match item {
+            Ok(engine::Event::Final(resp)) => return Ok(resp),
+            Ok(_) => continue,
+            Err(e) => return Err(engine_err_response(e)),
+        }
+    }
+    Err(engine_err_response(EngineError::new(
+        "orchestrate: loop ended without a final response",
+        "server_error",
+        500,
+    )))
+}
+
 // --- GET /v1/models -----------------------------------------------------------
 
-/// Slice 2 shape; per-model discovery (ollama catalog, configured `models`, recipes)
-/// is slice 8.
 async fn list_models() -> Json<Value> {
     Json(json!({"object": "list", "data": []}))
 }
 
 // --- POST /v1/chat/completions ------------------------------------------------
 
-async fn chat_completions(Json(body): Json<Value>) -> Response {
+async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
 
     if let Some(name) = model.strip_prefix("woollama/") {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            format!("orchestration for 'woollama/{name}' is not yet in the Rust server (slice 4)"),
-            "not_implemented",
-        );
+        let Some(recipe) = state.recipes.get(name) else {
+            return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
+        };
+        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            return err_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "streaming orchestration is not yet in the Rust server (slice 4b)",
+                "not_implemented",
+            );
+        }
+        let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
+        return match orchestrate_recipe(&state, recipe, &messages).await {
+            Ok(resp) => Json(resp).into_response(),
+            Err(r) => r,
+        };
     }
 
     let provider = model.split('/').next().unwrap_or("");
@@ -134,13 +202,11 @@ async fn chat_completions(Json(body): Json<Value>) -> Response {
         Err(e) => return engine_err_response(e),
     };
 
-    // Forward body with the bare model.
     let bare = model.splitn(2, '/').nth(1).unwrap_or("").to_string();
     let mut fwd = body.clone();
     fwd["model"] = json!(bare);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    // ollama num_ctx → native /api/chat (which honors it). Streaming-native is slice 3b.
     if provider == "ollama" && ollama_native::wants_native(&fwd) {
         if stream {
             return err_response(
@@ -157,7 +223,6 @@ async fn chat_completions(Json(body): Json<Value>) -> Response {
         return passthrough_stream(&inf, &fwd, &headers).await;
     }
 
-    // Plain non-stream /v1 passthrough.
     fwd["stream"] = json!(false);
     match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
         Ok(resp) => relay_json(resp).await,
@@ -165,8 +230,6 @@ async fn chat_completions(Json(body): Json<Value>) -> Response {
     }
 }
 
-/// num_ctx → native `/api/chat`: translate request to native shape, response back to
-/// OpenAI `chat.completion` (non-stream).
 async fn passthrough_native(
     inf: &engine::Inferencer,
     fwd: &Value,
@@ -188,8 +251,6 @@ async fn passthrough_native(
     }
 }
 
-/// Relay the upstream OpenAI SSE byte-for-byte (status checked first: a 4xx surfaces as
-/// JSON, not an empty 200 stream).
 async fn passthrough_stream(
     inf: &engine::Inferencer,
     fwd: &Value,
@@ -210,7 +271,7 @@ async fn passthrough_stream(
 
 // --- POST /v1/responses (stateless, non-stream) -------------------------------
 
-async fn responses_create(Json(body): Json<Value>) -> Response {
+async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     let input = body.get("input").cloned().unwrap_or_else(|| json!(""));
     let messages = match responses::parse_input(&input) {
@@ -237,24 +298,31 @@ async fn responses_create(Json(body): Json<Value>) -> Response {
             "not_implemented",
         );
     }
+
+    let resp_id = responses::new_id("resp");
+
+    // woollama/<recipe> → orchestrate; extract the final assistant text.
     if let Some(name) = model.strip_prefix("woollama/") {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            format!("orchestration for 'woollama/{name}' is not yet in the Rust server (slice 4)"),
-            "not_implemented",
-        );
+        let Some(recipe) = state.recipes.get(name) else {
+            return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
+        };
+        return match orchestrate_recipe(&state, recipe, &json!(messages)).await {
+            Ok(resp) => {
+                let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                Json(responses::build_response(&resp_id, &model, text)).into_response()
+            }
+            Err(r) => r,
+        };
     }
 
-    // Stateless inferencer turn — the engine's complete handles native num_ctx via options.
+    // Stateless inferencer turn — the engine's complete handles native num_ctx.
     let options = body.get("options").cloned();
     let req = match engine::build_request(&model, json!(messages), options, None, None, None, false) {
         Ok(r) => r,
         Err(e) => return engine_err_response(e),
     };
     match engine::run_complete(req).await {
-        Ok(text) => {
-            Json(responses::build_response(&responses::new_id("resp"), &model, &text)).into_response()
-        }
+        Ok(text) => Json(responses::build_response(&resp_id, &model, &text)).into_response(),
         Err(e) => engine_err_response(e),
     }
 }
