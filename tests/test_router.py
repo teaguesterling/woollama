@@ -17,10 +17,11 @@ The tests:
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
-from woollama import router
-from woollama import recipes
+from woollama import recipes, router
 from woollama.manager import Registry, ServerManager
 
 # ---------------------------------------------------------------------------
@@ -66,26 +67,66 @@ def mock_httpx(monkeypatch, post_responses: list[dict] | dict | None = None,
         post_script = list(post_responses)
         single_post = None
 
-    class _FakeClient:
-        def __init__(self, *_a, **_kw):
+    # Serve from a mock HTTP server + point $WOOLLAMA_OLLAMA_URL at it: the recipe
+    # loop / complete run in the Rust core (reqwest, not interceptable by an httpx
+    # patch); /v1/models discovery uses Python httpx — both hit the real mock server
+    # (POST = inferencer turn, GET = discovery payload).
+    lock = threading.Lock()
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
             pass
 
-        async def __aenter__(self):
-            return self
+        def _send(self, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
-        async def __aexit__(self, *_a):
-            return None
+        def do_GET(self):
+            self._send(get_payload or {})
 
-        async def get(self, _url, **_kw):
-            return HttpxResponseStub(200, get_payload or {})
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            with lock:
+                payload = post_script.pop(0) if post_script is not None else single_post
+            self._send(payload)
 
-        async def post(self, _url, json=None, **_kw):
-            if post_script is not None:
-                return HttpxResponseStub(200, post_script.pop(0))
-            return HttpxResponseStub(200, single_post)
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+def mock_inferencer_recording(monkeypatch, script: list[dict]) -> list[dict]:
+    """Like `mock_httpx` but RECORDS each posted request body (for asserting request
+    shape — system prompt sent, tool result fed back). Returns the `posted` list."""
+    posted: list[dict] = []
+    s = list(script)
+    lock = threading.Lock()
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            with lock:
+                posted.append(body)
+                payload = s.pop(0)
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return posted
 
 
 def _tool(name: str, description: str = "") -> SimpleNamespace:
@@ -363,23 +404,12 @@ async def test_orchestrate_sends_system_prompt_and_feeds_tool_result(monkeypatch
     fake_reg.add(mgr)
     monkeypatch.setattr(router, "registry", fake_reg)
 
-    posted: list[dict] = []
-    script = [
+    posted = mock_inferencer_recording(monkeypatch, [
         {"choices": [{"message": {"content": "", "tool_calls": [
             {"id": "c1", "function": {"name": "hello.count_to",
                                       "arguments": '{"n": 3}'}}]}}]},
         {"choices": [{"message": {"content": "done"}}]},
-    ]
-
-    class _Capture:
-        def __init__(self, *_a, **_kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_a): return None
-        async def post(self, _url, json=None, **_kw):
-            posted.append(json)
-            return HttpxResponseStub(200, script.pop(0))
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _Capture)
+    ])
 
     await router.chat_completions(FakeRequest({
         "model": "woollama/streamer",
@@ -429,23 +459,12 @@ async def test_orchestrate_continues_when_a_tool_dispatch_raises(monkeypatch, tm
     fake_reg.add(mgr)
     monkeypatch.setattr(router, "registry", fake_reg)
 
-    posted: list[dict] = []
-    script = [
+    posted = mock_inferencer_recording(monkeypatch, [
         {"choices": [{"message": {"content": "", "tool_calls": [
             {"id": "c1", "function": {"name": "hello.count_to",
                                       "arguments": "{}"}}]}}]},
         {"choices": [{"message": {"content": "recovered"}}]},
-    ]
-
-    class _Capture:
-        def __init__(self, *_a, **_kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_a): return None
-        async def post(self, _url, json=None, **_kw):
-            posted.append(json)
-            return HttpxResponseStub(200, script.pop(0))
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _Capture)
+    ])
 
     resp = await router.chat_completions(FakeRequest({
         "model": "woollama/streamer",
@@ -486,57 +505,39 @@ system = "test"
 # ---------------------------------------------------------------------------
 
 def mock_inferencer_stream(monkeypatch, turns: list[list[dict]]):
-    """Monkeypatch httpx.AsyncClient so each `.stream(POST)` plays the next
-    scripted SSE turn. A turn is a list of chunk dicts; each becomes a
-    `data: {...}` line and a trailing `data: [DONE]` is appended automatically —
-    so the per-turn DONE is something the router must SWALLOW, not relay."""
+    """Serve scripted SSE turns from a mock HTTP server + point $WOOLLAMA_OLLAMA_URL at
+    it (recipe streaming runs in the Rust core, reqwest — not interceptable by httpx).
+    Each POST plays the next turn: a list of chunk dicts → `data: {...}` lines + a
+    trailing `data: [DONE]` (the per-turn DONE the loop must SWALLOW). A turn dict with
+    `_status` returns that upstream error (mid-loop-error tests)."""
     script = list(turns)
+    lock = threading.Lock()
 
-    class _StreamCM:
-        def __init__(self, turn):
-            # A turn is normally a list of chunk dicts; a dict with `_status`
-            # makes that turn return an upstream error (for mid-loop-error tests).
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            with lock:
+                turn = script.pop(0)
             if isinstance(turn, dict) and "_status" in turn:
-                self.status_code = turn["_status"]
-                self._lines = []
-                self._body = json.dumps(turn.get("_body", {})).encode()
+                status = turn["_status"]
+                raw = json.dumps(turn.get("_body", {})).encode()
             else:
-                self.status_code = 200
-                self._lines = ([f"data: {json.dumps(c)}" for c in turn]
-                               + ["", "data: [DONE]", ""])
-                self._body = b""
+                status = 200
+                raw = ("".join(f"data: {json.dumps(c)}\n\n" for c in turn)
+                       + "data: [DONE]\n\n").encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return None
-
-        async def aiter_lines(self):
-            for ln in self._lines:
-                yield ln
-
-        async def aread(self):
-            return self._body
-
-    class _Client:
-        def __init__(self, *_a, **_kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return None
-
-        async def aclose(self):
-            pass
-
-        def stream(self, _method, _url, json=None, **_kw):
-            return _StreamCM(script.pop(0))
-
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
 
 async def _collect_sse(resp) -> tuple[list[dict], bool, list[dict]]:

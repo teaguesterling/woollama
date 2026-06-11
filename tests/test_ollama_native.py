@@ -10,11 +10,12 @@ translated back to the OpenAI chat-completions shape. The live acceptance
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import httpx
+import httpx  # used by the ollama-native PASSTHROUGH stream test (a Python path)
 
-from woollama import router
-from woollama import ollama_native
+from woollama import ollama_native, router
 
 
 class FakeRequest:
@@ -123,23 +124,42 @@ class _Resp:
 
 
 def _mock_httpx(monkeypatch, posts: list, native_payload: dict | None = None):
-    """Capture every POST (url, json). Non-stream POSTs return native_payload."""
+    """Capture every POST `(path, body)` into `posts` and return native_payload, from
+    a mock HTTP server + $WOOLLAMA_OLLAMA_URL. `complete_stateless` runs in the Rust
+    core (reqwest); the ollama passthrough uses Python httpx — both hit the server."""
     payload = native_payload or {
         "model": "qwen3:14b", "message": {"role": "assistant", "content": "ok"},
         "done": True, "done_reason": "stop",
         "prompt_eval_count": 5, "eval_count": 3,
     }
+    lock = threading.Lock()
 
-    class _Client:
-        def __init__(self, *_a, **_kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_a): return None
-        async def get(self, *_a, **_kw): return _Resp({})
-        async def post(self, url, json=None, **_kw):
-            posts.append((url, json))
-            return _Resp(payload)
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
 
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        def _send(self, body):
+            raw = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self._send({})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+            with lock:
+                posts.append((self.path, body))
+            self._send(payload)
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
 
 async def test_passthrough_routes_num_ctx_to_native_endpoint(monkeypatch):

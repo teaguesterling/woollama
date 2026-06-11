@@ -12,11 +12,10 @@ empty 200 stream.
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import httpx
-
-from woollama import router
-from woollama import recipes
+from woollama import recipes, router
 
 
 class FakeRequest:
@@ -46,26 +45,33 @@ async def _collect(resp) -> list[dict]:
 
 
 def _mock_inferencer_stream(monkeypatch, deltas, status=200):
-    """Mock httpx so the inferencer streams chat.completion.chunk SSE lines."""
-    lines = [f'data: {json.dumps({"choices": [{"delta": {"content": d}}]})}'
-             for d in deltas] + ["data: [DONE]"]
+    """Stream chat.completion.chunk SSE from a mock HTTP server + point
+    $WOOLLAMA_OLLAMA_URL at it. The Rust core streams via reqwest, which an in-process
+    httpx patch can't intercept."""
+    if status >= 400:
+        body = '{"error": {"message": "upstream"}}'
+    else:
+        body = "".join(
+            f'data: {json.dumps({"choices": [{"delta": {"content": d}}]})}\n\n'
+            for d in deltas) + "data: [DONE]\n\n"
+    raw = body.encode()
 
-    class _CM:
-        def __init__(self): self.status_code = status
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def aiter_lines(self):
-            for ln in lines:
-                yield ln
-        async def aread(self):
-            return b'{"error": {"message": "upstream"}}'
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
 
-    class _Client:
-        def __init__(self, *a, **k): pass
-        def stream(self, *a, **k): return _CM()
-        async def aclose(self): return None
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            self.send_response(status)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
 
 # --- inferencer streaming -----------------------------------------------------

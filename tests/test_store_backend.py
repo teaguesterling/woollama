@@ -13,6 +13,8 @@ inference failure surfaces cleanly (not a 500).
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from woollama import conversations, router
 
@@ -175,10 +177,8 @@ async def test_conversations_items_served_for_store_backend(monkeypatch):
 async def test_store_backed_ollama_turn_honors_num_ctx(monkeypatch):
     """The #1↔#2 seam closed: a stateful store-backed ollama turn threads
     options.num_ctx through send_turn → complete_stateless → the native /api/chat
-    (which honors num_ctx). Registers the REAL complete_stateless and mocks httpx
-    to capture where the inference call lands."""
-    import httpx
-
+    (which honors num_ctx). Registers the REAL complete_stateless and mocks the
+    inferencer at the wire to capture where the inference call lands."""
     store = FakeStore()
     monkeypatch.setattr(router, "conversation_store", conversations.ConversationStore())
     backend = conversations.StoreBackedBackend(
@@ -189,17 +189,22 @@ async def test_store_backed_ollama_turn_honors_num_ctx(monkeypatch):
 
     posts: list = []
 
-    class _Client:
-        def __init__(self, *a, **k): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return None
-        async def post(self, url, json=None, **k):
-            posts.append((url, json))
-            # native /api/chat reply shape
-            return type("R", (), {"status_code": 200,
-                                  "json": lambda self: {"message": {"content": "ok"},
-                                                        "done": True}})()
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            posts.append((self.path, json.loads(self.rfile.read(n) or b"{}")))
+            raw = json.dumps({"message": {"content": "ok"}, "done": True}).encode()  # native shape
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    _srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{_srv.server_address[1]}")
 
     r = await router.responses_create(FakeRequest({
         "model": "ollama/qwen3", "input": "hi", "store": True,
@@ -215,8 +220,11 @@ async def test_inference_failure_surfaces_cleanly_not_500(monkeypatch):
     OrchestrationError. _responses_stateful must surface it (here 502 with the
     upstream payload), not let it escape as an unhandled 500."""
     async def boom(model, messages, *, options=None):
+        # positional payload (the Rust InferenceError exposes the structured fields but,
+        # like BaseException, takes keyword args only through its #[new]; constructing
+        # it positionally is what the core itself does).
         raise router.OrchestrationError("inferencer down", "server_error", 502,
-                                        payload={"error": "down"})
+                                        {"error": "down"})
     setup(monkeypatch, complete=boom)
     r = await router.responses_create(FakeRequest({
         "model": "ollama/qwen3", "input": "hi", "store": True}))

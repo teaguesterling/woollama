@@ -9,12 +9,13 @@ a real round-trip is the opt-in @needs_anthropic live test in test_integration).
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 import pytest
 
-from woollama import router
-from woollama import config, inferencers, recipes
+from woollama import config, inferencers, recipes, router
 from woollama.manager import Registry
 
 
@@ -194,25 +195,63 @@ def _capture_httpx(monkeypatch, payload):
     return seen
 
 
+def _capture_wire(payload):
+    """Record the inferencer POST `(path, headers, body)` at the WIRE — the orchestrate
+    loop runs in the Rust core (reqwest), so we observe what the inferencer actually
+    receives rather than patching httpx. Point the provider's base_url at the returned
+    URL ($WOOLLAMA_OLLAMA_URL or an inferencers.toml override). The exact HOST is the
+    Rust registry's concern (covered by woollama-core's test_registry_conformance);
+    here we assert the path + auth + body the core builds. Returns (seen, base_url)."""
+    seen: dict = {}
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def _send(self, body):
+            raw = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self._send({})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            seen["path"] = self.path
+            seen["headers"] = {k.lower(): v for k, v in self.headers.items()}
+            seen["json"] = json.loads(self.rfile.read(n) or b"{}")
+            self._send(payload)
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return seen, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
 async def test_orchestrate_routes_to_anthropic_with_auth(monkeypatch, tmp_path):
     """A woollama recipe with an anthropic inferencer orchestrates against the
-    Anthropic compat endpoint: right URL, Bearer auth, bare model, and the
-    provider's extra_body (max_tokens) merged in."""
+    Anthropic compat endpoint: right path, Bearer auth, bare model, and the
+    provider's extra_body (max_tokens) merged in. (anthropic's base_url is overridden
+    to a local mock via inferencers.toml; the real host is asserted in the Rust
+    registry conformance suite.)"""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    seen, base = _capture_wire({"choices": [{"message": {"content": "ok"}}]})
     (tmp_path / "recipes.toml").write_text(
         '[recipes.cloud]\ninferencer="anthropic/claude-sonnet-4-6"\ntools=[]\n'
         'system="be brief"\n')
+    (tmp_path / "inferencers.toml").write_text(
+        f'[inferencers.anthropic]\nbase_url="{base}/v1"\n')
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     recipes.reload()
-
-    seen = _capture_httpx(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
 
     resp = await router.orchestrate(
         recipes.get("cloud"), [{"role": "user", "content": "hi"}], Registry())
 
     assert resp["choices"][0]["message"]["content"] == "ok"
-    assert seen["url"] == "https://api.anthropic.com/v1/chat/completions"
-    assert seen["headers"]["Authorization"] == "Bearer sk-ant-test"
+    assert seen["path"] == "/v1/chat/completions"
+    assert seen["headers"]["authorization"] == "Bearer sk-ant-test"
     assert seen["json"]["model"] == "claude-sonnet-4-6"        # prefix stripped
     assert seen["json"]["max_tokens"]                          # extra_body merged
     assert seen["json"]["messages"][0] == {"role": "system", "content": "be brief"}
@@ -221,16 +260,16 @@ async def test_orchestrate_routes_to_anthropic_with_auth(monkeypatch, tmp_path):
 async def test_orchestrate_ollama_unchanged(monkeypatch, tmp_path):
     """Regression: the ollama path still posts to the ollama URL with no auth and
     its native `options` body (the generalization must not change ollama)."""
-    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", "http://localhost:11434")
+    seen, base = _capture_wire({"choices": [{"message": {"content": "done"}}]})
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", base)
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     recipes.reload()
-    seen = _capture_httpx(monkeypatch, {"choices": [{"message": {"content": "done"}}]})
 
     await router.orchestrate(
         recipes.get("streamer"), [{"role": "user", "content": "count to 3"}], Registry())
 
-    assert seen["url"] == "http://localhost:11434/v1/chat/completions"
-    assert seen["headers"] == {}
+    assert seen["path"] == "/v1/chat/completions"
+    assert "authorization" not in seen["headers"]              # ollama: no auth
     assert seen["json"]["options"] == {"temperature": 0}
 
 

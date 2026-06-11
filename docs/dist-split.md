@@ -130,13 +130,28 @@ Rust `core.InferenceError`, which carries only a message — the **structured
 `InferenceError` fields (kind/status/payload)** the port deferred. The router depends
 on them; the Python `InferenceError` had them.
 
-So greening the cutover needs, in addition to the harness rework:
+So greening the cutover needed, in addition to the harness rework:
 
 - **Rust: make `InferenceError` a structured exception** — `InferenceError(message,
   kind=None, status=None, payload=None)` with `.message`/`.kind`/`.status`/`.payload`
-  attributes, and have the Rust core's own raises populate them (e.g. the inferencer-
-  error path → `kind="server_error", status=502, payload=<upstream>`), matching the
-  Python `orchestrate.py` raises. (Best as a `#[pyclass(extends=PyException)]`.)
-- Then propagate the mock-server fixture to test_responses / test_responses_stream /
-  test_router / test_mcp_server, and fix the few test_inferencers / test_ollama_native
-  failures.
+  attributes, raises populated to match `orchestrate.py`. (A
+  `#[pyclass(extends=PyException)]`; construct POSITIONALLY — PyO3 wires `#[new]` as
+  __new__ only, so a `payload=` kwarg reaches the inherited `BaseException.__init__`
+  which rejects it.)
+- Propagate the mock-server fixture to every orchestration-driving test (test_routing,
+  test_responses, test_responses_stream, test_router, test_mcp_server,
+  test_inferencers, test_ollama_native, test_store_backend); leave the Python-path
+  httpx patches (passthrough, /v1/models discovery, file-store) as-is.
+
+## DONE ✅
+
+Both pieces landed. The server runs entirely on the Rust `woollama.core`:
+**225 server tests + 42 Rust conformance tests green**, ruff clean. The obsolete
+Python-engine tests (test_core_{inference,orchestrate,models}) were removed — their
+coverage is the Rust conformance suite + the (now wire-mocked) server integration
+tests; `make_recipe` coverage preserved in test_recipes.py.
+
+Remaining deferred (named, NOT blocking the migration): the registry's discovery
+fields (`models`/`discover`/`model_patterns`) + a Rust `/v1/models` (still Python in
+`woollama.inferencers`); publishing `woollama-core` to PyPI so the server dep isn't a
+path source; and re-pinning lackpy from the git rev to the published wheel.

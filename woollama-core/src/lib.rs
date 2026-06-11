@@ -62,6 +62,10 @@ impl InferenceError {
         InferenceError { message, kind, status, payload }
     }
 
+    // NB: like `BaseException`, construct POSITIONALLY — `InferenceError(msg, kind,
+    // status, payload)`. A `payload=`-style keyword reaches the inherited
+    // `BaseException.__init__` (PyO3 wires `#[new]` as __new__ only, not __init__),
+    // which rejects kwargs. The core always raises positionally (see inf_err*).
     fn __str__(&self) -> String {
         self.message.clone()
     }

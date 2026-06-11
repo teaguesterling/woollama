@@ -9,9 +9,10 @@ deferred (501) rather than half-implemented.
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from woollama import responses, router
-from woollama import recipes
+from woollama import recipes, responses, router
 from woollama.manager import Registry
 
 # ---------------------------------------------------------------------------
@@ -26,24 +27,27 @@ class FakeRequest:
         return self._body
 
 
-class _Stub:
-    def __init__(self, payload, status=200):
-        self.status_code = status
-        self._p = payload
-
-    def json(self):
-        return self._p
-
-
 def mock_post(monkeypatch, payload):
-    class _Client:
-        def __init__(self, *a, **k): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return None
-        async def get(self, *a, **k): return _Stub({})
-        async def post(self, *a, **k): return _Stub(payload)
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    """Serve `payload` for every inferencer POST from a mock HTTP server + point
+    $WOOLLAMA_OLLAMA_URL at it. The recipe loop / complete run in the Rust core
+    (reqwest), which an in-process httpx patch can't intercept."""
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
 
 # ---------------------------------------------------------------------------

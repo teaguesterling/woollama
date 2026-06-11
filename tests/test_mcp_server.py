@@ -21,14 +21,16 @@ empty registry is fine.
 """
 from __future__ import annotations
 
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
 from fastmcp import Client
 from mcp.types import TextContent
 
-from woollama import mcp_server
-from woollama import recipes
+from woollama import mcp_server, recipes
 from woollama.manager import Registry, ServerManager
 
 # fastmcp's Client is async; mark the whole module.
@@ -105,29 +107,23 @@ async def test_chat_tool_orchestrates_end_to_end(server, monkeypatch):
     The inferencer is mocked (unit test, not integration): turn 1 returns final
     content, so the tool-dispatch path is never reached."""
 
-    class _Resp:
-        def __init__(self, payload):
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-    class _FakeClient:
-        def __init__(self, *_a, **_kw):
+    # The recipe loop runs in the Rust core (reqwest) — mock at the wire (a mock HTTP
+    # server + $WOOLLAMA_OLLAMA_URL), not via an in-process httpx patch.
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
             pass
 
-        async def __aenter__(self):
-            return self
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            raw = json.dumps({"choices": [{"message": {"content": "Counted to 3."}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
 
-        async def __aexit__(self, *_a):
-            return None
-
-        async def post(self, _url, json=None, **_kw):
-            return _Resp({"choices": [{"message": {"content": "Counted to 3."}}]})
-
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
 
     async with Client(server) as c:
         result = await c.call_tool("chat", {
