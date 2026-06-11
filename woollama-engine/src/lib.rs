@@ -146,6 +146,19 @@ fn build_headers(inf: &Inferencer, api_key: Option<&str>) -> Result<HashMap<Stri
     }
 }
 
+impl Inferencer {
+    /// The OpenAI-compatible chat endpoint (`<base_url>/chat/completions`).
+    pub fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+    /// Auth headers from the configured `api_key_env` (empty if none); errors if a
+    /// required key env is unset — mirrors Python `Inferencer.headers()`. Used by the
+    /// server's passthrough.
+    pub fn auth_headers(&self) -> Result<HashMap<String, String>, EngineError> {
+        build_headers(self, None).map_err(|e| EngineError::new(e, "invalid_request_error", 400))
+    }
+}
+
 fn split_model(model: &str) -> (String, String) {
     match model.split_once('/') {
         Some((p, m)) => (p.to_string(), m.to_string()),

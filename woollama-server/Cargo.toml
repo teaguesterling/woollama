@@ -2,14 +2,24 @@
 name = "woollama-server"
 version = "0.4.0"
 edition = "2021"
-description = "The woollama router service (Rust). Stub — grows from slice 2 (see docs/rust-router-port.md)."
+description = "The woollama router service (Rust) — axum HTTP surface over woollama-engine."
 license = "MIT"
+
+[lib]
+name = "woollama_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "woollama-server"
 path = "src/main.rs"
 
 [dependencies]
-# The pure-Rust engine — proves it links into a non-PyO3 binary (slice 1's point).
-# Slice 2 adds axum/tokio and the HTTP surface on top of it.
 woollama-engine = { path = "../woollama-engine" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }

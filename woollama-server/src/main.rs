@@ -1,21 +1,13 @@
-//! The woollama router service, as a native Rust binary.
-//!
-//! STUB (slice 0): this crate exists so the cargo workspace hosts the eventual
-//! server binary alongside the engine cdylib and the PyO3 wheel, and so we prove
-//! the three build targets coexist without breaking the maturin wheel build.
-//!
-//! It does nothing yet. The HTTP surface (axum), the MCP aggregator (rmcp), the
-//! conversation stores, and the claude-code executor land from slice 2 onward,
-//! built on `woollama-core` once that is a pure rlib (slice 1).
-//!
-//! See docs/rust-router-port.md for the slice plan.
+//! The woollama router service binary. Binds TCP (`WOOLLAMA_ADDRESS` or loopback) and
+//! serves the axum app from `woollama_server::router()`. See docs/rust-router-port.md.
 
-fn main() {
-    // Slice 1 proof: the engine rlib links into a pure-Rust binary (no PyO3).
-    // The HTTP surface that drives these primitives lands in slice 2.
-    eprintln!(
-        "woollama-server {} — stub (slice 1). engine providers: {}",
-        env!("CARGO_PKG_VERSION"),
-        woollama_engine::provider_names().join(", ")
-    );
+#[tokio::main]
+async fn main() {
+    let (host, port) = woollama_server::resolve_tcp_target();
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
+        .await
+        .unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
+    let addr = listener.local_addr().expect("local_addr");
+    eprintln!("woollama-server {} listening on http://{addr}", env!("CARGO_PKG_VERSION"));
+    axum::serve(listener, woollama_server::router()).await.expect("serve");
 }
