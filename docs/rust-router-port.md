@@ -178,8 +178,12 @@ woollama/                         (cargo workspace root = the woollama placehold
    repo (Python uses the SDK), so the client targets a SIMPLIFIED protocol exercised by
    the mock — the real API must be reconciled before the opt-in live `@needs_anthropic`
    test passes. The tested value is woollama's routing, not the Anthropic wire format.
-8. **`/v1/models` discovery in Rust.** Static `models` + live `discover` +
-   `model_patterns`; collapses the two-registry drift (the named deferred item).
+8. **`/v1/models` discovery in Rust.** ✅ DONE (commit `dcfe8f8`). Discovery fields
+   (`models`/`discover`/`model_patterns`) ported into the engine `Inferencer`/registry
+   (so ONE registry serves orchestration + discovery — the two-registry drift is gone;
+   `inferencer_to_json` unchanged so conformance is untouched); server `/v1/models` does
+   static + live discovery (namespaced, fnmatch-filtered) + recipes. Gate: a mock-`/v1/models`
+   e2e covering live discover, pattern filtering, static models, and recipes.
 9. **Cutover.** `woollama` entrypoint = the Rust binary; Python server retired to
    reference. Wheel stays as the auxiliary embed surface; re-pin lackpy to it.
 
