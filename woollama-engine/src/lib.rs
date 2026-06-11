@@ -84,6 +84,13 @@ pub struct Inferencer {
     /// (NOT into `complete`). ollama keeps native `options`, anthropic gets a sane
     /// max_tokens, clouds get temperature=0 for determinism.
     pub extra_body: Value,
+    /// Model discoverability for `GET /v1/models` (issue #3). woollama owns no catalog —
+    /// a provider's models surface only if opted in: `models` (explicit ids, no key),
+    /// `discover` (live-query the provider's own /v1/models, needs key), `model_patterns`
+    /// (fnmatch globs filtering a discovered catalog; empty = all).
+    pub models: Vec<String>,
+    pub discover: bool,
+    pub model_patterns: Vec<String>,
 }
 
 /// The built-in providers — same set/URLs/extra_body as `woollama.core.inferencers`.
@@ -94,6 +101,9 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
         base_url: b.to_string(),
         api_key_env: Some(k.to_string()),
         extra_body: json!({"temperature": 0}),
+        models: Vec::new(),
+        discover: false,
+        model_patterns: Vec::new(),
     };
     match provider {
         "ollama" => {
@@ -106,6 +116,9 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
                 base_url: format!("{root}/v1"),
                 api_key_env: None,
                 extra_body: json!({"options": {"temperature": 0}}),
+                models: Vec::new(),
+                discover: true, // local catalog is small + needs no key → list it
+                model_patterns: Vec::new(),
             })
         }
         "anthropic" => Some(Inferencer {
@@ -113,6 +126,9 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
             base_url: "https://api.anthropic.com/v1".to_string(),
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             extra_body: json!({"temperature": 0, "max_tokens": 4096}),
+            models: Vec::new(),
+            discover: false,
+            model_patterns: Vec::new(),
         }),
         "openai" => Some(cloud("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")),
         "groq" => Some(cloud("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")),
@@ -433,7 +449,20 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
             .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
             .cloned()
             .unwrap_or_else(|| base.as_ref().map_or_else(|| json!({}), |b| b.extra_body.clone()));
-        reg.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body });
+        // discovery (issue #3): models/model_patterns falsy-or; discover absence-inherit.
+        let str_list = |v: Option<&Value>| {
+            v.and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+                .filter(|l| !l.is_empty())
+        };
+        let models = str_list(spec.get("models")).or_else(|| base.as_ref().map(|b| b.models.clone())).unwrap_or_default();
+        let discover = match spec.get("discover") {
+            Some(v) => v.as_bool().unwrap_or(false),
+            None => base.as_ref().is_some_and(|b| b.discover),
+        };
+        let model_patterns =
+            str_list(spec.get("model_patterns")).or_else(|| base.as_ref().map(|b| b.model_patterns.clone())).unwrap_or_default();
+        reg.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body, models, discover, model_patterns });
     }
     Ok(reg)
 }
@@ -463,7 +492,10 @@ impl Registry {
         Ok(Registry { infs: build_config_registry()? })
     }
     pub fn add(&mut self, name: String, base_url: String, api_key_env: Option<String>, extra_body: Value) {
-        self.infs.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body });
+        self.infs.insert(
+            name.clone(),
+            Inferencer { name, base_url, api_key_env, extra_body, models: Vec::new(), discover: false, model_patterns: Vec::new() },
+        );
     }
     /// The resolved inferencer as a JSON dict, or None.
     pub fn get_json(&self, provider: &str) -> Option<Value> {
@@ -473,6 +505,14 @@ impl Registry {
         let mut n: Vec<String> = self.infs.keys().cloned().collect();
         n.sort();
         n
+    }
+
+    /// The resolved inferencers, sorted by name — for `GET /v1/models` discovery (reads
+    /// `models`/`discover`/`model_patterns` + base_url/auth for the live query).
+    pub fn list(&self) -> Vec<Inferencer> {
+        let mut v: Vec<Inferencer> = self.infs.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
     }
     pub fn all_json(&self) -> Value {
         let map: serde_json::Map<String, Value> =

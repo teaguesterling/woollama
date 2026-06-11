@@ -1,16 +1,18 @@
 //! The woollama router service (Rust) — the axum HTTP surface over `woollama-engine`.
 //!
-//! Slices landed here:
-//!   2  — TCP binding, `GET /v1/models`, `POST /v1/chat/completions` passthrough.
-//!   3  — native num_ctx passthrough (non-stream), streaming passthrough, stateless
-//!        `POST /v1/responses` (non-stream).
-//!   4a — `woollama/<recipe>` ORCHESTRATION: a downstream MCP registry (rmcp
-//!        child-process clients) + `RegistryToolProvider` drives the engine recipe
-//!        loop, on `/v1/chat/completions` and stateless `/v1/responses` (non-stream).
+//! Surface (slices 2–8, see docs/rust-router-port.md):
+//!   - `GET /v1/models` — inferencer discovery (static + live) + recipes (slice 8).
+//!   - `POST /v1/chat/completions` — passthrough (`<provider>/<model>`, incl. native
+//!     num_ctx + streaming) and `woollama/<recipe>` orchestration (incl. streaming),
+//!     dispatching tools to the downstream MCP registry; claude-code recipes execute
+//!     via the claude CLI.
+//!   - `POST /v1/responses` — stateless (incl. streaming) and STATEFUL (claude-resume,
+//!     store-backed, managed-agents) with the requires_action pause/resume.
+//!   - `/v1/conversations` CRUD + `/items` — the durable handle table.
+//!   - `/mcp` — woollama AS an MCP server (Streamable-HTTP), plus a `mcp` stdio subcommand.
 //!
-//! Deferred (each a clear 501): native num_ctx STREAMING + Responses streaming/items
-//! (3b); STREAMING orchestration + the woollama-as-MCP `/mcp` surface (4b); stateful
-//! `/v1/responses` (6–7); `/v1/models` discovery (8); the Unix socket.
+//! Remaining: the Unix-socket surface; the cutover (slice 9). Managed-agents' Anthropic
+//! wire format is best-effort pending live reconciliation (see managed_agents.rs).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -454,8 +456,68 @@ pub(crate) async fn orchestrate_recipe(
 
 // --- GET /v1/models -----------------------------------------------------------
 
-async fn list_models() -> Json<Value> {
-    Json(json!({"object": "list", "data": []}))
+/// `GET /v1/models` (slice 8): each inferencer's opted-in models (static `models` +
+/// optional live `discover`, namespaced `provider/<id>`) plus `woollama/<recipe>`.
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut data: Vec<Value> = Vec::new();
+    for inf in state.inferencers.list() {
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = inf.models.clone();
+        if inf.discover {
+            if let Ok(found) = discover_models(&inf).await {
+                ids.extend(found);
+            }
+        }
+        for id in ids {
+            if seen.insert(id.clone()) {
+                data.push(json!({"id": format!("{}/{id}", inf.name), "object": "model", "owned_by": inf.name}));
+            }
+        }
+    }
+    let mut recipe_names: Vec<String> = state.recipes.keys().cloned().collect();
+    recipe_names.sort();
+    for r in recipe_names {
+        data.push(json!({"id": format!("woollama/{r}"), "object": "model", "owned_by": "woollama"}));
+    }
+    Json(json!({"object": "list", "data": data}))
+}
+
+/// Live-query a provider's own `/v1/models`, filtered by its `model_patterns` (empty =
+/// all). Errors (missing key / unreachable / non-200) are the caller's cue to skip.
+async fn discover_models(inf: &engine::Inferencer) -> Result<Vec<String>, ()> {
+    let headers = inf.auth_headers().map_err(|_| ())?;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().map_err(|_| ())?;
+    let mut rb = client.get(format!("{}/models", inf.base_url.trim_end_matches('/')));
+    for (k, v) in &headers {
+        rb = rb.header(k, v);
+    }
+    let r = rb.send().await.map_err(|_| ())?;
+    if !r.status().is_success() {
+        return Err(());
+    }
+    let v: Value = r.json().await.map_err(|_| ())?;
+    let mut ids: Vec<String> = v
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from)).collect())
+        .unwrap_or_default();
+    if !inf.model_patterns.is_empty() {
+        ids.retain(|id| inf.model_patterns.iter().any(|p| fnmatch(p, id)));
+    }
+    Ok(ids)
+}
+
+/// fnmatch-style glob (`*` any run, `?` one char) — mirrors Python's `fnmatch` filtering.
+fn fnmatch(pattern: &str, name: &str) -> bool {
+    fn m(p: &[u8], n: &[u8]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => m(rest, n) || (!n.is_empty() && m(p, &n[1..])),
+            Some((b'?', rest)) => !n.is_empty() && m(rest, &n[1..]),
+            Some((c, rest)) => !n.is_empty() && n[0] == *c && m(rest, &n[1..]),
+        }
+    }
+    m(pattern.as_bytes(), name.as_bytes())
 }
 
 // --- POST /v1/chat/completions ------------------------------------------------
@@ -962,4 +1024,22 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
         t.remove(&conv_id);
     }
     Json(json!({"id": conv_id, "object": "conversation.deleted", "deleted": true})).into_response()
+}
+
+#[cfg(test)]
+mod fnmatch_tests {
+    use super::fnmatch;
+
+    #[test]
+    fn glob_star_and_question() {
+        assert!(fnmatch("gpt-4*", "gpt-4o"));
+        assert!(fnmatch("keep-*", "keep-this"));
+        assert!(!fnmatch("keep-*", "drop-that"));
+        assert!(fnmatch("*", "anything"));
+        assert!(fnmatch("q?en", "qwen"));
+        assert!(!fnmatch("q?en", "qween"));
+        assert!(fnmatch("exact", "exact"));
+        assert!(!fnmatch("exact", "exacto"));
+        assert!(fnmatch("a*b*c", "axxbyyc"));
+    }
 }
