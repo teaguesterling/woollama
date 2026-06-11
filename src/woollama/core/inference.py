@@ -18,7 +18,8 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from . import inferencers, ollama_native
+from . import inferencers
+from .. import ollama_native
 
 # Ollama's native /api/chat may need to load a large model on the first call; the
 # /v1 path is the usual OpenAI request timeout.

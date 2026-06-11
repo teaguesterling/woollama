@@ -59,9 +59,9 @@ def state_dir() -> Path:
 def _examples_dir() -> Path:
     """The repo's `examples/` directory (dev checkout only — used by the bundled
     default mcp.json's `${WOOLLAMA_EXAMPLES_DIR}`). This file lives at
-    `src/woollama/core/config.py`, so the repo root is the 4th parent up. Guarded
+    `src/woollama/config.py`, so the repo root is the 3rd parent up. Guarded
     by `test_examples_dir_resolves` so a future move can't silently break it."""
-    return Path(__file__).resolve().parents[3] / "examples"
+    return Path(__file__).resolve().parents[2] / "examples"
 
 
 def _expand_env(text: str) -> str:
