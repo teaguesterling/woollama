@@ -20,7 +20,7 @@ import json
 from types import SimpleNamespace
 
 from woollama import router
-from woollama.core import recipes
+from woollama import recipes
 from woollama.manager import Registry, ServerManager
 
 # ---------------------------------------------------------------------------

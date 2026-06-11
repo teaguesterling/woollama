@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 
 from woollama import responses, router
-from woollama.core import recipes
+from woollama import recipes
 from woollama.manager import Registry
 
 # ---------------------------------------------------------------------------

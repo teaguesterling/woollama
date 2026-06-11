@@ -14,7 +14,7 @@ import json
 import httpx
 
 from woollama import router
-from woollama.core import ollama_native
+from woollama import ollama_native
 
 
 class FakeRequest:

@@ -19,7 +19,7 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from .core.tooling import ToolResult, ToolSpec
+from .tooling import ToolResult, ToolSpec
 
 log = logging.getLogger("woollama.manager")
 

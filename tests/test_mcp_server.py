@@ -28,7 +28,7 @@ from fastmcp import Client
 from mcp.types import TextContent
 
 from woollama import mcp_server
-from woollama.core import recipes
+from woollama import recipes
 from woollama.manager import Registry, ServerManager
 
 # fastmcp's Client is async; mark the whole module.

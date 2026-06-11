@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from woollama import router
-from woollama.core import config, inferencers, recipes
+from woollama import config, inferencers, recipes
 from woollama.manager import Registry
 
 

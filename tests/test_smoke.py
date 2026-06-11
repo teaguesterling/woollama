@@ -24,7 +24,7 @@ def test_recipes_have_streamer(monkeypatch, tmp_path):
     """The bundled single-server recipe is intact."""
     # Point config dir at an empty location → falls back to bundled defaults
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    from woollama.core import recipes
+    from woollama import recipes
     recipes.reload()
     r = recipes.get("streamer")
     assert r is not None
@@ -37,7 +37,7 @@ def test_recipes_have_streamer(monkeypatch, tmp_path):
 def test_recipes_have_cross_server(monkeypatch, tmp_path):
     """The cross-server recipe references tools from both bundled servers."""
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    from woollama.core import recipes
+    from woollama import recipes
     recipes.reload()
     r = recipes.get("textcounter")
     assert r is not None
@@ -59,7 +59,7 @@ def test_registry_namespacing():
 
 def test_recipes_unknown_returns_none(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    from woollama.core import recipes
+    from woollama import recipes
     recipes.reload()
     assert recipes.get("does-not-exist") is None
 

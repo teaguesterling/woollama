@@ -32,7 +32,7 @@ from fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 
 from woollama import claude_code, mcp_server, router
-from woollama.core import recipes
+from woollama import recipes
 from woollama.manager import Registry, ServerManager
 
 # ---------------------------------------------------------------------------

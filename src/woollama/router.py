@@ -32,7 +32,7 @@ from . import (
     managed_agents,
     responses,
 )
-from .core import config, inferencers, ollama_native, recipes
+from . import config, inferencers, ollama_native, recipes
 from .core import inference as _inference
 from .core import orchestrate as _core_orchestrate
 from .manager import Registry, RegistryToolProvider, ServerManager

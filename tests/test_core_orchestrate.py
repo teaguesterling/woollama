@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 
 from woollama.core import orchestrate
-from woollama.core.tooling import ToolResult, ToolSpec, render_tool_result
+from woollama.tooling import ToolResult, ToolSpec, render_tool_result
 
 
 class _Block:

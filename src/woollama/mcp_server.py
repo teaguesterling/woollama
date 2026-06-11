@@ -43,7 +43,7 @@ from fastmcp.tools import Tool
 from fastmcp.tools.tool import ToolResult
 from pydantic import PrivateAttr
 
-from .core import config, recipes
+from . import config, recipes
 from .manager import Registry, ServerManager
 
 # NOTE: `orchestrate`/`OrchestrationError` are imported lazily inside the chat
