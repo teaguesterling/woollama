@@ -11,8 +11,11 @@
 //! See docs/rust-router-port.md for the slice plan.
 
 fn main() {
+    // Slice 1 proof: the engine rlib links into a pure-Rust binary (no PyO3).
+    // The HTTP surface that drives these primitives lands in slice 2.
     eprintln!(
-        "woollama-server {} — stub (slice 0). See docs/rust-router-port.md.",
-        env!("CARGO_PKG_VERSION")
+        "woollama-server {} — stub (slice 1). engine providers: {}",
+        env!("CARGO_PKG_VERSION"),
+        woollama_engine::provider_names().join(", ")
     );
 }

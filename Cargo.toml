@@ -4,7 +4,7 @@
 #   woollama-server — the router-service binary (stub today; grows from slice 2)
 # The root `woollama` package below stays as the crates.io-name placeholder.
 [workspace]
-members = ["woollama-core", "woollama-server"]
+members = ["woollama-engine", "woollama-core", "woollama-server"]
 resolver = "2"
 
 [package]

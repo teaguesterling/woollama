@@ -10,5 +10,6 @@ name = "woollama-server"
 path = "src/main.rs"
 
 [dependencies]
-# Intentionally empty for slice 0. Slice 2 adds axum/tokio and wires the engine
-# (woollama-core) once it is a pure rlib (slice 1).
+# The pure-Rust engine — proves it links into a non-PyO3 binary (slice 1's point).
+# Slice 2 adds axum/tokio and the HTTP surface on top of it.
+woollama-engine = { path = "../woollama-engine" }

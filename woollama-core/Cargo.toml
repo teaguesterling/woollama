@@ -10,15 +10,14 @@ name = "woollama_core"
 crate-type = ["cdylib"]
 
 [dependencies]
+# The pure-Rust engine (no pyo3) lives in woollama-engine now; this crate is just
+# the thin PyO3 wrapper that wires it to Python (InferenceError, PyToolProvider, the
+# async-iterator pyclasses, the pyfunctions).
+woollama-engine = { path = "../woollama-engine" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 pythonize = "0.23"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread"] }
-# The recipe loop is authored as one `stream!` of events (orchestrate_events);
-# `orchestrate` drains it. async-stream generates the suspend/resume state machine.
-async-stream = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = "0.3"
-# inferencers.toml parsing (registry slice). Deserialize straight into serde_json::Value.
-toml = "0.8"
+async-trait = "0.1"
