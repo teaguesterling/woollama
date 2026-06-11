@@ -17,12 +17,13 @@ path = "src/main.rs"
 woollama-engine = { path = "../woollama-engine" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# 0.13 to match rmcp's reqwest (so reqwest::Client unifies with rmcp's HTTP client impl).
+reqwest = { version = "0.13", features = ["json", "stream"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 # MCP: downstream servers as rmcp child-process clients (slice 4) + the stdio test
 # fixture (server side). transport-io gives the stdio (stdin/stdout) server transport.
-rmcp = { version = "1.7", features = ["client", "server", "macros", "transport-child-process", "transport-async-rw", "transport-io"] }
+rmcp = { version = "1.7", features = ["client", "server", "macros", "reqwest", "transport-child-process", "transport-async-rw", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 async-trait = "0.1"
 futures = "0.3"
 toml = "0.8"
@@ -33,5 +34,5 @@ path = "src/bin/mcp_fixture.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 tempfile = "3"

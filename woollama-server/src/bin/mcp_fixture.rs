@@ -28,7 +28,14 @@ impl ServerHandler for Fixture {
             }))
             .unwrap(),
         );
-        Ok(ListToolsResult::with_all_items(vec![Tool::new("count_to", "count to n", schema)]))
+        let out_schema: Arc<JsonObject> = Arc::new(
+            serde_json::from_value(json!({
+                "type": "object", "properties": {"count": {"type": "integer"}}
+            }))
+            .unwrap(),
+        );
+        let tool = Tool::new("count_to", "count to n", schema).with_raw_output_schema(out_schema);
+        Ok(ListToolsResult::with_all_items(vec![tool]))
     }
     async fn call_tool(
         &self,
@@ -41,7 +48,9 @@ impl ServerHandler for Fixture {
             .and_then(|a| a.get("n"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
-        Ok(CallToolResult::success(vec![Content::text(format!("counted to {n}"))]))
+        let mut res = CallToolResult::success(vec![Content::text(format!("counted to {n}"))]);
+        res.structured_content = Some(json!({"count": n}));
+        Ok(res)
     }
 }
 

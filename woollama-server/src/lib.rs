@@ -30,8 +30,11 @@ use engine::EngineError;
 
 mod config;
 mod mcp_registry;
+mod mcp_surface;
 mod ollama_native;
 mod responses;
+
+use mcp_surface::WoollamaMcp;
 
 pub use config::{load_mcp_servers, load_recipes};
 
@@ -76,13 +79,33 @@ pub fn resolve_tcp_target() -> (String, u16) {
     }
 }
 
-/// The axum app (shared by the binary and the integration tests).
+/// The axum app (shared by the binary and the integration tests). Mounts woollama's own
+/// MCP surface at `/mcp` (Streamable-HTTP) on the same port — the per-session factory
+/// shares the one `AppState` (and thus the one downstream registry).
 pub fn router(state: Arc<AppState>) -> Router {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::StreamableHttpService;
+
+    let mcp_state = state.clone();
+    let mcp_svc = StreamableHttpService::new(
+        move || Ok(WoollamaMcp { state: mcp_state.clone() }),
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_create))
+        .nest_service("/mcp", mcp_svc)
         .with_state(state)
+}
+
+/// Serve woollama's MCP surface over stdio — the `woollama-server mcp` subcommand (what
+/// an MCP client puts in its mcp.json). stdout is the JSON-RPC channel; logs go to stderr.
+pub async fn serve_mcp_stdio(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+    let running = rmcp::serve_server(WoollamaMcp { state }, (tokio::io::stdin(), tokio::io::stdout())).await?;
+    running.waiting().await?;
+    Ok(())
 }
 
 // --- error helpers ------------------------------------------------------------
@@ -128,31 +151,27 @@ async fn relay_json(resp: reqwest::Response) -> Response {
 
 // --- orchestration (shared by chat-completions + responses) -------------------
 
-/// Run a recipe to completion and return the final OpenAI response dict, or an error
-/// Response. Tools are dispatched to the downstream MCP registry.
-async fn orchestrate_recipe(
+/// Run a recipe to completion and return the final OpenAI response dict. Tools are
+/// dispatched to the downstream MCP registry. Shared by the HTTP handlers and the MCP
+/// `chat` tool; each maps the `EngineError` to its own surface.
+pub(crate) async fn orchestrate_recipe(
     state: &AppState,
     recipe: &config::Recipe,
     messages: &Value,
-) -> Result<Value, Response> {
+) -> Result<Value, EngineError> {
     let recipe_val = recipe.to_value();
     let provider: Arc<dyn engine::ToolProvider> =
         Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
-    let setup = engine::build_setup(&recipe_val, messages, provider, None, None, Some(&state.inferencers))
-        .map_err(engine_err_response)?;
+    let setup = engine::build_setup(&recipe_val, messages, provider, None, None, Some(&state.inferencers))?;
     let mut s = Box::pin(engine::events_stream(setup, false));
     while let Some(item) = s.next().await {
         match item {
             Ok(engine::Event::Final(resp)) => return Ok(resp),
             Ok(_) => continue,
-            Err(e) => return Err(engine_err_response(e)),
+            Err(e) => return Err(e),
         }
     }
-    Err(engine_err_response(EngineError::new(
-        "orchestrate: loop ended without a final response",
-        "server_error",
-        500,
-    )))
+    Err(EngineError::new("orchestrate: loop ended without a final response", "server_error", 500))
 }
 
 // --- GET /v1/models -----------------------------------------------------------
@@ -180,7 +199,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
         let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
         return match orchestrate_recipe(&state, recipe, &messages).await {
             Ok(resp) => Json(resp).into_response(),
-            Err(r) => r,
+            Err(e) => engine_err_response(e),
         };
     }
 
@@ -311,7 +330,7 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
                 let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("");
                 Json(responses::build_response(&resp_id, &model, text)).into_response()
             }
-            Err(r) => r,
+            Err(e) => engine_err_response(e),
         };
     }
 

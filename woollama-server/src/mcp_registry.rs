@@ -74,6 +74,40 @@ impl McpRegistry {
         let (server, bare) = namespaced.split_once('.')?;
         self.servers.get(server)?.tools.iter().find(|t| t.name == bare)
     }
+
+    /// Every downstream tool, re-exported namespaced `<server>.<tool>` with input +
+    /// output schema MIRRORED — for woollama's own tools/list (the MCP aggregator).
+    pub fn reexport_tools(&self) -> Vec<Tool> {
+        let mut out = Vec::new();
+        for (server, conn) in &self.servers {
+            for t in &conn.tools {
+                let mut nt = Tool::new(
+                    format!("{server}.{}", t.name),
+                    t.description.clone().unwrap_or_default(),
+                    t.input_schema.clone(),
+                );
+                if let Some(os) = t.output_schema.clone() {
+                    nt = nt.with_raw_output_schema(os);
+                }
+                out.push(nt);
+            }
+        }
+        out
+    }
+
+    /// Dispatch a namespaced tool and return the RAW `CallToolResult` (content +
+    /// structured_content), for the MCP proxy passthrough (vs. the lossy text render
+    /// `RegistryToolProvider::dispatch` does for the inference loop).
+    pub async fn call_raw(&self, namespaced: &str, args: &Value) -> Result<CallToolResult, String> {
+        let Some((peer, bare)) = self.resolve(namespaced) else {
+            return Err(format!("unknown tool '{namespaced}'"));
+        };
+        let mut params = CallToolRequestParams::new(bare);
+        if let Some(obj) = args.as_object() {
+            params = params.with_arguments(obj.clone());
+        }
+        peer.call_tool(params).await.map_err(|e| e.to_string())
+    }
 }
 
 /// Adapts an `McpRegistry` to the engine's `ToolProvider` seam.
