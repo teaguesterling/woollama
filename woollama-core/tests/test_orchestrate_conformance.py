@@ -201,7 +201,8 @@ def test_merges_extra_body_and_params(base_url):
     _run(recipe, prov, base_url, api_key="k")
 
     b = _LoopMock.requests[0]
-    assert b["model"] == "gpt-x" and b["stream"] is False and b["tools"] == []
+    # `tools` is OMITTED when the recipe allow-lists none (Anthropic rejects `[]`).
+    assert b["model"] == "gpt-x" and b["stream"] is False and "tools" not in b
     assert b["temperature"] == 0.7                       # param wins over extra_body's 0
     assert b["messages"][0] == {"role": "system", "content": "s"}
 

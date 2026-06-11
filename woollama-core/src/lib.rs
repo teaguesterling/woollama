@@ -864,8 +864,12 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
             Err(e) => { yield Err(inf_err(e.to_string(), "server_error", 502)); return; }
         };
         for turn in 1..=8u32 {
-            // body = {model, messages, tools, stream, **extra_body, **params}
-            let mut body = json!({"model": model, "messages": messages, "tools": schemas, "stream": stream_mode});
+            // body = {model, messages, tools?, stream, **extra_body, **params}
+            // Omit `tools` entirely when the recipe allow-lists none: Anthropic's
+            // OpenAI-compat endpoint rejects an empty `tools: []` ("List should have
+            // at least 1 item"), and OpenAI/Ollama are fine with it absent.
+            let mut body = json!({"model": model, "messages": messages, "stream": stream_mode});
+            if !schemas.is_empty() { body["tools"] = json!(schemas); }
             if let Some(o) = extra_body.as_object() { for (k, v) in o { body[k] = v.clone(); } }
             if let Some(o) = params.as_ref().and_then(Value::as_object) { for (k, v) in o { body[k] = v.clone(); } }
 
