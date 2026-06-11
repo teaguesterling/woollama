@@ -27,6 +27,9 @@ rmcp = { version = "1.7", features = ["client", "server", "macros", "reqwest", "
 async-trait = "0.1"
 futures = "0.3"
 toml = "0.8"
+# Generated SSE streams (native NDJSON->SSE, streaming orchestration, Responses streaming).
+async-stream = "0.3"
+bytes = "1"
 
 [[bin]]
 name = "mcp_fixture"

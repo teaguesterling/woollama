@@ -76,6 +76,56 @@ pub fn build_response(resp_id: &str, model: &str, text: &str) -> Value {
     })
 }
 
+/// A Response object with explicit `status` + `created_at` — for the streaming
+/// `response.created` (in_progress) and `response.completed` (completed) events.
+pub fn build_response_full(resp_id: &str, model: &str, text: &str, status: &str, created_at: i64) -> Value {
+    json!({
+        "id": resp_id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model,
+        "status": status,
+        "conversation": Value::Null,
+        "output": [{
+            "type": "message",
+            "id": new_id("msg"),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }],
+        "parallel_tool_calls": false,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+}
+
+/// A Responses output-message ITEM — empty content while in progress, the output_text
+/// part once done (the `output_item.added`/`output_item.done` payload).
+pub fn msg_item(item_id: &str, text: &str, done: bool) -> Value {
+    json!({
+        "type": "message",
+        "id": item_id,
+        "status": if done { "completed" } else { "in_progress" },
+        "role": "assistant",
+        "content": if done {
+            json!([{"type": "output_text", "text": text, "annotations": []}])
+        } else {
+            json!([])
+        },
+    })
+}
+
+/// One Responses SSE event: `event: <type>\ndata: {type, sequence_number, ...payload}\n\n`.
+pub fn resp_ev(type_: &str, seq: i64, payload: Value) -> bytes::Bytes {
+    let mut frame = json!({"type": type_, "sequence_number": seq});
+    if let Some(o) = payload.as_object() {
+        for (k, v) in o {
+            frame[k] = v.clone();
+        }
+    }
+    bytes::Bytes::from(format!("event: {}\ndata: {}\n\n", type_, serde_json::to_string(&frame).unwrap()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

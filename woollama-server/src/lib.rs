@@ -14,14 +14,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_stream::stream;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value};
 
@@ -149,6 +152,177 @@ async fn relay_json(resp: reqwest::Response) -> Response {
     (status, Json(data)).into_response()
 }
 
+// --- SSE helpers --------------------------------------------------------------
+
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn chatcmpl_id() -> String {
+    format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Next complete `\n`-terminated line from a raw byte buffer (UTF-8-safe), or None.
+fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+    let nl = buf.iter().position(|&b| b == b'\n')?;
+    let line: Vec<u8> = buf.drain(..=nl).collect();
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// One OpenAI `chat.completion.chunk` SSE frame.
+fn chat_chunk(cid: &str, created: i64, model: &str, delta: Value, finish: Option<&str>) -> Bytes {
+    let payload = json!({
+        "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    });
+    Bytes::from(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()))
+}
+
+fn sse_response(body: Body) -> Response {
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(body)
+        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
+}
+
+/// num_ctx + stream → native `/api/chat` NDJSON, translated frame-by-frame to OpenAI SSE.
+async fn native_stream(
+    inf: &engine::Inferencer,
+    fwd: &Value,
+    headers: &HashMap<String, String>,
+    model: &str,
+) -> Response {
+    let url = ollama_native::native_chat_url(&inf.base_url);
+    let req = ollama_native::to_native_request(fwd);
+    let resp = match forward_post(url, &req, headers, 600).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    if resp.status().as_u16() >= 400 {
+        return relay_json(resp).await;
+    }
+    let model = model.to_string();
+    let body = Body::from_stream(stream! {
+        let mut t = ollama_native::SseTranslator::new(&model);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut bs = resp.bytes_stream();
+        while let Some(chunk) = bs.next().await {
+            let Ok(bytes) = chunk else { break };
+            buf.extend_from_slice(&bytes);
+            while let Some(line) = take_line(&mut buf) {
+                for out in t.translate(&line) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                }
+            }
+        }
+    });
+    sse_response(body)
+}
+
+/// woollama/<recipe> + stream → run the loop over SSE and emit `chat.completion.chunk`
+/// frames: a role chunk, the content deltas, then exactly one stop terminator + [DONE].
+/// Primed before returning so a setup/first-turn error maps to an HTTP status.
+async fn orchestrate_stream(
+    state: Arc<AppState>,
+    recipe: config::Recipe,
+    messages: Value,
+    model: String,
+) -> Response {
+    let recipe_val = recipe.to_value();
+    let provider: Arc<dyn engine::ToolProvider> =
+        Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
+    let setup = match engine::build_setup(&recipe_val, &messages, provider, None, None, Some(&state.inferencers)) {
+        Ok(s) => s,
+        Err(e) => return engine_err_response(e),
+    };
+    let mut s = Box::pin(engine::events_stream(setup, true));
+    let first_ev = match s.next().await {
+        Some(Err(e)) => return engine_err_response(e),
+        Some(Ok(ev)) => Some(ev),
+        None => None,
+    };
+    let cid = chatcmpl_id();
+    let created = now_secs();
+    let body = Body::from_stream(stream! {
+        yield Ok::<Bytes, std::io::Error>(chat_chunk(&cid, created, &model, json!({"role": "assistant"}), None));
+        if let Some(engine::Event::Delta(c)) = first_ev {
+            yield Ok(chat_chunk(&cid, created, &model, json!({"content": c}), None));
+        }
+        while let Some(item) = s.next().await {
+            match item {
+                Ok(engine::Event::Delta(c)) => {
+                    yield Ok(chat_chunk(&cid, created, &model, json!({"content": c}), None));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let payload = e.payload.clone().unwrap_or_else(|| json!({"error": {"message": e.message, "type": e.kind}}));
+                    yield Ok(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap())));
+                    break;
+                }
+            }
+        }
+        yield Ok(chat_chunk(&cid, created, &model, json!({}), Some("stop")));
+        yield Ok(Bytes::from("data: [DONE]\n\n"));
+    });
+    sse_response(body)
+}
+
+/// Stream a stateless /v1/responses turn as OpenAI Responses SSE (the canonical
+/// created → output_item.added → content_part.added → output_text.delta* →
+/// output_text.done → content_part.done → output_item.done → completed sequence).
+/// Primed before returning so a setup error maps to an HTTP status.
+async fn responses_stream(mut source: BoxStream<'static, Result<String, EngineError>>, model: String) -> Response {
+    let first_delta = match source.next().await {
+        Some(Err(e)) => return engine_err_response(e),
+        Some(Ok(d)) => Some(d),
+        None => None,
+    };
+    let resp_id = responses::new_id("resp");
+    let item_id = responses::new_id("msg");
+    let created = now_secs();
+    let body = Body::from_stream(stream! {
+        let mut seq = 0i64;
+        yield Ok::<Bytes, std::io::Error>(responses::resp_ev("response.created", seq,
+            json!({"response": responses::build_response_full(&resp_id, &model, "", "in_progress", created)}))); seq += 1;
+        yield Ok(responses::resp_ev("response.output_item.added", seq,
+            json!({"output_index": 0, "item": responses::msg_item(&item_id, "", false)}))); seq += 1;
+        yield Ok(responses::resp_ev("response.content_part.added", seq,
+            json!({"item_id": item_id, "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": "", "annotations": []}}))); seq += 1;
+
+        let mut chunks: Vec<String> = Vec::new();
+        if let Some(d) = first_delta {
+            chunks.push(d.clone());
+            yield Ok(responses::resp_ev("response.output_text.delta", seq,
+                json!({"item_id": item_id, "output_index": 0, "content_index": 0, "logprobs": [], "delta": d}))); seq += 1;
+        }
+        while let Some(item) = source.next().await {
+            match item {
+                Ok(piece) => {
+                    chunks.push(piece.clone());
+                    yield Ok(responses::resp_ev("response.output_text.delta", seq,
+                        json!({"item_id": item_id, "output_index": 0, "content_index": 0, "logprobs": [], "delta": piece}))); seq += 1;
+                }
+                Err(e) => {
+                    yield Ok(responses::resp_ev("error", seq, json!({"message": e.message, "code": e.kind}))); seq += 1;
+                    break;
+                }
+            }
+        }
+        let full = chunks.concat();
+        yield Ok(responses::resp_ev("response.output_text.done", seq,
+            json!({"item_id": item_id, "output_index": 0, "content_index": 0, "logprobs": [], "text": full}))); seq += 1;
+        yield Ok(responses::resp_ev("response.content_part.done", seq,
+            json!({"item_id": item_id, "output_index": 0, "content_index": 0,
+                   "part": {"type": "output_text", "text": full, "annotations": []}}))); seq += 1;
+        yield Ok(responses::resp_ev("response.output_item.done", seq,
+            json!({"output_index": 0, "item": responses::msg_item(&item_id, &full, true)}))); seq += 1;
+        yield Ok(responses::resp_ev("response.completed", seq,
+            json!({"response": responses::build_response_full(&resp_id, &model, &full, "completed", created)})));
+    });
+    sse_response(body)
+}
+
 // --- orchestration (shared by chat-completions + responses) -------------------
 
 /// Run a recipe to completion and return the final OpenAI response dict. Tools are
@@ -189,14 +363,10 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
         let Some(recipe) = state.recipes.get(name) else {
             return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
         };
-        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-            return err_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "streaming orchestration is not yet in the Rust server (slice 4b)",
-                "not_implemented",
-            );
-        }
         let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
+        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            return orchestrate_stream(state.clone(), recipe.clone(), messages, model).await;
+        }
         return match orchestrate_recipe(&state, recipe, &messages).await {
             Ok(resp) => Json(resp).into_response(),
             Err(e) => engine_err_response(e),
@@ -228,12 +398,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
 
     if provider == "ollama" && ollama_native::wants_native(&fwd) {
         if stream {
-            return err_response(
-                StatusCode::NOT_IMPLEMENTED,
-                "native num_ctx streaming is not yet in the Rust server (slice 3b); \
-                 omit stream, or drop num_ctx to stream on /v1",
-                "not_implemented",
-            );
+            return native_stream(&inf, &fwd, &headers, &bare).await;
         }
         return passthrough_native(&inf, &fwd, &headers, &bare).await;
     }
@@ -311,11 +476,36 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
         );
     }
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "streaming /v1/responses is not yet in the Rust server (slice 3b)",
-            "not_implemented",
-        );
+        let source: BoxStream<'static, Result<String, EngineError>> =
+            if let Some(name) = model.strip_prefix("woollama/") {
+                let Some(recipe) = state.recipes.get(name) else {
+                    return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
+                };
+                let recipe_val = recipe.to_value();
+                let provider: Arc<dyn engine::ToolProvider> =
+                    Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
+                let setup = match engine::build_setup(&recipe_val, &json!(messages), provider, None, None, Some(&state.inferencers)) {
+                    Ok(s) => s,
+                    Err(e) => return engine_err_response(e),
+                };
+                engine::events_stream(setup, true)
+                    .filter_map(|item| async move {
+                        match item {
+                            Ok(engine::Event::Delta(c)) => Some(Ok(c)),
+                            Ok(_) => None,
+                            Err(e) => Some(Err(e)),
+                        }
+                    })
+                    .boxed()
+            } else {
+                let options = body.get("options").cloned();
+                let req = match engine::build_request(&model, json!(messages), options, None, None, None, true) {
+                    Ok(r) => r,
+                    Err(e) => return engine_err_response(e),
+                };
+                engine::complete_stream_events(req).boxed()
+            };
+        return responses_stream(source, model).await;
     }
 
     let resp_id = responses::new_id("resp");

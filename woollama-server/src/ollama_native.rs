@@ -112,6 +112,56 @@ pub fn from_native_response(native: &Value, model: &str) -> Value {
     })
 }
 
+/// Stateful NDJSON→SSE translator: ollama `/api/chat` stream frames → OpenAI
+/// `chat.completion.chunk` SSE byte strings. The first content chunk carries
+/// `role:assistant`; the `done:true` frame emits a finish chunk + `data: [DONE]`.
+pub struct SseTranslator {
+    cid: String,
+    created: i64,
+    model: String,
+    role_sent: bool,
+}
+
+impl SseTranslator {
+    pub fn new(model: &str) -> Self {
+        SseTranslator { cid: chatcmpl_id(), created: now_secs(), model: model.to_string(), role_sent: false }
+    }
+
+    fn chunk(&self, delta: Value, finish: Option<&str>) -> Vec<u8> {
+        let payload = json!({
+            "id": self.cid, "object": "chat.completion.chunk",
+            "created": self.created, "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()).into_bytes()
+    }
+
+    /// Translate one NDJSON frame line into zero or more SSE byte strings.
+    pub fn translate(&mut self, line: &str) -> Vec<Vec<u8>> {
+        let line = line.trim();
+        if line.is_empty() {
+            return vec![];
+        }
+        let Ok(frame) = serde_json::from_str::<Value>(line) else { return vec![] };
+        if frame.get("done").and_then(Value::as_bool).unwrap_or(false) {
+            return vec![
+                self.chunk(json!({}), Some(finish(frame.get("done_reason").and_then(Value::as_str)))),
+                b"data: [DONE]\n\n".to_vec(),
+            ];
+        }
+        let content = frame.get("message").and_then(|m| m.get("content")).and_then(Value::as_str).unwrap_or("");
+        if content.is_empty() {
+            return vec![];
+        }
+        if !self.role_sent {
+            self.role_sent = true;
+            vec![self.chunk(json!({"role": "assistant", "content": content}), None)]
+        } else {
+            vec![self.chunk(json!({"content": content}), None)]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +226,24 @@ mod tests {
             "m",
         );
         assert_eq!(out["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn sse_translator_role_then_deltas_then_done() {
+        let mut t = SseTranslator::new("qwen3.5:4b");
+        let lines = [
+            r#"{"message":{"role":"assistant","content":"one"},"done":false}"#,
+            r#"{"message":{"role":"assistant","content":" two"},"done":false}"#,
+            r#"{"message":{"content":""},"done":true,"done_reason":"stop"}"#,
+        ];
+        let chunks: Vec<String> =
+            lines.iter().flat_map(|l| t.translate(l)).map(|c| String::from_utf8(c).unwrap()).collect();
+        let first: Value = serde_json::from_str(chunks[0].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(first["choices"][0]["delta"], json!({"role": "assistant", "content": "one"}));
+        let second: Value = serde_json::from_str(chunks[1].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(second["choices"][0]["delta"], json!({"content": " two"}));
+        let term: Value = serde_json::from_str(chunks[2].trim_start_matches("data: ").trim()).unwrap();
+        assert_eq!(term["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chunks[3], "data: [DONE]\n\n");
     }
 }
