@@ -24,6 +24,8 @@ examples/routing_demo.py.
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -39,30 +41,33 @@ from woollama.manager import Registry, ServerManager
 # Fakes — a scripted inferencer + two recording downstream sessions
 # ---------------------------------------------------------------------------
 
-class _Resp:
-    def __init__(self, payload: dict, status: int = 200):
-        self.status_code = status
-        self._payload = payload
-
-    def json(self) -> dict:
-        return self._payload
-
-
 def mock_inferencer(monkeypatch, turns: list[dict]):
-    """Monkeypatch httpx.AsyncClient so each POST to Ollama returns the next
-    scripted turn. A turn is a full OpenAI-shaped response dict."""
+    """Serve each scripted turn from a mock HTTP server and point
+    `$WOOLLAMA_OLLAMA_URL` at it. The recipe loop runs in the Rust core (reqwest),
+    which an in-process httpx patch can't intercept — so we mock at the wire instead.
+    A turn is a full OpenAI-shaped response dict, popped one per inferencer POST."""
     script = list(turns)
+    lock = threading.Lock()
 
-    class _Client:
-        def __init__(self, *_a, **_kw): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_a): return None
-        async def get(self, *_a, **_kw): return _Resp({})
-        async def post(self, _url, json=None, **_kw):
-            return _Resp(script.pop(0))
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
 
-    import httpx
-    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            with lock:
+                payload = script.pop(0)
+            raw = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setenv("WOOLLAMA_OLLAMA_URL", f"http://127.0.0.1:{srv.server_address[1]}")
+    return srv
 
 
 def _assistant_tool_call(name: str, args: dict, call_id: str = "c1") -> dict:

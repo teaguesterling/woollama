@@ -118,3 +118,25 @@ the ollama-URL normalization). The file-store / discovery httpx patches
 (test_store_backend, test_http_store_provider) are Python-path and stay as-is.
 
 This is bounded but is its own focused pass — pending.
+
+### Second discovery: the router needs structured `InferenceError` fields
+
+Reworking the `mock_inferencer` fixture to a mock HTTP server **removed the hangs**
+(test_routing: 11 happy-path orchestration tests green). The remaining failures are a
+*separate* gap: the router maps orchestration errors to HTTP via
+`OrchestrationError.{message,kind,status,payload}` (and raises
+`OrchestrationError(msg, kind, status[, payload=…])`). `OrchestrationError` is now the
+Rust `core.InferenceError`, which carries only a message — the **structured
+`InferenceError` fields (kind/status/payload)** the port deferred. The router depends
+on them; the Python `InferenceError` had them.
+
+So greening the cutover needs, in addition to the harness rework:
+
+- **Rust: make `InferenceError` a structured exception** — `InferenceError(message,
+  kind=None, status=None, payload=None)` with `.message`/`.kind`/`.status`/`.payload`
+  attributes, and have the Rust core's own raises populate them (e.g. the inferencer-
+  error path → `kind="server_error", status=502, payload=<upstream>`), matching the
+  Python `orchestrate.py` raises. (Best as a `#[pyclass(extends=PyException)]`.)
+- Then propagate the mock-server fixture to test_responses / test_responses_stream /
+  test_router / test_mcp_server, and fix the few test_inferencers / test_ollama_native
+  failures.
