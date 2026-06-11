@@ -161,9 +161,14 @@ woollama/                         (cargo workspace root = the woollama placehold
    **Still deferred:** `run_resumable` (the claude-resume conversation backend) → slice 6;
    the 3 LIVE security gates (real `claude`: shell refused, sibling denied) → opt-in
    plain-terminal tests, rewritten HTTP/recipe-driven.
-6. **Conversation stores.** ConversationStore seam, durable handle table
-   (`WOOLLAMA_STATE_DIR`), claude-resume + store-backed backends (MCP + REST clients).
-   Gate: the store-backed + restart-survival live tests.
+6. **Conversation stores.** Split:
+   - **6a ✅ DONE** (commit `0f07112`) — the durable handle table (`WOOLLAMA_STATE_DIR`,
+     atomic rewrite, restart-survival) + per-conversation locks + the **claude-resume**
+     backend + stateful `/v1/responses` + `/v1/conversations` CRUD. Gate: a hermetic e2e
+     (fake `claude`) incl. restart survival. (`run_resumable` added to claude_code.)
+   - **6b ⬜** — store-backed statefulness for ollama/cloud/recipe models: the
+     `ConversationStore` provider seam + `McpStoreProvider`/`HttpStoreProvider` (MCP +
+     REST clients) + `/items` served from the store.
 7. **Managed agents.** Anthropic Managed Agents backend via raw REST. Gate: the 2
    SDK-driven anthropic tests (managed-agents journey, requires_action) repointed,
    **plus the anthropic-inferencer gate rewritten as HTTP/recipe-driven**.
