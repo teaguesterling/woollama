@@ -130,8 +130,13 @@ woollama/                         (cargo workspace root = the woollama placehold
    so they can't go green until those land. The Rust test covers binding + `/v1/models` +
    the bare-model rewrite/relay + the 501/400 deferrals; it also replaces the TCP half of
    the in-process `unix_socket` test. (UDS still deferred.)
-3. **Native + Responses.** `ollama_native` translation, `/v1/responses` (stateless,
-   `complete_stateless`), num_ctx native routing. Gate: the num_ctx + responses live tests.
+3. **Native + Responses.** ✅ DONE (commit `5538bc7`). `ollama_native` translators
+   (pure, ported + unit-tested), native num_ctx → `/api/chat` (non-stream), streaming
+   passthrough (SSE relay), stateless `/v1/responses` (non-stream; the inferencer path
+   reuses the engine `complete`, which already does native num_ctx). Gate: 10 unit + 2
+   integration tests vs a mock upstream. **Carved out to slice 3b:** native num_ctx
+   STREAMING (NDJSON→SSE, the `sse_translator`) + Responses streaming/`items` — each a
+   clear 501 today.
 4. **MCP aggregator (productionize the spike).** `manager` (downstream registry as
    rmcp clients, `start_all`) + `mcp_server` (`/mcp` over **stdio AND** Streamable-HTTP,
    re-export + schema mirroring). **Includes the one open lifecycle question:** a load
