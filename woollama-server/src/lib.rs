@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use woollama_engine as engine;
 use engine::EngineError;
 
+mod claude_code;
 mod config;
 mod mcp_registry;
 mod mcp_surface;
@@ -47,6 +48,9 @@ pub struct AppState {
     pub recipes: HashMap<String, config::Recipe>,
     pub registry: Arc<mcp_registry::McpRegistry>,
     pub inferencers: engine::Registry,
+    /// The mcp.json specs (for claude-code delegation, which writes a per-recipe
+    /// --mcp-config from the referenced subset).
+    pub mcp_specs: HashMap<String, config::McpServerSpec>,
 }
 
 /// Load config + connect the downstream MCP servers. Errors are logged and degraded to
@@ -60,12 +64,12 @@ pub async fn build_state() -> AppState {
         eprintln!("woollama-server: mcp.json load error: {e}");
         HashMap::new()
     });
-    let registry = Arc::new(mcp_registry::McpRegistry::connect(specs).await);
+    let registry = Arc::new(mcp_registry::McpRegistry::connect(specs.clone()).await);
     let inferencers = engine::Registry::from_config().unwrap_or_else(|e| {
         eprintln!("woollama-server: inferencers load error: {e}");
         engine::Registry::new()
     });
-    AppState { recipes, registry, inferencers }
+    AppState { recipes, registry, inferencers, mcp_specs: specs }
 }
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
@@ -228,6 +232,24 @@ async fn orchestrate_stream(
     messages: Value,
     model: String,
 ) -> Response {
+    // claude-code is non-streaming: run it, then surface the whole answer as one delta.
+    if let Some(cc_model) = recipe.inferencer.strip_prefix("claude-code/") {
+        let text = match run_claude_recipe(&state, &recipe, &messages, cc_model).await {
+            Ok(resp) => resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string(),
+            Err(e) => return engine_err_response(e),
+        };
+        let cid = chatcmpl_id();
+        let created = now_secs();
+        let body = Body::from_stream(stream! {
+            yield Ok::<Bytes, std::io::Error>(chat_chunk(&cid, created, &model, json!({"role": "assistant"}), None));
+            if !text.is_empty() {
+                yield Ok(chat_chunk(&cid, created, &model, json!({"content": text}), None));
+            }
+            yield Ok(chat_chunk(&cid, created, &model, json!({}), Some("stop")));
+            yield Ok(Bytes::from("data: [DONE]\n\n"));
+        });
+        return sse_response(body);
+    }
     let recipe_val = recipe.to_value();
     let provider: Arc<dyn engine::ToolProvider> =
         Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
@@ -325,14 +347,58 @@ async fn responses_stream(mut source: BoxStream<'static, Result<String, EngineEr
 
 // --- orchestration (shared by chat-completions + responses) -------------------
 
-/// Run a recipe to completion and return the final OpenAI response dict. Tools are
-/// dispatched to the downstream MCP registry. Shared by the HTTP handlers and the MCP
-/// `chat` tool; each maps the `EngineError` to its own surface.
+/// The mcp.json `{command, args}` for the servers a recipe's tools reference (the subset
+/// claude-code delegation hands the child). Errors if a referenced server isn't configured.
+fn referenced_mcp_servers(state: &AppState, tools: &[String]) -> Result<HashMap<String, Value>, EngineError> {
+    let mut servers = HashMap::new();
+    for t in tools {
+        let server = t.split_once('.').map(|(s, _)| s).unwrap_or(t.as_str());
+        if servers.contains_key(server) {
+            continue;
+        }
+        let Some(spec) = state.mcp_specs.get(server) else {
+            return Err(EngineError::new(
+                format!("recipe references MCP server '{server}' not in mcp.json config"),
+                "invalid_request_error",
+                400,
+            ));
+        };
+        servers.insert(server.to_string(), json!({"command": spec.command, "args": spec.args}));
+    }
+    Ok(servers)
+}
+
+/// Run a `claude-code/<model>` recipe: tool-less completion, or delegation when the
+/// recipe allow-lists tools (Claude owns the loop). Returns an OpenAI dict.
+async fn run_claude_recipe(
+    state: &AppState,
+    recipe: &config::Recipe,
+    messages: &Value,
+    model: &str,
+) -> Result<Value, EngineError> {
+    let cc_err = |e: claude_code::ClaudeCodeError| EngineError::new(format!("claude-code backend: {e}"), "server_error", 502);
+    if recipe.tools.is_empty() {
+        claude_code::run_completion(&recipe.system, messages, model).await.map_err(cc_err)
+    } else {
+        let servers = referenced_mcp_servers(state, &recipe.tools)?;
+        claude_code::run_delegated(&recipe.system, messages, model, &recipe.tools, &servers, 8)
+            .await
+            .map_err(cc_err)
+    }
+}
+
+/// Run a recipe to completion and return the final OpenAI response dict. A
+/// `claude-code/<model>` recipe runs through the executor; otherwise tools are
+/// dispatched to the downstream MCP registry via the engine loop. Shared by the HTTP
+/// handlers and the MCP `chat` tool; each maps the `EngineError` to its own surface.
 pub(crate) async fn orchestrate_recipe(
     state: &AppState,
     recipe: &config::Recipe,
     messages: &Value,
 ) -> Result<Value, EngineError> {
+    if let Some(cc_model) = recipe.inferencer.strip_prefix("claude-code/") {
+        return run_claude_recipe(state, recipe, messages, cc_model).await;
+    }
     let recipe_val = recipe.to_value();
     let provider: Arc<dyn engine::ToolProvider> =
         Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
@@ -481,22 +547,31 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
                 let Some(recipe) = state.recipes.get(name) else {
                     return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
                 };
-                let recipe_val = recipe.to_value();
-                let provider: Arc<dyn engine::ToolProvider> =
-                    Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
-                let setup = match engine::build_setup(&recipe_val, &json!(messages), provider, None, None, Some(&state.inferencers)) {
-                    Ok(s) => s,
-                    Err(e) => return engine_err_response(e),
-                };
-                engine::events_stream(setup, true)
-                    .filter_map(|item| async move {
-                        match item {
-                            Ok(engine::Event::Delta(c)) => Some(Ok(c)),
-                            Ok(_) => None,
-                            Err(e) => Some(Err(e)),
-                        }
-                    })
-                    .boxed()
+                if let Some(cc_model) = recipe.inferencer.strip_prefix("claude-code/") {
+                    // claude-code is non-streaming: the answer is one delta.
+                    let text = match run_claude_recipe(&state, recipe, &json!(messages), cc_model).await {
+                        Ok(resp) => resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string(),
+                        Err(e) => return engine_err_response(e),
+                    };
+                    futures::stream::once(async move { Ok::<String, EngineError>(text) }).boxed()
+                } else {
+                    let recipe_val = recipe.to_value();
+                    let provider: Arc<dyn engine::ToolProvider> =
+                        Arc::new(mcp_registry::RegistryToolProvider { reg: state.registry.clone() });
+                    let setup = match engine::build_setup(&recipe_val, &json!(messages), provider, None, None, Some(&state.inferencers)) {
+                        Ok(s) => s,
+                        Err(e) => return engine_err_response(e),
+                    };
+                    engine::events_stream(setup, true)
+                        .filter_map(|item| async move {
+                            match item {
+                                Ok(engine::Event::Delta(c)) => Some(Ok(c)),
+                                Ok(_) => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        })
+                        .boxed()
+                }
             } else {
                 let options = body.get("options").cloned();
                 let req = match engine::build_request(&model, json!(messages), options, None, None, None, true) {

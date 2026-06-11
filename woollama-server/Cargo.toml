@@ -30,10 +30,17 @@ toml = "0.8"
 # Generated SSE streams (native NDJSON->SSE, streaming orchestration, Responses streaming).
 async-stream = "0.3"
 bytes = "1"
+# claude-code executor: temp cwd + delegate-mcp.json (run_completion/run_delegated).
+tempfile = "3"
 
 [[bin]]
 name = "mcp_fixture"
 path = "src/bin/mcp_fixture.rs"
+
+# A fake `claude` CLI for hermetic claude-code tests (WOOLLAMA_CLAUDE_BIN points here).
+[[bin]]
+name = "fake_claude"
+path = "src/bin/fake_claude.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
