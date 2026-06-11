@@ -153,10 +153,14 @@ woollama/                         (cargo workspace root = the woollama placehold
      **shared-registry-across-sessions stress** (two concurrent sessions — the open
      lifecycle question, settled) + a stdio `initialize` smoke. (Streaming orchestration
      was folded into 3b ✅.)
-5. **claude-code executor.** `run_completion` + `run_delegated` + the `--tools ""`
-   lockdown, via `tokio::process`. Gate: the 2 SDK-driven tests (claude-resume,
-   conversations journey) repointed, **plus the 3 security gates rewritten as
-   HTTP/recipe-driven** (canary/refusal asserted from outside) — **in a plain terminal**.
+5. **claude-code executor.** ✅ DONE (commit `5ca47b4`). `run_completion` (tool-less) +
+   `run_delegated` (Claude owns the loop) via `tokio::process`, intercepted in
+   `orchestrate_recipe` before the engine loop; the full `--tools ""` lockdown ported and
+   unit-tested (incl. the allow-list boundary + the env allow-list). Gate: unit tests pin
+   the lockdown/boundary + an e2e via a fake `claude` CLI through chat/responses/streaming.
+   **Still deferred:** `run_resumable` (the claude-resume conversation backend) → slice 6;
+   the 3 LIVE security gates (real `claude`: shell refused, sibling denied) → opt-in
+   plain-terminal tests, rewritten HTTP/recipe-driven.
 6. **Conversation stores.** ConversationStore seam, durable handle table
    (`WOOLLAMA_STATE_DIR`), claude-resume + store-backed backends (MCP + REST clients).
    Gate: the store-backed + restart-survival live tests.
