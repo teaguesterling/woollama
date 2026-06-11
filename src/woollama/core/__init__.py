@@ -12,7 +12,7 @@ paths (`woollama.config`, `woollama.inferencers`, `woollama.recipes`,
 """
 import sys as _sys
 
-from . import inference, inferencers, orchestrate  # noqa: F401  (engine — stays in core)
+from . import inference, orchestrate  # noqa: F401  (engine — stays in core)
 
 # Dist-split migration (docs/dist-split.md): the support modules now live at top
 # level (`woollama.config` / `recipes` / `tooling` / `ollama_native`). Keep
@@ -20,8 +20,8 @@ from . import inference, inferencers, orchestrate  # noqa: F401  (engine — sta
 # access (`from woollama.core import recipes`) and submodule import
 # (`from woollama.core.tooling import X`) — by aliasing into sys.modules. Removed in
 # the cleanup stage once all import sites are updated.
-from .. import config, ollama_native, recipes, tooling  # noqa: F401
-for _m in ("config", "ollama_native", "recipes", "tooling"):
+from .. import config, inferencers, ollama_native, recipes, tooling  # noqa: F401
+for _m in ("config", "inferencers", "ollama_native", "recipes", "tooling"):
     _sys.modules[f"{__name__}.{_m}"] = _sys.modules[f"woollama.{_m}"]
 
 from .inference import (  # noqa: F401,E402
@@ -30,7 +30,7 @@ from .inference import (  # noqa: F401,E402
     complete_stream,
     complete_sync,
 )
-from .inferencers import Inferencer, InferencerError, ModelRegistry  # noqa: F401,E402
+from ..inferencers import Inferencer, InferencerError, ModelRegistry  # noqa: F401,E402
 from .orchestrate import (
     orchestrate_events,  # noqa: F401,E402  (the `orchestrate()` drainer is core.orchestrate.orchestrate)
 )

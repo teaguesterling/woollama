@@ -21,8 +21,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 
-from . import inferencers
-from .. import recipes
+from .. import inferencers, recipes
 from .inference import InferenceError
 from ..tooling import DEFAULT_CAPS, ToolProvider, render_tool_result
 
