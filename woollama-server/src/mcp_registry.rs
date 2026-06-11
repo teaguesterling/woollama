@@ -95,6 +95,17 @@ impl McpRegistry {
         out
     }
 
+    /// Call a tool by BARE name on a specific server (for the MCP conversation-store
+    /// provider, whose tools — create_thread/etc. — aren't recipe-namespaced).
+    pub async fn call_server(&self, server: &str, tool: &str, args: &Value) -> Result<CallToolResult, String> {
+        let conn = self.servers.get(server).ok_or_else(|| format!("unknown server '{server}'"))?;
+        let mut params = CallToolRequestParams::new(tool.to_string());
+        if let Some(obj) = args.as_object() {
+            params = params.with_arguments(obj.clone());
+        }
+        conn.peer.call_tool(params).await.map_err(|e| e.to_string())
+    }
+
     /// Dispatch a namespaced tool and return the RAW `CallToolResult` (content +
     /// structured_content), for the MCP proxy passthrough (vs. the lossy text render
     /// `RegistryToolProvider::dispatch` does for the inference loop).

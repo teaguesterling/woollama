@@ -54,6 +54,15 @@ pub struct AppState {
     pub mcp_specs: HashMap<String, config::McpServerSpec>,
     /// The durable conversation handle table (stateful /v1/responses + /v1/conversations).
     pub conversations: Arc<conversations::Conversations>,
+    /// An external conversation store (issue #2), wired from mcp.json's
+    /// `conversationStore`. When present, non-claude models become stateful (store-backed).
+    pub store: Option<Arc<dyn conversations::StoreProvider>>,
+}
+
+impl AppState {
+    fn backend_for_model(&self, model: &str) -> Option<&'static str> {
+        conversations::backend_for_model(model, self.store.is_some())
+    }
 }
 
 /// Load config + connect the downstream MCP servers. Errors are logged and degraded to
@@ -78,7 +87,19 @@ pub async fn build_state() -> AppState {
         .filter(|s| !s.is_empty())
         .map(|d| std::path::PathBuf::from(d).join("conversations.json"));
     let conversations = Arc::new(conversations::Conversations::new(state_path));
-    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations }
+    // Optional external conversation store (makes non-claude models stateful).
+    let store: Option<Arc<dyn conversations::StoreProvider>> = match config::load_conversation_store() {
+        Ok(Some(config::ConvStoreConfig::Http { url })) => Some(Arc::new(conversations::HttpStoreProvider::new(&url))),
+        Ok(Some(config::ConvStoreConfig::Mcp { server })) => {
+            Some(Arc::new(conversations::McpStoreProvider::new(registry.clone(), server)))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("woollama-server: conversationStore config error: {e}");
+            None
+        }
+    };
+    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations, store }
 }
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
@@ -659,7 +680,7 @@ async fn responses_stateful(state: &AppState, body: &Value, model: &str, message
                 None => return err_response(StatusCode::NOT_FOUND, format!("unknown previous_response_id '{p}'"), "not_found"),
             }
         } else {
-            let Some(backend) = conversations::backend_for_model(model) else {
+            let Some(backend) = state.backend_for_model(model) else {
                 return err_response(StatusCode::NOT_IMPLEMENTED, no_stateful_backend_msg(model), "not_implemented");
             };
             match key {
@@ -669,50 +690,98 @@ async fn responses_stateful(state: &AppState, body: &Value, model: &str, message
         }
     };
 
-    if conv.backend != "claude-resume" {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            format!("the '{}' backend is not yet in the Rust server (slices 6b/7)", conv.backend),
-            "not_implemented",
-        );
-    }
-
     // One writer per conversation: hold the per-conv lock across the turn (but NOT the
-    // table lock, which only guards brief reads/writes).
+    // table lock, which only guards brief reads/writes — each backend turn does its own).
     let lock = state.conversations.conv_lock(&conv.id).await;
     let _guard = lock.lock().await;
 
-    let (model_full, mut native_id, mut workdir) = {
-        let t = state.conversations.table.lock().await;
-        let c = t.get(&conv.id).unwrap_or_else(|| conv.clone());
-        (c.model.clone(), c.native_id.clone(), c.workdir.clone())
-    };
-    // A stable, neutral workdir per conversation — Claude scopes sessions by project dir,
-    // so every --resume must run in the same dir. Created on the first turn, reused after.
-    if workdir.is_none() {
-        let dir = std::env::temp_dir().join(format!("woollama-conv-{}", uuid::Uuid::new_v4().simple()));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            return engine_err_response(EngineError::new(e.to_string(), "server_error", 500));
+    let options = body.get("options").cloned();
+    let text = match conv.backend.as_str() {
+        "claude-resume" => claude_resume_turn(state, &conv.id, &conv.model, messages).await,
+        "store-backed" => store_backed_turn(state, &conv.id, &conv.model, messages, options).await,
+        other => {
+            return err_response(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("the '{other}' backend is not yet in the Rust server (slice 7)"),
+                "not_implemented",
+            )
         }
-        workdir = Some(dir.to_string_lossy().to_string());
-    }
-    let cc_model = model_full.strip_prefix("claude-code/").unwrap_or("");
-    let (resp, sid) = match claude_code::run_resumable(messages, cc_model, native_id.as_deref(), workdir.as_deref().unwrap()).await {
-        Ok(x) => x,
-        Err(e) => return engine_err_response(EngineError::new(format!("claude-resume backend: {e}"), "server_error", 502)),
     };
-    if sid.is_some() {
-        native_id = sid; // first turn sets it; resume reports the same id
-    }
-    let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+    let text = match text {
+        Ok(t) => t,
+        Err(e) => return engine_err_response(e),
+    };
 
     let resp_id = responses::new_id("resp");
     {
         let mut t = state.conversations.table.lock().await;
-        t.set_native(&conv.id, native_id, workdir);
         t.record_response(&conv.id, &resp_id);
     }
     Json(responses::build_response_conv(&resp_id, &conv.model, &text, &conv.id)).into_response()
+}
+
+/// One claude-resume turn: ensure a stable workdir, `--resume` the session, persist the
+/// captured/echoed session_id.
+async fn claude_resume_turn(state: &AppState, conv_id: &str, model: &str, messages: &Value) -> Result<String, EngineError> {
+    let (mut native_id, mut workdir) = {
+        let t = state.conversations.table.lock().await;
+        let c = t.get(conv_id);
+        (c.as_ref().and_then(|c| c.native_id.clone()), c.and_then(|c| c.workdir.clone()))
+    };
+    if workdir.is_none() {
+        let dir = std::env::temp_dir().join(format!("woollama-conv-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).map_err(|e| EngineError::new(e.to_string(), "server_error", 500))?;
+        workdir = Some(dir.to_string_lossy().to_string());
+    }
+    let cc_model = model.strip_prefix("claude-code/").unwrap_or("");
+    let (resp, sid) = claude_code::run_resumable(messages, cc_model, native_id.as_deref(), workdir.as_deref().unwrap())
+        .await
+        .map_err(|e| EngineError::new(format!("claude-resume backend: {e}"), "server_error", 502))?;
+    if sid.is_some() {
+        native_id = sid;
+    }
+    let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+    state.conversations.table.lock().await.set_native(conv_id, native_id, workdir);
+    Ok(text)
+}
+
+/// One store-backed turn: the external store owns the transcript; woollama assembles
+/// prior + new, runs STATELESS inference, and writes the turn back.
+async fn store_backed_turn(state: &AppState, conv_id: &str, model: &str, messages: &Value, options: Option<Value>) -> Result<String, EngineError> {
+    let store = state.store.clone().ok_or_else(|| EngineError::new("no conversation store configured", "server_error", 500))?;
+    let mut native_id = {
+        let t = state.conversations.table.lock().await;
+        t.get(conv_id).and_then(|c| c.native_id.clone())
+    };
+    if native_id.is_none() {
+        native_id = Some(store.create().await?); // the store mints the thread
+    }
+    let tid = native_id.clone().unwrap();
+    let mut combined = store.get(&tid).await?; // bytes owned by the store
+    combined.extend(messages.as_array().cloned().unwrap_or_default());
+    let answer = complete_stateless(state, model, &json!(combined), options).await?;
+    let mut to_append = messages.as_array().cloned().unwrap_or_default();
+    to_append.push(json!({"role": "assistant", "content": answer}));
+    store.append(&tid, &json!(to_append)).await?; // write the turn back
+    state.conversations.table.lock().await.set_native(conv_id, native_id, None);
+    Ok(answer)
+}
+
+/// Run one stateless turn and return the assistant text — routes by model exactly like
+/// /v1/chat/completions (woollama/<recipe> → orchestrate; a known inferencer → complete,
+/// honoring native num_ctx via options). The inference fn for store-backed turns.
+async fn complete_stateless(state: &AppState, model: &str, messages: &Value, options: Option<Value>) -> Result<String, EngineError> {
+    if let Some(name) = model.strip_prefix("woollama/") {
+        let recipe = state
+            .recipes
+            .get(name)
+            .ok_or_else(|| EngineError::new(format!("unknown recipe '{name}'"), "not_found", 404))?;
+        let resp = orchestrate_recipe(state, recipe, messages).await?;
+        Ok(resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+    } else {
+        let req = engine::build_request(model, messages.clone(), options, None, None, None, false)?;
+        engine::run_complete(req).await
+    }
 }
 
 async fn conversations_create(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
@@ -724,8 +793,8 @@ async fn conversations_create(State(state): State<Arc<AppState>>, Json(body): Js
         .get("backend")
         .and_then(Value::as_str)
         .map(String::from)
-        .or_else(|| conversations::backend_for_model(model).map(String::from));
-    let Some(backend) = backend.filter(|b| b == "claude-resume") else {
+        .or_else(|| state.backend_for_model(model).map(String::from));
+    let Some(backend) = backend.filter(|b| b == "claude-resume" || b == "store-backed") else {
         return err_response(StatusCode::NOT_IMPLEMENTED, no_stateful_backend_msg(model), "not_implemented");
     };
     let key = body.get("key").and_then(Value::as_str).map(String::from);
@@ -757,12 +826,35 @@ async fn conversations_get(State(state): State<Arc<AppState>>, Path(conv_id): Pa
 }
 
 async fn conversations_items(State(state): State<Arc<AppState>>, Path(conv_id): Path<String>) -> Response {
-    let t = state.conversations.table.lock().await;
-    let Some(conv) = t.get(&conv_id) else {
-        return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found");
+    let conv = {
+        let t = state.conversations.table.lock().await;
+        match t.get(&conv_id) {
+            Some(c) => c,
+            None => return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found"),
+        }
     };
-    // claude-resume has no `history` (reading its session log is a later driver slice);
-    // managed-agents / store-backed will serve items.
+    // store-backed serves the transcript from the external store; claude-resume has no
+    // `history` (reading its session log is a later driver slice) → 501.
+    if conv.backend == "store-backed" {
+        let Some(store) = state.store.clone() else {
+            return engine_err_response(EngineError::new("no conversation store configured", "server_error", 500));
+        };
+        let msgs = match &conv.native_id {
+            Some(tid) => match store.get(tid).await {
+                Ok(m) => m,
+                Err(e) => return engine_err_response(e),
+            },
+            None => Vec::new(),
+        };
+        let data: Vec<Value> = msgs.iter().map(responses::item_object).collect();
+        let first_id = data.first().and_then(|x| x.get("id").cloned()).unwrap_or(Value::Null);
+        let last_id = data.last().and_then(|x| x.get("id").cloned()).unwrap_or(Value::Null);
+        return Json(json!({
+            "object": "list", "data": data,
+            "first_id": first_id, "last_id": last_id, "has_more": false,
+        }))
+        .into_response();
+    }
     err_response(
         StatusCode::NOT_IMPLEMENTED,
         format!("conversation transcript items are not available for the '{}' backend yet", conv.backend),
@@ -778,10 +870,21 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
     let Some(conv) = conv else {
         return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found");
     };
-    // Backend teardown (best-effort): claude-resume removes the per-conversation workdir;
-    // the Claude session transcript on disk (~/.claude) is the user's data, left intact.
-    if let Some(wd) = &conv.workdir {
-        let _ = std::fs::remove_dir_all(wd);
+    // Backend teardown (best-effort): claude-resume removes the per-conversation workdir
+    // (the on-disk Claude session is the user's data, left intact); store-backed tells the
+    // external store to drop the thread.
+    match conv.backend.as_str() {
+        "claude-resume" => {
+            if let Some(wd) = &conv.workdir {
+                let _ = std::fs::remove_dir_all(wd);
+            }
+        }
+        "store-backed" => {
+            if let (Some(store), Some(tid)) = (state.store.clone(), conv.native_id.clone()) {
+                let _ = store.delete(&tid).await;
+            }
+        }
+        _ => {}
     }
     {
         let mut t = state.conversations.table.lock().await;

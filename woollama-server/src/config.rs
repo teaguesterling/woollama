@@ -71,6 +71,42 @@ pub fn load_recipes() -> Result<HashMap<String, Recipe>, String> {
     Ok(out)
 }
 
+/// The external conversation store (issue #2), from the top-level `conversationStore`
+/// key in mcp.json. None ⇒ non-claude models stay stateless.
+pub enum ConvStoreConfig {
+    Mcp { server: String },
+    Http { url: String },
+}
+
+pub fn load_conversation_store() -> Result<Option<ConvStoreConfig>, String> {
+    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
+    match v.get("conversationStore") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(ConvStoreConfig::Mcp { server: s.clone() })),
+        Some(Value::Object(o)) => match o.get("type").and_then(Value::as_str) {
+            Some("mcp") => {
+                let server = o
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .ok_or("conversationStore type 'mcp' needs a string 'server'")?
+                    .to_string();
+                Ok(Some(ConvStoreConfig::Mcp { server }))
+            }
+            Some("http") => {
+                let url = o
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .ok_or("conversationStore type 'http' needs a string 'url'")?
+                    .to_string();
+                Ok(Some(ConvStoreConfig::Http { url }))
+            }
+            other => Err(format!("unknown conversationStore type {other:?} (expected 'mcp' or 'http')")),
+        },
+        Some(_) => Err("'conversationStore' must be a string or an object with a 'type'".to_string()),
+    }
+}
+
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
     let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;

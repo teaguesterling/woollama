@@ -122,6 +122,19 @@ pub fn msg_item(item_id: &str, text: &str, done: bool) -> Value {
     })
 }
 
+/// Shape one stored transcript message as an OpenAI conversation *item* (the
+/// `/v1/conversations/{id}/items` payload).
+pub fn item_object(msg: &Value) -> Value {
+    let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+    let text = msg.get("content").and_then(Value::as_str).unwrap_or("");
+    let content = if role == "assistant" {
+        json!([{"type": "output_text", "text": text, "annotations": []}])
+    } else {
+        json!([{"type": "input_text", "text": text}])
+    };
+    json!({"id": new_id("msg"), "type": "message", "status": "completed", "role": role, "content": content})
+}
+
 /// One Responses SSE event: `event: <type>\ndata: {type, sequence_number, ...payload}\n\n`.
 pub fn resp_ev(type_: &str, seq: i64, payload: Value) -> bytes::Bytes {
     let mut frame = json!({"type": type_, "sequence_number": seq});

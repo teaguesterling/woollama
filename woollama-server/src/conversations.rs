@@ -250,12 +250,134 @@ impl Conversations {
     }
 }
 
-/// Which state-owning backend (if any) backs conversations for this model.
-/// Slice 6a: only `claude-code/<model>` → `claude-resume`. `claude-agent` (managed-agents)
-/// is slice 7; every other model is stateful only once a store provider is wired (6b).
-pub fn backend_for_model(model: &str) -> Option<&'static str> {
+/// Which state-owning backend (if any) backs conversations for this model:
+/// `claude-code/<model>` → `claude-resume`; every other model → `store-backed` IFF a
+/// conversation-store provider is wired (`has_store`), else stateless. (`claude-agent`
+/// → managed-agents is slice 7.)
+pub fn backend_for_model(model: &str, has_store: bool) -> Option<&'static str> {
     match model.split('/').next().unwrap_or("") {
         "claude-code" => Some("claude-resume"),
-        _ => None,
+        _ => has_store.then_some("store-backed"),
+    }
+}
+
+// --- external conversation stores (issue #2): woollama is a CLIENT; the store owns
+//     the transcript bytes ------------------------------------------------------
+
+use std::time::Duration;
+
+use woollama_engine::EngineError;
+
+use crate::mcp_registry::McpRegistry;
+
+/// A pluggable external owner of conversation transcripts. woollama assembles prior
+/// history + the new turn and runs STATELESS inference; the store owns the bytes.
+#[async_trait::async_trait]
+pub trait StoreProvider: Send + Sync {
+    async fn create(&self) -> Result<String, EngineError>;
+    async fn get(&self, thread_id: &str) -> Result<Vec<Value>, EngineError>;
+    async fn append(&self, thread_id: &str, messages: &Value) -> Result<(), EngineError>;
+    async fn delete(&self, thread_id: &str) -> Result<(), EngineError>;
+}
+
+/// A `StoreProvider` over a REST conversation-store endpoint (examples/rest-convstore).
+/// The provider mints the thread id (a uuid) and PUTs it, so create is idempotent.
+pub struct HttpStoreProvider {
+    base: String,
+}
+
+impl HttpStoreProvider {
+    pub fn new(url: &str) -> Self {
+        HttpStoreProvider { base: url.trim_end_matches('/').to_string() }
+    }
+    async fn req(&self, method: &str, path: &str, body: Option<Value>) -> Result<Option<Value>, EngineError> {
+        let fail = |e: String| EngineError::new(
+            format!("conversation store (http {}) failed on {method} {path}: {e}", self.base),
+            "upstream_error",
+            502,
+        );
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().map_err(|e| fail(e.to_string()))?;
+        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let mut rb = client.request(m, format!("{}{path}", self.base));
+        if let Some(b) = body {
+            rb = rb.json(&b);
+        }
+        let r = rb.send().await.map_err(|e| fail(e.to_string()))?;
+        if !r.status().is_success() {
+            return Err(fail(format!("status {}", r.status())));
+        }
+        let bytes = r.bytes().await.map_err(|e| fail(e.to_string()))?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice(&bytes).ok())
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreProvider for HttpStoreProvider {
+    async fn create(&self) -> Result<String, EngineError> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        self.req("PUT", &format!("/threads/{id}"), None).await?;
+        Ok(id)
+    }
+    async fn get(&self, thread_id: &str) -> Result<Vec<Value>, EngineError> {
+        Ok(self
+            .req("GET", &format!("/threads/{thread_id}"), None)
+            .await?
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default())
+    }
+    async fn append(&self, thread_id: &str, messages: &Value) -> Result<(), EngineError> {
+        self.req("PATCH", &format!("/threads/{thread_id}"), Some(messages.clone())).await?;
+        Ok(())
+    }
+    async fn delete(&self, thread_id: &str) -> Result<(), EngineError> {
+        self.req("DELETE", &format!("/threads/{thread_id}"), None).await?;
+        Ok(())
+    }
+}
+
+/// A `StoreProvider` over an MCP conversation-store server (examples/mcp-convstore): each
+/// op is one MCP tool call whose JSON text block is the result.
+pub struct McpStoreProvider {
+    reg: Arc<McpRegistry>,
+    server: String,
+}
+
+impl McpStoreProvider {
+    pub fn new(reg: Arc<McpRegistry>, server: String) -> Self {
+        McpStoreProvider { reg, server }
+    }
+    async fn call(&self, tool: &str, args: Value) -> Result<Value, EngineError> {
+        let fail = |e: String| EngineError::new(
+            format!("conversation store '{}' failed on '{tool}': {e}", self.server),
+            "upstream_error",
+            502,
+        );
+        let res = self.reg.call_server(&self.server, tool, &args).await.map_err(fail)?;
+        let text: String = res.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect();
+        serde_json::from_str(&text).map_err(|e| fail(format!("bad json: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreProvider for McpStoreProvider {
+    async fn create(&self) -> Result<String, EngineError> {
+        let v = self.call("create_thread", json!({})).await?;
+        v.as_str()
+            .map(String::from)
+            .ok_or_else(|| EngineError::new("create_thread did not return a thread id", "upstream_error", 502))
+    }
+    async fn get(&self, thread_id: &str) -> Result<Vec<Value>, EngineError> {
+        Ok(self.call("get_thread", json!({"thread_id": thread_id})).await?.as_array().cloned().unwrap_or_default())
+    }
+    async fn append(&self, thread_id: &str, messages: &Value) -> Result<(), EngineError> {
+        self.call("append_turn", json!({"thread_id": thread_id, "messages": messages})).await?;
+        Ok(())
+    }
+    async fn delete(&self, thread_id: &str) -> Result<(), EngineError> {
+        self.call("delete_thread", json!({"thread_id": thread_id})).await?;
+        Ok(())
     }
 }
