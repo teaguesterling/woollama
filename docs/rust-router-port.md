@@ -134,9 +134,11 @@ woollama/                         (cargo workspace root = the woollama placehold
    (pure, ported + unit-tested), native num_ctx → `/api/chat` (non-stream), streaming
    passthrough (SSE relay), stateless `/v1/responses` (non-stream; the inferencer path
    reuses the engine `complete`, which already does native num_ctx). Gate: 10 unit + 2
-   integration tests vs a mock upstream. **Carved out to slice 3b:** native num_ctx
-   STREAMING (NDJSON→SSE, the `sse_translator`) + Responses streaming/`items` — each a
-   clear 501 today.
+   integration tests vs a mock upstream. **Streaming (3b) ✅ DONE** (commit `43e7a6a`):
+   native num_ctx streaming (NDJSON→SSE via the ported `SseTranslator`), Responses
+   streaming (the full event sequence), and streaming orchestration — gated by a
+   streaming.rs end-to-end test (incl. a fragmented tool_call reassembled mid-stream).
+   Only Responses transcript `/items` (stateful) remains, with the stores slice.
 4. **MCP aggregator + orchestration.** Split into:
    - **4a ✅ DONE** (commit `afaf4a7`) — the downstream MCP registry (rmcp child-process
      **clients**) + `RegistryToolProvider` (the engine `ToolProvider` seam) + recipe/
@@ -149,8 +151,8 @@ woollama/                         (cargo workspace root = the woollama placehold
      `/mcp` mount (shared port) and a `woollama-server mcp` stdio subcommand. Gate: an
      rmcp-client end-to-end test (aggregation + proxy + the chat tool + prompts) + the
      **shared-registry-across-sessions stress** (two concurrent sessions — the open
-     lifecycle question, settled) + a stdio `initialize` smoke. **Still deferred:**
-     STREAMING orchestration (`woollama/<recipe>` + stream:true → SSE) — folds into 3b.
+     lifecycle question, settled) + a stdio `initialize` smoke. (Streaming orchestration
+     was folded into 3b ✅.)
 5. **claude-code executor.** `run_completion` + `run_delegated` + the `--tools ""`
    lockdown, via `tokio::process`. Gate: the 2 SDK-driven tests (claude-resume,
    conversations journey) repointed, **plus the 3 security gates rewritten as
