@@ -85,35 +85,41 @@ Treat slice 1 as the expensive, risky one — this is where days go if it's mist
 for mechanical. Once the engine is PyO3-free and trait-driven, every later slice is
 additive.
 
-## Target workspace layout
+## Target workspace layout (as built — deviates from the original sketch)
+
+The published wheel name `woollama-core` is load-bearing (PyPI dist, the server's
+`uv` path source, the `woollama.core` import + namespace merge). Renaming it would
+churn all of that for no gain, so we KEPT `woollama-core` as the cdylib wheel and
+added a new `woollama-engine` rlib instead of the sketch's `woollama-core`=rlib +
+`woollama-py`=cdylib. Same intent, far less blast radius. Flat layout (no `crates/`).
 
 ```
-woollama/                         (cargo workspace)
-  crates/
-    woollama-core/   (rlib)       ← pure Rust engine: types, complete*, orchestrate*,
-                                    ModelRegistry, ToolProvider trait, InferenceError.
-                                    NO pyo3. The reusable heart.
-    woollama-py/     (cdylib)     ← thin PyO3 wrapper → the wheel (AUXILIARY).
-                                    PyToolProvider + the #[pyclass]/#[pymodule] glue.
-    woollama-server/ (bin)        ← the PRODUCT: axum + rmcp + stores + claude-code.
-                                    Depends on woollama-core.
-  src/woollama/      (python)     ← stays until cutover; becomes the differential oracle.
+woollama/                         (cargo workspace root = the woollama placeholder pkg)
+  woollama-engine/ (rlib)         ← pure Rust engine: EngineError, ToolProvider trait,
+                                    Registry, complete*, build_setup/events_stream.
+                                    NO pyo3. The reusable heart. [slice 1 ✅]
+  woollama-core/   (cdylib)       ← thin PyO3 wrapper → the wheel, name UNCHANGED.
+                                    InferenceError, PyToolProvider (coroutine bridge),
+                                    the pyclasses, the pyfunctions. [slice 1 ✅]
+  woollama-server/ (bin)          ← the PRODUCT: axum + rmcp + stores + claude-code.
+                                    Depends on woollama-engine. [stub; grows slice 2+]
+  src/woollama/    (python)       ← stays until cutover; the differential oracle.
 ```
-
-(Today's single cdylib splits into core-rlib + py-cdylib; the `crate-type` change
-is slice 0.)
 
 ## Slice ordering (risk-front-loaded; each slice ships green)
 
-0. **Workspace split.** `woollama-core` → pure rlib; `woollama-py` cdylib wraps it.
-   **Not a pure Cargo change** — it's a maturin/pyproject rewire (`module-name`, the
-   editable install, the `woollama.core` namespace merge must still resolve to the
-   cdylib). No behavior change. Gate: conformance (42) + server suite green, wheel imports.
-1. **Trait-ize tool dispatch + PyO3 extraction (the expensive slice).** Introduce the
-   Rust `ToolProvider` trait; engine generic over it; extract pure-Rust `InferenceError`
-   / `DeltaStream` / `EventIter` / serde return types into the core; `PyToolProvider`
-   in the cdylib preserves the Python path (incl. the coroutine bridge). Gate: same
-   suites green. **Budget real time here** (see the refactor section).
+0. **Workspace split.** ✅ DONE (commit `1701552`). Cargo workspace (root placeholder +
+   `woollama-core` cdylib + `woollama-server` bin stub). Proved the workspace wrapper is
+   benign: maturin wheel + editable install + namespace merge + conformance/server suites
+   all green. (Turned out to be a pure Cargo change in the end — maturin needed no rewire
+   since `woollama-core` stayed the cdylib.)
+1. **Trait-ize tool dispatch + PyO3 extraction (the expensive slice).** ✅ DONE (commit
+   `41937e4`). Extracted the engine into `woollama-engine` (pure rlib): `EngineError`
+   (replaces `PyErr`/`InferenceError`), `ToolProvider` trait (replaces the `Py<PyAny>`
+   seam), `Registry`, `build_setup`/`events_stream`, `complete_stream` re-expressed as a
+   `stream!`. `woollama-core` is now a thin wrapper (incl. the `PyToolProvider`
+   coroutine bridge). Gate met: conformance 42 + server 226 green; `woollama-server`
+   links the engine with **no pyo3** in its dep tree.
 2. **Server skeleton.** `woollama-server` bin: axum, `binding` (TCP/UDS), `/v1/models`
    (static+registry), `/v1/chat/completions` **passthrough** + **orchestration** via
    the core. Gate: the HTTP/SDK live tests repointed at the Rust binary, **plus** a new
