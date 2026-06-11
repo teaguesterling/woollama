@@ -40,7 +40,7 @@ impl McpRegistry {
                     servers.insert(name.clone(), conn);
                 }
                 Err(e) => {
-                    eprintln!("woollama-server: MCP server '{name}' failed to start, skipping: {e}");
+                    eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}");
                 }
             }
         }
@@ -132,7 +132,7 @@ impl ToolProvider for RegistryToolProvider {
         let mut out = Vec::new();
         for namespaced in allow {
             let Some(tool) = self.reg.tool(namespaced) else {
-                eprintln!("woollama-server: recipe references unknown tool '{namespaced}', skipping");
+                eprintln!("woollamad: recipe references unknown tool '{namespaced}', skipping");
                 continue;
             };
             // The namespaced name flows out, so the model emits tool_calls we can route.

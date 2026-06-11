@@ -7,8 +7,8 @@
 //! boundary. Two consumers wrap it:
 //!   - `woollama-core` (cdylib): the PyO3 wheel — wraps `EngineError` as the
 //!     `InferenceError` pyclass and bridges a Python `ToolProvider` callback.
-//!   - `woollama-server` (bin): the native router — dispatches tools to downstream
-//!     MCP servers (rmcp), from slice 4 onward.
+//!   - `woollamad` (the `woollama-server` crate's binary): the native router —
+//!     dispatches tools to downstream MCP servers (rmcp), from slice 4 onward.
 //!
 //! Behavior mirrors `woollama.core` in Python; the conformance suite pins it.
 

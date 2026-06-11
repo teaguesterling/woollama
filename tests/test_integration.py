@@ -36,9 +36,9 @@ def _woollama_argv(*extra):
     stdio MCP subcommand).
 
     Default is the Python module (`python -m woollama`). Set WOOLLAMA_TEST_CMD
-    (shlex-split) to launch a different implementation — e.g. the Rust binary:
+    (shlex-split) to launch a different implementation — e.g. the Rust daemon:
 
-        WOOLLAMA_TEST_CMD="$PWD/target/release/woollama-server"
+        WOOLLAMA_TEST_CMD="$PWD/target/release/woollamad"
 
     That turns this suite into a DIFFERENTIAL ORACLE: the exact same live tests
     run against both implementations, so a behavioral divergence shows up as a

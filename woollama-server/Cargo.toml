@@ -9,8 +9,10 @@ license = "MIT"
 name = "woollama_server"
 path = "src/lib.rs"
 
+# The router daemon. Package/lib stay `woollama-server`/`woollama_server`; the produced
+# binary is `woollamad` (the service identity, distinct from the auxiliary `woollama` lib).
 [[bin]]
-name = "woollama-server"
+name = "woollamad"
 path = "src/main.rs"
 
 [dependencies]

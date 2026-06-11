@@ -77,16 +77,16 @@ pub async fn build_state() -> AppState {
     // Resolve WOOLLAMA_EXAMPLES_DIR before any config load — the bundled mcp.json expands it.
     config::ensure_examples_dir();
     let recipes = config::load_recipes().unwrap_or_else(|e| {
-        eprintln!("woollama-server: recipes load error: {e}");
+        eprintln!("woollamad: recipes load error: {e}");
         HashMap::new()
     });
     let specs = config::load_mcp_servers().unwrap_or_else(|e| {
-        eprintln!("woollama-server: mcp.json load error: {e}");
+        eprintln!("woollamad: mcp.json load error: {e}");
         HashMap::new()
     });
     let registry = Arc::new(mcp_registry::McpRegistry::connect(specs.clone()).await);
     let inferencers = engine::Registry::from_config().unwrap_or_else(|e| {
-        eprintln!("woollama-server: inferencers load error: {e}");
+        eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
     });
     // Durable handle table at $WOOLLAMA_STATE_DIR/conversations.json (in-memory if unset).
@@ -103,7 +103,7 @@ pub async fn build_state() -> AppState {
         }
         Ok(None) => None,
         Err(e) => {
-            eprintln!("woollama-server: conversationStore config error: {e}");
+            eprintln!("woollamad: conversationStore config error: {e}");
             None
         }
     };
@@ -149,7 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Serve woollama's MCP surface over stdio — the `woollama-server mcp` subcommand (what
+/// Serve woollama's MCP surface over stdio — the `woollamad mcp` subcommand (what
 /// an MCP client puts in its mcp.json). stdout is the JSON-RPC channel; logs go to stderr.
 pub async fn serve_mcp_stdio(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let running = rmcp::serve_server(WoollamaMcp { state }, (tokio::io::stdin(), tokio::io::stdout())).await?;

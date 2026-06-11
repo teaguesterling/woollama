@@ -101,7 +101,8 @@ woollama/                         (cargo workspace root = the woollama placehold
   woollama-core/   (cdylib)       ← thin PyO3 wrapper → the wheel, name UNCHANGED.
                                     InferenceError, PyToolProvider (coroutine bridge),
                                     the pyclasses, the pyfunctions. [slice 1 ✅]
-  woollama-server/ (bin)          ← the PRODUCT: axum + rmcp + stores + claude-code.
+  woollama-server/ (crate)        ← the PRODUCT: builds the `woollamad` daemon —
+                                    axum + rmcp + stores + claude-code.
                                     Depends on woollama-engine. [stub; grows slice 2+]
   src/woollama/    (python)       ← stays until cutover; the differential oracle.
 ```
@@ -148,7 +149,7 @@ woollama/                         (cargo workspace root = the woollama placehold
    - **4b ✅ DONE** (commit `163b1bc`) — woollama-AS-an-MCP-server (`WoollamaMcp`): the
      `chat` tool + re-exported downstream tools (input+output schema mirrored, structured
      passthrough) + recipe prompts, served from one handler over BOTH a Streamable-HTTP
-     `/mcp` mount (shared port) and a `woollama-server mcp` stdio subcommand. Gate: an
+     `/mcp` mount (shared port) and a `woollamad mcp` stdio subcommand. Gate: an
      rmcp-client end-to-end test (aggregation + proxy + the chat tool + prompts) + the
      **shared-registry-across-sessions stress** (two concurrent sessions — the open
      lifecycle question, settled) + a stdio `initialize` smoke. (Streaming orchestration
@@ -242,7 +243,7 @@ release Rust binary via a new `WOOLLAMA_TEST_CMD` env hook (`_woollama_argv`), a
 self-authored mocks). Command:
 
 ```
-WOOLLAMA_TEST_CMD="$PWD/target/release/woollama-server" \
+WOOLLAMA_TEST_CMD="$PWD/target/release/woollamad" \
 WOOLLAMA_EXAMPLES_DIR="$PWD/examples" WOOLLAMA_OLLAMA_URL="http://localhost:11434" \
 uv run --extra dev pytest tests/test_integration.py -m integration -v
 ```

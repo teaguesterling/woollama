@@ -1,7 +1,7 @@
 # Cargo workspace root for the Rust port of the woollama router service
 # (see docs/rust-router-port.md). Members:
 #   woollama-core   — the engine cdylib/wheel (today; becomes a pure rlib in slice 1)
-#   woollama-server — the router-service binary (stub today; grows from slice 2)
+#   woollama-server — the crate that builds the `woollamad` router daemon (grows from slice 2)
 # The root `woollama` package below stays as the crates.io-name placeholder.
 [workspace]
 members = ["woollama-engine", "woollama-core", "woollama-server"]

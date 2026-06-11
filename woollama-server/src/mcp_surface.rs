@@ -5,7 +5,7 @@
 //!                         with input + output schema mirrored, proxied to the registry.
 //!   - recipe prompts    — one per recipe; get returns its system message.
 //!
-//! Served two ways from the SAME handler: stdio (`woollama-server mcp`) and a
+//! Served two ways from the SAME handler: stdio (`woollamad mcp`) and a
 //! Streamable-HTTP mount at `/mcp` (shared port). The `WoollamaMcp` handler holds an
 //! `Arc<AppState>`, so the per-session factory shares the one downstream registry.
 
