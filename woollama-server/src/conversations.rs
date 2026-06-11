@@ -213,6 +213,26 @@ impl ConversationStore {
         self.save();
     }
 
+    /// Update the managed-agents routing state after a turn (native session id + the
+    /// interactive pause state — required_action / pending_tool_use_id / status).
+    pub fn set_managed(
+        &mut self,
+        conv_id: &str,
+        native_id: Option<String>,
+        status: String,
+        required_action: Option<Value>,
+        pending_tool_use_id: Option<String>,
+    ) {
+        if let Some(conv) = self.convs.get_mut(conv_id) {
+            conv.native_id = native_id;
+            conv.status = status;
+            conv.required_action = required_action;
+            conv.pending_tool_use_id = pending_tool_use_id;
+            conv.updated_at = now_secs();
+        }
+        self.save();
+    }
+
     pub fn remove(&mut self, conv_id: &str) -> Option<Conversation> {
         let conv = self.convs.remove(conv_id);
         if let Some(c) = &conv {
@@ -257,6 +277,7 @@ impl Conversations {
 pub fn backend_for_model(model: &str, has_store: bool) -> Option<&'static str> {
     match model.split('/').next().unwrap_or("") {
         "claude-code" => Some("claude-resume"),
+        "claude-agent" => Some("managed-agents"),
         _ => has_store.then_some("store-backed"),
     }
 }

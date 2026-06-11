@@ -83,6 +83,24 @@ pub fn build_response_conv(resp_id: &str, model: &str, text: &str, conv_id: &str
     v
 }
 
+/// A stateful Response with an explicit `status` and optional `required_action` (the
+/// interactive requires_action superset — managed-agents' ask_user pause).
+pub fn build_response_stateful(
+    resp_id: &str,
+    model: &str,
+    text: &str,
+    conv_id: &str,
+    status: &str,
+    required_action: Option<Value>,
+) -> Value {
+    let mut v = build_response_conv(resp_id, model, text, conv_id);
+    v["status"] = json!(status);
+    if let Some(ra) = required_action {
+        v["required_action"] = ra;
+    }
+    v
+}
+
 /// A Response object with explicit `status` + `created_at` — for the streaming
 /// `response.created` (in_progress) and `response.completed` (completed) events.
 pub fn build_response_full(resp_id: &str, model: &str, text: &str, status: &str, created_at: i64) -> Value {

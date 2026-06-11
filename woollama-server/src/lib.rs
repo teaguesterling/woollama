@@ -34,6 +34,7 @@ use engine::EngineError;
 mod claude_code;
 mod config;
 mod conversations;
+mod managed_agents;
 mod mcp_registry;
 mod mcp_surface;
 mod ollama_native;
@@ -57,6 +58,9 @@ pub struct AppState {
     /// An external conversation store (issue #2), wired from mcp.json's
     /// `conversationStore`. When present, non-claude models become stateful (store-backed).
     pub store: Option<Arc<dyn conversations::StoreProvider>>,
+    /// The Anthropic Managed Agents backend (claude-agent/* models). Paid; errors at
+    /// turn time if ANTHROPIC_API_KEY is unset.
+    pub managed_agents: Arc<managed_agents::ManagedAgents>,
 }
 
 impl AppState {
@@ -99,7 +103,8 @@ pub async fn build_state() -> AppState {
             None
         }
     };
-    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations, store }
+    let managed_agents = Arc::new(managed_agents::ManagedAgents::new());
+    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations, store, managed_agents }
 }
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
@@ -696,19 +701,20 @@ async fn responses_stateful(state: &AppState, body: &Value, model: &str, message
     let _guard = lock.lock().await;
 
     let options = body.get("options").cloned();
-    let text = match conv.backend.as_str() {
-        "claude-resume" => claude_resume_turn(state, &conv.id, &conv.model, messages).await,
-        "store-backed" => store_backed_turn(state, &conv.id, &conv.model, messages, options).await,
+    let turn: Result<(String, Option<Value>), EngineError> = match conv.backend.as_str() {
+        "claude-resume" => claude_resume_turn(state, &conv.id, &conv.model, messages).await.map(|t| (t, None)),
+        "store-backed" => store_backed_turn(state, &conv.id, &conv.model, messages, options).await.map(|t| (t, None)),
+        "managed-agents" => managed_agents_turn(state, &conv, messages).await,
         other => {
             return err_response(
                 StatusCode::NOT_IMPLEMENTED,
-                format!("the '{other}' backend is not yet in the Rust server (slice 7)"),
+                format!("the '{other}' backend is not in the Rust server"),
                 "not_implemented",
             )
         }
     };
-    let text = match text {
-        Ok(t) => t,
+    let (text, required_action) = match turn {
+        Ok(x) => x,
         Err(e) => return engine_err_response(e),
     };
 
@@ -717,7 +723,56 @@ async fn responses_stateful(state: &AppState, body: &Value, model: &str, message
         let mut t = state.conversations.table.lock().await;
         t.record_response(&conv.id, &resp_id);
     }
-    Json(responses::build_response_conv(&resp_id, &conv.model, &text, &conv.id)).into_response()
+    let status = if required_action.is_some() { "requires_action" } else { "completed" };
+    Json(responses::build_response_stateful(&resp_id, &conv.model, &text, &conv.id, status, required_action))
+        .into_response()
+}
+
+/// The latest user message text — for a stateful turn the backend already owns prior
+/// history, so woollama sends only the new user input.
+fn latest_user_text(messages: &Value) -> String {
+    let Some(arr) = messages.as_array() else { return String::new() };
+    for m in arr.iter().rev() {
+        if m.get("role").and_then(Value::as_str) == Some("user") {
+            return m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        }
+    }
+    arr.last().and_then(|m| m.get("content").and_then(Value::as_str)).unwrap_or("").to_string()
+}
+
+/// One managed-agents turn: resume a paused session with the answer (if awaiting input),
+/// else run a fresh turn (creating the hosted session lazily). Returns the text + the
+/// `required_action` payload when the agent paused on ask_user.
+async fn managed_agents_turn(state: &AppState, conv: &conversations::Conversation, messages: &Value) -> Result<(String, Option<Value>), EngineError> {
+    let ma = &state.managed_agents;
+    let to_err = |e: managed_agents::ManagedAgentsError| EngineError::new(format!("managed-agents backend: {e}"), "server_error", 502);
+
+    let mut native_id = conv.native_id.clone();
+    let turn = if conv.status == "awaiting_input" && conv.pending_tool_use_id.is_some() {
+        ma.answer_turn(
+            native_id.as_deref().unwrap_or(""),
+            conv.pending_tool_use_id.as_deref().unwrap(),
+            &latest_user_text(messages),
+        )
+        .await
+        .map_err(to_err)?
+    } else {
+        if native_id.is_none() {
+            native_id = Some(ma.create_session(&conv.model, conv.title.as_deref(), &conv.metadata).await.map_err(to_err)?);
+        }
+        ma.run_turn(native_id.as_deref().unwrap(), &latest_user_text(messages)).await.map_err(to_err)?
+    };
+
+    let (status, required_action, pending_id) = match &turn.pending {
+        Some(p) => (
+            "awaiting_input".to_string(),
+            Some(json!({"type": "ask_user", "question": p.input})),
+            Some(p.id.clone()),
+        ),
+        None => ("idle".to_string(), None, None),
+    };
+    state.conversations.table.lock().await.set_managed(&conv.id, native_id, status, required_action.clone(), pending_id);
+    Ok((turn.text, required_action))
 }
 
 /// One claude-resume turn: ensure a stable workdir, `--resume` the session, persist the
@@ -794,7 +849,7 @@ async fn conversations_create(State(state): State<Arc<AppState>>, Json(body): Js
         .and_then(Value::as_str)
         .map(String::from)
         .or_else(|| state.backend_for_model(model).map(String::from));
-    let Some(backend) = backend.filter(|b| b == "claude-resume" || b == "store-backed") else {
+    let Some(backend) = backend.filter(|b| b == "claude-resume" || b == "store-backed" || b == "managed-agents") else {
         return err_response(StatusCode::NOT_IMPLEMENTED, no_stateful_backend_msg(model), "not_implemented");
     };
     let key = body.get("key").and_then(Value::as_str).map(String::from);
@@ -833,18 +888,29 @@ async fn conversations_items(State(state): State<Arc<AppState>>, Path(conv_id): 
             None => return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found"),
         }
     };
-    // store-backed serves the transcript from the external store; claude-resume has no
-    // `history` (reading its session log is a later driver slice) → 501.
-    if conv.backend == "store-backed" {
-        let Some(store) = state.store.clone() else {
-            return engine_err_response(EngineError::new("no conversation store configured", "server_error", 500));
-        };
-        let msgs = match &conv.native_id {
-            Some(tid) => match store.get(tid).await {
-                Ok(m) => m,
-                Err(e) => return engine_err_response(e),
+    // store-backed + managed-agents serve the transcript (from the store / Anthropic's
+    // event log); claude-resume has no `history` (a later driver slice) → 501.
+    if conv.backend == "store-backed" || conv.backend == "managed-agents" {
+        let msgs: Vec<Value> = match conv.backend.as_str() {
+            "store-backed" => {
+                let Some(store) = state.store.clone() else {
+                    return engine_err_response(EngineError::new("no conversation store configured", "server_error", 500));
+                };
+                match &conv.native_id {
+                    Some(tid) => match store.get(tid).await {
+                        Ok(m) => m,
+                        Err(e) => return engine_err_response(e),
+                    },
+                    None => Vec::new(),
+                }
+            }
+            _ => match &conv.native_id {
+                Some(sid) => match state.managed_agents.history(sid).await {
+                    Ok(m) => m,
+                    Err(e) => return engine_err_response(EngineError::new(format!("managed-agents backend: {e}"), "server_error", 502)),
+                },
+                None => Vec::new(),
             },
-            None => Vec::new(),
         };
         let data: Vec<Value> = msgs.iter().map(responses::item_object).collect();
         let first_id = data.first().and_then(|x| x.get("id").cloned()).unwrap_or(Value::Null);
@@ -882,6 +948,11 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
         "store-backed" => {
             if let (Some(store), Some(tid)) = (state.store.clone(), conv.native_id.clone()) {
                 let _ = store.delete(&tid).await;
+            }
+        }
+        "managed-agents" => {
+            if let Some(sid) = &conv.native_id {
+                let _ = state.managed_agents.delete_session(sid).await;
             }
         }
         _ => {}
