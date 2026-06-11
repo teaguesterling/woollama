@@ -17,10 +17,12 @@
 //! field-by-field). Passed to `orchestrate`/`orchestrate_events` via `registry=`;
 //! omitting it uses the built-ins (the hermetic default).
 //!
+//! `InferenceError` is structured (`message`/`kind`/`status`/`payload`) so the server
+//! maps it to HTTP/MCP error surfaces — mirrors the Python `InferenceError`.
+//!
 //! Behavior mirrors `woollama.core` in Python; its hermetic suite is the
 //! conformance oracle. Deferred (later slices): the registry's discovery fields
-//! (`models`/`discover`/`model_patterns`) + `/v1/models`; structured
-//! `InferenceError` fields (kind/status/payload).
+//! (`models`/`discover`/`model_patterns`) + `/v1/models`.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -29,14 +31,59 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
-use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-create_exception!(core, InferenceError, PyException);
+/// Structured inference/orchestration error — mirrors the Python
+/// `core.InferenceError(message, kind, status, payload=None)`. Each transport maps it
+/// to its surface (HTTP status / MCP error) via `.kind`/`.status`, and `.payload`
+/// passes the raw upstream response through verbatim. The router re-exports it as
+/// `OrchestrationError`.
+#[pyclass(extends = PyException, subclass)]
+struct InferenceError {
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    kind: Option<String>,
+    #[pyo3(get)]
+    status: Option<i64>,
+    #[pyo3(get)]
+    payload: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl InferenceError {
+    #[new]
+    #[pyo3(signature = (message, kind=None, status=None, payload=None))]
+    fn new(message: String, kind: Option<String>, status: Option<i64>, payload: Option<Py<PyAny>>) -> Self {
+        InferenceError { message, kind, status, payload }
+    }
+
+    fn __str__(&self) -> String {
+        self.message.clone()
+    }
+}
+
+/// Raise a structured `InferenceError` with `kind`/`status` (no payload).
+fn inf_err(message: impl Into<String>, kind: &str, status: i64) -> PyErr {
+    inf_err_payload(message, kind, status, None)
+}
+
+/// Raise a structured `InferenceError`, optionally carrying the raw upstream `payload`.
+fn inf_err_payload(message: impl Into<String>, kind: &str, status: i64, payload: Option<Value>) -> PyErr {
+    Python::with_gil(|py| {
+        let payload_py = payload
+            .and_then(|p| pythonize::pythonize(py, &p).ok())
+            .map(|b| b.unbind());
+        match py.get_type::<InferenceError>().call1((message.into(), kind, status, payload_py)) {
+            Ok(exc) => PyErr::from_value(exc),
+            Err(e) => e,
+        }
+    })
+}
 
 /// A resolved inference backend (OpenAI-compatible endpoint).
 #[derive(Clone)]
@@ -144,17 +191,21 @@ fn build_request(
 ) -> PyResult<Request> {
     let (provider, bare) = split_model(model);
     let inf = get_inferencer(&provider).ok_or_else(|| {
-        InferenceError::new_err(format!(
-            "unknown model namespace: '{model}'. Use 'woollama/<recipe>' or \
-             '<provider>/<model>' for a known inferencer ({}).",
-            known_providers().join(", ")
-        ))
+        inf_err(
+            format!(
+                "unknown model namespace: '{model}'. Use 'woollama/<recipe>' or \
+                 '<provider>/<model>' for a known inferencer ({}).",
+                known_providers().join(", ")
+            ),
+            "invalid_request_error",
+            400,
+        )
     })?;
     let base = base_url
         .unwrap_or_else(|| inf.base_url.clone())
         .trim_end_matches('/')
         .to_string();
-    let headers = build_headers(&inf, api_key).map_err(InferenceError::new_err)?;
+    let headers = build_headers(&inf, api_key).map_err(|e| inf_err(e, "invalid_request_error", 400))?;
 
     // ollama-native num_ctx routing is non-stream only (matches Python).
     let native = !stream
@@ -243,7 +294,7 @@ fn complete<'py>(
             parse_response(&data, req.native)
         }
         .await;
-        out.map_err(InferenceError::new_err)
+        out.map_err(|e| inf_err(e, "server_error", 502))
     })
 }
 
@@ -274,7 +325,7 @@ fn complete_sync(
         let data = resp.json::<Value>().map_err(|e| e.to_string())?;
         parse_response(&data, req.native)
     })
-    .map_err(InferenceError::new_err)
+    .map_err(|e| inf_err(e, "server_error", 502))
 }
 
 /// The built-in provider names (introspection / parity with `inferencers.names()`).
@@ -345,25 +396,31 @@ fn load_inferencers_toml() -> PyResult<HashMap<String, serde_json::Map<String, V
         Err(_) => return Ok(HashMap::new()), // not a file / unreadable → none (matches is_file gate)
     };
     let v: Value = toml::from_str(&expand_env(&text)).map_err(|e| {
-        InferenceError::new_err(format!("inferencers.toml parse error in {}: {e}", path.display()))
+        inf_err(
+            format!("inferencers.toml parse error in {}: {e}", path.display()),
+            "invalid_request_error",
+            400,
+        )
     })?;
     let raw = match v.get("inferencers") {
         None => return Ok(HashMap::new()),
         Some(Value::Object(o)) => o,
         Some(_) => {
-            return Err(InferenceError::new_err(format!(
-                "inferencers.toml {}: 'inferencers' must be a table",
-                path.display()
-            )))
+            return Err(inf_err(
+                format!("inferencers.toml {}: 'inferencers' must be a table", path.display()),
+                "invalid_request_error",
+                400,
+            ))
         }
     };
     let mut out = HashMap::new();
     for (name, entry) in raw {
         let obj = entry.as_object().ok_or_else(|| {
-            InferenceError::new_err(format!(
-                "inferencers.toml {}: '{name}' must be a table",
-                path.display()
-            ))
+            inf_err(
+                format!("inferencers.toml {}: '{name}' must be a table", path.display()),
+                "invalid_request_error",
+                400,
+            )
         })?;
         out.insert(name.clone(), obj.clone());
     }
@@ -393,10 +450,14 @@ fn build_config_registry() -> PyResult<HashMap<String, Inferencer>> {
             .map(str::to_string)
             .or_else(|| base.as_ref().map(|b| b.base_url.clone()))
             .ok_or_else(|| {
-                InferenceError::new_err(format!(
-                    "inferencer '{name}' has no base_url and is not a known built-in to \
-                     extend — add base_url in inferencers.toml"
-                ))
+                inf_err(
+                    format!(
+                        "inferencer '{name}' has no base_url and is not a known built-in to \
+                         extend — add base_url in inferencers.toml"
+                    ),
+                    "invalid_request_error",
+                    400,
+                )
             })?;
         // api_key_env: absence-inherit. Present (even "") wins; "" → no auth (falsy in headers).
         let api_key_env = if spec.contains_key("api_key_env") {
@@ -613,7 +674,7 @@ fn build_setup(
     let inferencer = rv
         .get("inferencer")
         .and_then(Value::as_str)
-        .ok_or_else(|| InferenceError::new_err("recipe missing 'inferencer'"))?
+        .ok_or_else(|| inf_err("recipe missing 'inferencer'", "invalid_request_error", 400))?
         .to_string();
     let system = rv.get("system").and_then(Value::as_str).unwrap_or("").to_string();
     let tool_names: Vec<String> = rv
@@ -634,11 +695,13 @@ fn build_setup(
             Some(reg) => reg.names().join(", "),
             None => known_providers().join(", "),
         };
-        InferenceError::new_err(format!(
-            "unsupported inferencer '{inferencer}' (supported providers: {known}, claude-code)"
-        ))
+        inf_err(
+            format!("unsupported inferencer '{inferencer}' (supported providers: {known}, claude-code)"),
+            "not_implemented",
+            501,
+        )
     })?;
-    let headers = build_headers(&inf, api_key.as_deref()).map_err(InferenceError::new_err)?;
+    let headers = build_headers(&inf, api_key.as_deref()).map_err(|e| inf_err(e, "invalid_request_error", 400))?;
     let base = base_url
         .unwrap_or_else(|| inf.base_url.clone())
         .trim_end_matches('/')
@@ -794,7 +857,7 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
         let mut messages = messages;
         let client = match reqwest::Client::builder().timeout(Duration::from_secs(180)).build() {
             Ok(c) => c,
-            Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+            Err(e) => { yield Err(inf_err(e.to_string(), "server_error", 502)); return; }
         };
         for turn in 1..=8u32 {
             // body = {model, messages, tools, stream, **extra_body, **params}
@@ -806,7 +869,7 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
             for (k, v) in &headers { rb = rb.header(k, v); }
             let resp = match rb.send().await {
                 Ok(r) => r,
-                Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+                Err(e) => { yield Err(inf_err(e.to_string(), "server_error", 502)); return; }
             };
 
             // Resolve this turn into (content, calls, response). STREAMING yields the
@@ -819,7 +882,8 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
             if stream_mode {
                 if resp.status().as_u16() >= 400 {
                     let err_body = resp.text().await.unwrap_or_default();
-                    yield Err(InferenceError::new_err(format!("inferencer error: {err_body}")));
+                    yield Err(inf_err_payload("inferencer error", "server_error", 502,
+                                              serde_json::from_str::<Value>(&err_body).ok()));
                     return;
                 }
                 let mut resp = resp;
@@ -851,7 +915,7 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
                             if !buf.is_empty() && !flushed { flushed = true; buf.push(b'\n'); continue; }
                             break 'read;
                         }
-                        Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+                        Err(e) => { yield Err(inf_err(e.to_string(), "server_error", 502)); return; }
                     }
                 }
                 content = parts.join("");
@@ -868,10 +932,10 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
             } else {
                 let data: Value = match resp.json().await {
                     Ok(d) => d,
-                    Err(e) => { yield Err(InferenceError::new_err(e.to_string())); return; }
+                    Err(e) => { yield Err(inf_err(e.to_string(), "server_error", 502)); return; }
                 };
                 if data.get("choices").is_none() {
-                    yield Err(InferenceError::new_err(format!("inferencer error: {data}")));
+                    yield Err(inf_err_payload("inferencer error", "server_error", 502, Some(data.clone())));
                     return;
                 }
                 let msg = &data["choices"][0]["message"];
@@ -913,7 +977,7 @@ fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = PyResult
                 messages.push(json!({"role": "tool", "content": result, "tool_call_id": call_id}));
             }
         }
-        yield Err(InferenceError::new_err("max turns (8) exceeded"));
+        yield Err(inf_err("max turns (8) exceeded", "server_error", 500));
     }
 }
 
@@ -939,7 +1003,7 @@ fn orchestrate<'py>(
                 return Python::with_gil(|py| Ok(pythonize::pythonize(py, &resp)?.unbind()));
             }
         }
-        Err(InferenceError::new_err("orchestrate: loop ended without a final response"))
+        Err(inf_err("orchestrate: loop ended without a final response", "server_error", 500))
     })
 }
 
@@ -1053,7 +1117,7 @@ impl DeltaStream {
                     let client = reqwest::Client::builder()
                         .timeout(Duration::from_secs(req.timeout))
                         .build()
-                        .map_err(|e| InferenceError::new_err(e.to_string()))?;
+                        .map_err(|e| inf_err(e.to_string(), "server_error", 502))?;
                     let mut rb = client.post(&req.url).json(&req.body);
                     for (k, v) in &req.headers {
                         rb = rb.header(k, v);
@@ -1061,10 +1125,12 @@ impl DeltaStream {
                     let resp = rb
                         .send()
                         .await
-                        .map_err(|e| InferenceError::new_err(e.to_string()))?;
+                        .map_err(|e| inf_err(e.to_string(), "server_error", 502))?;
                     if resp.status().as_u16() >= 400 {
+                        let status = resp.status().as_u16() as i64;   // upstream status (matches Python)
                         let body = resp.text().await.unwrap_or_default();
-                        return Err(InferenceError::new_err(format!("inferencer error: {body}")));
+                        return Err(inf_err_payload("inferencer error", "server_error", status,
+                                                   serde_json::from_str::<Value>(&body).ok()));
                     }
                     *s = StreamState::Active { resp, buf: Vec::new() };
                 }
@@ -1081,7 +1147,7 @@ impl DeltaStream {
                         Delta::NeedMore => match resp
                             .chunk()
                             .await
-                            .map_err(|e| InferenceError::new_err(e.to_string()))?
+                            .map_err(|e| inf_err(e.to_string(), "server_error", 502))?
                         {
                             Some(bytes) => buf.extend_from_slice(&bytes),
                             None => {
@@ -1118,11 +1184,9 @@ fn complete_stream(
 #[pymodule]
 fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // `create_exception!` can't take a dotted module ident, so its `__module__` is the bare
-    // `core`; relabel it to the real import path for clean reprs / pickling.
-    let exc = m.py().get_type::<InferenceError>();
-    exc.setattr("__module__", "woollama.core")?;
-    m.add("InferenceError", exc)?;
+    m.add_class::<InferenceError>()?;
+    // Relabel `__module__` from the bare `core` to the real import path (clean reprs).
+    m.py().get_type::<InferenceError>().setattr("__module__", "woollama.core")?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
     m.add_function(wrap_pyfunction!(complete_sync, m)?)?;
     m.add_function(wrap_pyfunction!(complete_stream, m)?)?;

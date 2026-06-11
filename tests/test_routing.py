@@ -41,6 +41,17 @@ from woollama.manager import Registry, ServerManager
 # Fakes — a scripted inferencer + two recording downstream sessions
 # ---------------------------------------------------------------------------
 
+class _Resp:
+    """A fake httpx response — used only by the ollama-native PASSTHROUGH test, which
+    legitimately patches httpx (the passthrough is a Python path, not the Rust core)."""
+    def __init__(self, payload: dict, status: int = 200):
+        self.status_code = status
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
 def mock_inferencer(monkeypatch, turns: list[dict]):
     """Serve each scripted turn from a mock HTTP server and point
     `$WOOLLAMA_OLLAMA_URL` at it. The recipe loop runs in the Rust core (reqwest),
