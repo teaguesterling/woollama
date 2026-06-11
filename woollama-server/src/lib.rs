@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,6 +33,7 @@ use engine::EngineError;
 
 mod claude_code;
 mod config;
+mod conversations;
 mod mcp_registry;
 mod mcp_surface;
 mod ollama_native;
@@ -51,6 +52,8 @@ pub struct AppState {
     /// The mcp.json specs (for claude-code delegation, which writes a per-recipe
     /// --mcp-config from the referenced subset).
     pub mcp_specs: HashMap<String, config::McpServerSpec>,
+    /// The durable conversation handle table (stateful /v1/responses + /v1/conversations).
+    pub conversations: Arc<conversations::Conversations>,
 }
 
 /// Load config + connect the downstream MCP servers. Errors are logged and degraded to
@@ -69,7 +72,13 @@ pub async fn build_state() -> AppState {
         eprintln!("woollama-server: inferencers load error: {e}");
         engine::Registry::new()
     });
-    AppState { recipes, registry, inferencers, mcp_specs: specs }
+    // Durable handle table at $WOOLLAMA_STATE_DIR/conversations.json (in-memory if unset).
+    let state_path = std::env::var("WOOLLAMA_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|d| std::path::PathBuf::from(d).join("conversations.json"));
+    let conversations = Arc::new(conversations::Conversations::new(state_path));
+    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations }
 }
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
@@ -103,6 +112,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_create))
+        .route("/v1/conversations", post(conversations_create).get(conversations_list))
+        .route("/v1/conversations/{conv_id}", get(conversations_get).delete(conversations_delete))
+        .route("/v1/conversations/{conv_id}/items", get(conversations_items))
         .nest_service("/mcp", mcp_svc)
         .with_state(state)
 }
@@ -535,11 +547,14 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
         || nonnull("previous_response_id")
         || nonnull("key");
     if stateful {
-        return err_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "stateful /v1/responses is not yet in the Rust server (slices 6-7)",
-            "not_implemented",
-        );
+        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "streaming is not supported for STATEFUL /v1/responses conversations",
+                "invalid_request_error",
+            );
+        }
+        return responses_stateful(&state, &body, &model, &json!(messages)).await;
     }
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         let source: BoxStream<'static, Result<String, EngineError>> =
@@ -609,4 +624,168 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
         Ok(text) => Json(responses::build_response(&resp_id, &model, &text)).into_response(),
         Err(e) => engine_err_response(e),
     }
+}
+
+// --- stateful conversations (slice 6a) ----------------------------------------
+
+fn no_stateful_backend_msg(model: &str) -> String {
+    format!(
+        "no stateful backend for model '{model}': only claude-code (claude-resume) has one \
+         in this build (managed-agents + store-backed are later slices). Use store:false \
+         (the caller owns history)."
+    )
+}
+
+/// Run one stateful /v1/responses turn: resolve/create the conversation handle, run the
+/// turn on its backend under a per-conversation write lock, return the Responses object
+/// carrying the conversation id. Slice 6a: the claude-resume backend only.
+async fn responses_stateful(state: &AppState, body: &Value, model: &str, messages: &Value) -> Response {
+    let conv_id_param = body.get("conversation").and_then(Value::as_str);
+    let prev = body.get("previous_response_id").and_then(Value::as_str);
+    let key = body.get("key").and_then(Value::as_str);
+
+    // Resolve or create the conversation handle (explicit id wins, then prev, then key,
+    // else a new one whose backend is derived from the model).
+    let conv = {
+        let mut t = state.conversations.table.lock().await;
+        if let Some(cid) = conv_id_param {
+            match t.get(cid) {
+                Some(c) => c,
+                None => return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{cid}'"), "not_found"),
+            }
+        } else if let Some(p) = prev {
+            match t.by_response(p) {
+                Some(c) => c,
+                None => return err_response(StatusCode::NOT_FOUND, format!("unknown previous_response_id '{p}'"), "not_found"),
+            }
+        } else {
+            let Some(backend) = conversations::backend_for_model(model) else {
+                return err_response(StatusCode::NOT_IMPLEMENTED, no_stateful_backend_msg(model), "not_implemented");
+            };
+            match key {
+                Some(k) => t.get_or_create_by_alias(k, backend, model),
+                None => t.create(backend, model, json!({}), None, None),
+            }
+        }
+    };
+
+    if conv.backend != "claude-resume" {
+        return err_response(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("the '{}' backend is not yet in the Rust server (slices 6b/7)", conv.backend),
+            "not_implemented",
+        );
+    }
+
+    // One writer per conversation: hold the per-conv lock across the turn (but NOT the
+    // table lock, which only guards brief reads/writes).
+    let lock = state.conversations.conv_lock(&conv.id).await;
+    let _guard = lock.lock().await;
+
+    let (model_full, mut native_id, mut workdir) = {
+        let t = state.conversations.table.lock().await;
+        let c = t.get(&conv.id).unwrap_or_else(|| conv.clone());
+        (c.model.clone(), c.native_id.clone(), c.workdir.clone())
+    };
+    // A stable, neutral workdir per conversation — Claude scopes sessions by project dir,
+    // so every --resume must run in the same dir. Created on the first turn, reused after.
+    if workdir.is_none() {
+        let dir = std::env::temp_dir().join(format!("woollama-conv-{}", uuid::Uuid::new_v4().simple()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return engine_err_response(EngineError::new(e.to_string(), "server_error", 500));
+        }
+        workdir = Some(dir.to_string_lossy().to_string());
+    }
+    let cc_model = model_full.strip_prefix("claude-code/").unwrap_or("");
+    let (resp, sid) = match claude_code::run_resumable(messages, cc_model, native_id.as_deref(), workdir.as_deref().unwrap()).await {
+        Ok(x) => x,
+        Err(e) => return engine_err_response(EngineError::new(format!("claude-resume backend: {e}"), "server_error", 502)),
+    };
+    if sid.is_some() {
+        native_id = sid; // first turn sets it; resume reports the same id
+    }
+    let text = resp["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+
+    let resp_id = responses::new_id("resp");
+    {
+        let mut t = state.conversations.table.lock().await;
+        t.set_native(&conv.id, native_id, workdir);
+        t.record_response(&conv.id, &resp_id);
+    }
+    Json(responses::build_response_conv(&resp_id, &conv.model, &text, &conv.id)).into_response()
+}
+
+async fn conversations_create(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    if model.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "`model` is required to create a conversation", "invalid_request_error");
+    }
+    let backend = body
+        .get("backend")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| conversations::backend_for_model(model).map(String::from));
+    let Some(backend) = backend.filter(|b| b == "claude-resume") else {
+        return err_response(StatusCode::NOT_IMPLEMENTED, no_stateful_backend_msg(model), "not_implemented");
+    };
+    let key = body.get("key").and_then(Value::as_str).map(String::from);
+    let metadata = body.get("metadata").cloned().unwrap_or_else(|| json!({}));
+    let title = body.get("title").and_then(Value::as_str).map(String::from);
+
+    let mut t = state.conversations.table.lock().await;
+    if let Some(k) = &key {
+        if let Some(existing) = t.by_alias(k) {
+            return (StatusCode::OK, Json(existing.to_object())).into_response();
+        }
+    }
+    let conv = t.create(&backend, model, metadata, title, key);
+    (StatusCode::CREATED, Json(conv.to_object())).into_response()
+}
+
+async fn conversations_list(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let t = state.conversations.table.lock().await;
+    let data: Vec<Value> = t.list().iter().map(|c| c.to_object()).collect();
+    Json(json!({"object": "list", "data": data}))
+}
+
+async fn conversations_get(State(state): State<Arc<AppState>>, Path(conv_id): Path<String>) -> Response {
+    let t = state.conversations.table.lock().await;
+    match t.get(&conv_id) {
+        Some(c) => Json(c.to_object()).into_response(),
+        None => err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found"),
+    }
+}
+
+async fn conversations_items(State(state): State<Arc<AppState>>, Path(conv_id): Path<String>) -> Response {
+    let t = state.conversations.table.lock().await;
+    let Some(conv) = t.get(&conv_id) else {
+        return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found");
+    };
+    // claude-resume has no `history` (reading its session log is a later driver slice);
+    // managed-agents / store-backed will serve items.
+    err_response(
+        StatusCode::NOT_IMPLEMENTED,
+        format!("conversation transcript items are not available for the '{}' backend yet", conv.backend),
+        "not_implemented",
+    )
+}
+
+async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id): Path<String>) -> Response {
+    let conv = {
+        let t = state.conversations.table.lock().await;
+        t.get(&conv_id)
+    };
+    let Some(conv) = conv else {
+        return err_response(StatusCode::NOT_FOUND, format!("unknown conversation '{conv_id}'"), "not_found");
+    };
+    // Backend teardown (best-effort): claude-resume removes the per-conversation workdir;
+    // the Claude session transcript on disk (~/.claude) is the user's data, left intact.
+    if let Some(wd) = &conv.workdir {
+        let _ = std::fs::remove_dir_all(wd);
+    }
+    {
+        let mut t = state.conversations.table.lock().await;
+        t.remove(&conv_id);
+    }
+    Json(json!({"id": conv_id, "object": "conversation.deleted", "deleted": true})).into_response()
 }

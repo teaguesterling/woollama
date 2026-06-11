@@ -86,7 +86,7 @@ fn render_prompt(user_msgs: &Value) -> String {
         .join("\n")
 }
 
-fn build_args(prompt: &str, system: &str, model: &str) -> Vec<String> {
+fn build_args(prompt: &str, system: &str, model: &str, resume: Option<&str>) -> Vec<String> {
     let mut args = vec![
         claude_bin(), "-p".into(), prompt.into(),
         "--output-format".into(), "json".into(),
@@ -97,7 +97,12 @@ fn build_args(prompt: &str, system: &str, model: &str) -> Vec<String> {
         "--tools".into(), "".into(),
         "--disallowedTools".into(), DENY_TOOLS.into(),
     ];
-    if !system.is_empty() {
+    if let Some(r) = resume {
+        args.push("--resume".into()); // continue an existing session
+        args.push(r.into());
+    }
+    // The system prompt is set when STARTING a session; --resume carries it forward.
+    if !system.is_empty() && resume.is_none() {
         args.push("--system-prompt".into());
         args.push(system.into());
     }
@@ -215,12 +220,28 @@ fn as_openai(text: &str) -> Value {
 
 /// One-shot, tool-less completion → an OpenAI chat-completions dict.
 pub async fn run_completion(system: &str, user_msgs: &Value, model: &str) -> Result<Value, ClaudeCodeError> {
-    let args = build_args(&render_prompt(user_msgs), system, model);
+    let args = build_args(&render_prompt(user_msgs), system, model, None);
     let env = child_env();
     let tmp = tempfile::tempdir().map_err(|e| ClaudeCodeError(e.to_string()))?;
     let cwd = tmp.path().to_string_lossy().to_string();
     let (text, _) = invoke_and_parse(&args, &env, &cwd, 180.0).await?;
     Ok(as_openai(&text))
+}
+
+/// One tool-less turn that PARTICIPATES IN A SESSION — the claude-resume backend.
+/// `session_id=None` starts a new session, else `--resume` it; `cwd` MUST be stable
+/// across a conversation's turns (Claude scopes sessions by project dir). Returns
+/// `(OpenAI dict, session_id)` — the captured/echoed id is the handle's backing id.
+pub async fn run_resumable(
+    user_msgs: &Value,
+    model: &str,
+    session_id: Option<&str>,
+    cwd: &str,
+) -> Result<(Value, Option<String>), ClaudeCodeError> {
+    let args = build_args(&render_prompt(user_msgs), "", model, session_id);
+    let env = child_env();
+    let (text, sid) = invoke_and_parse(&args, &env, cwd, 180.0).await?;
+    Ok((as_openai(&text), sid))
 }
 
 /// Delegated executor turn: hand Claude the recipe's allow-listed MCP tools (config
@@ -267,7 +288,7 @@ mod tests {
 
     #[test]
     fn build_args_carries_the_lockdown() {
-        let a = build_args("hi", "be brief", "haiku");
+        let a = build_args("hi", "be brief", "haiku", None);
         let s = a.join(" ");
         assert!(a.windows(2).any(|w| w == ["--tools", ""]), "allow-list of none");
         assert!(s.contains("--strict-mcp-config"));

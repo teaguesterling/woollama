@@ -19,6 +19,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # 0.13 to match rmcp's reqwest (so reqwest::Client unifies with rmcp's HTTP client impl).
 reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 # MCP: downstream servers as rmcp child-process clients (slice 4) + the stdio test

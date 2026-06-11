@@ -76,6 +76,13 @@ pub fn build_response(resp_id: &str, model: &str, text: &str) -> Value {
     })
 }
 
+/// A completed Response carrying a conversation id (the stateful turn's result).
+pub fn build_response_conv(resp_id: &str, model: &str, text: &str, conv_id: &str) -> Value {
+    let mut v = build_response(resp_id, model, text);
+    v["conversation"] = json!({"id": conv_id});
+    v
+}
+
 /// A Response object with explicit `status` + `created_at` — for the streaming
 /// `response.created` (in_progress) and `response.completed` (completed) events.
 pub fn build_response_full(resp_id: &str, model: &str, text: &str, status: &str, created_at: i64) -> Value {
