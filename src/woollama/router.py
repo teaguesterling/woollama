@@ -26,13 +26,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import (
-    __version__,
     claude_code,
     conversations,
     managed_agents,
     responses,
 )
 from . import config, core, inferencers, ollama_native, recipes
+from ._version import __version__
 from .manager import Registry, RegistryToolProvider, ServerManager
 from .mcp_server import build_server, register_reexported_tools
 

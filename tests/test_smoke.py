@@ -4,9 +4,11 @@ from __future__ import annotations
 
 
 def test_version_is_string():
-    import woollama
-    assert isinstance(woollama.__version__, str)
-    assert woollama.__version__.count(".") == 2  # X.Y.Z
+    # `woollama` is a PEP 420 namespace package (no __init__), so the version lives
+    # in woollama._version (resolved from installed metadata), not as a package attr.
+    from woollama._version import __version__
+    assert isinstance(__version__, str)
+    assert __version__.count(".") == 2  # X.Y.Z
 
 
 def test_app_is_fastapi():

@@ -14,7 +14,8 @@ import sys
 
 import uvicorn
 
-from . import __version__, binding
+from . import binding
+from ._version import __version__
 from .router import app
 
 

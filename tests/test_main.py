@@ -10,7 +10,8 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
-from woollama import __main__, __version__
+from woollama import __main__
+from woollama._version import __version__
 
 
 def test_main_version_flag_prints_and_returns_0(monkeypatch, capsys):

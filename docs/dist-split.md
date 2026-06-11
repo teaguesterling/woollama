@@ -91,3 +91,30 @@ discovery + `/v1/models` to Rust and collapse it).
 5. **Cleanup** — remove any transition shims; docs.
 
 Each stage is its own commit; if a stage can't stay green it stops there for review.
+
+## Status / discovery (stage 3b cutover)
+
+Stages 1, 2, 3a, 3b-1 landed green. The structural cutover (3b-2 / stage 4) is
+**done and proven**: `woollama` is a PEP 420 namespace, `woollama.core` resolves to
+the **Rust** `.so` (namespace merge verified — `woollama.__path__` spans the server
+src + the woollama-core wheel), the router is rewired to the flat Rust surface with
+`registry=ModelRegistry.from_config()`, and the non-engine suite is green
+(config/recipes/tooling/smoke/server-free/claude_code).
+
+**But the cutover surfaced a test-harness incompatibility** (the genuine remaining
+work): the server's orchestration tests fake the inferencer by
+`monkeypatch.setattr(httpx, "AsyncClient", …)` — patching httpx **in-process**. The
+Python engine used httpx so the patch worked; the **Rust engine uses reqwest**, which
+the patch can't intercept, so those tests issue real HTTP and hit the live ollama
+(slow inference → effective hang).
+
+The fix is the same pattern the Rust conformance suite already uses: a threaded **mock
+HTTP server** + `$WOOLLAMA_OLLAMA_URL` (or per-recipe `base_url`) pointed at it, so the
+Rust core's reqwest hits the mock. Scope: rework the shared `mock_inferencer` fixture
+(test_routing) and the equivalent httpx-patching in the orchestration-driving files
+(test_responses, test_responses_stream, test_router, test_mcp_server), plus a few
+non-hang failures in test_inferencers / test_ollama_native (Python-path tests, likely
+the ollama-URL normalization). The file-store / discovery httpx patches
+(test_store_backend, test_http_store_provider) are Python-path and stay as-is.
+
+This is bounded but is its own focused pass — pending.
