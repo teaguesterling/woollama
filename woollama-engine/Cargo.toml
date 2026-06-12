@@ -4,6 +4,9 @@ version = "0.4.0"
 edition = "2021"
 description = "The pure-Rust woollama engine (no PyO3): inferencer registry, complete/stream, the recipe<->tool orchestrate loop. Consumed by the woollama-core wheel and the woollamad daemon (woollama-server crate)."
 license = "MIT"
+repository = "https://github.com/teaguesterling/woollama"
+keywords = ["mcp", "openai", "ollama", "llm", "inference"]
+categories = ["asynchronous", "api-bindings"]
 
 [lib]
 name = "woollama_engine"

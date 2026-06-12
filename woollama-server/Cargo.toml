@@ -2,8 +2,12 @@
 name = "woollama-server"
 version = "0.4.0"
 edition = "2021"
-description = "The woollama router service (Rust) — axum HTTP surface over woollama-engine."
+description = "woollamad — the woollama router daemon (Rust): an OpenAI-compatible + MCP router over Ollama, cloud models, and Claude Code, built on axum + woollama-engine."
 license = "MIT"
+repository = "https://github.com/teaguesterling/woollama"
+readme = "README.md"
+keywords = ["mcp", "openai", "ollama", "router", "llm"]
+categories = ["web-programming::http-server", "command-line-utilities"]
 
 [lib]
 name = "woollama_server"
@@ -11,12 +15,20 @@ path = "src/lib.rs"
 
 # The router daemon. Package/lib stay `woollama-server`/`woollama_server`; the produced
 # binary is `woollamad` (the service identity, distinct from the auxiliary `woollama` lib).
+# `cargo install woollama-server` installs just this bin (the fixtures below are gated).
 [[bin]]
 name = "woollamad"
 path = "src/main.rs"
 
+[features]
+# The two test-fixture binaries are gated behind this feature so a default `cargo install
+# woollama-server` ships ONLY `woollamad`. The test suite enables it
+# (`cargo test --features test-fixtures`); the `CARGO_BIN_EXE_*` envs the tests use are still
+# set when the feature is on.
+test-fixtures = []
+
 [dependencies]
-woollama-engine = { path = "../woollama-engine" }
+woollama-engine = { path = "../woollama-engine", version = "0.4.0" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # 0.13 to match rmcp's reqwest (so reqwest::Client unifies with rmcp's HTTP client impl).
@@ -36,14 +48,17 @@ bytes = "1"
 # claude-code executor: temp cwd + delegate-mcp.json (run_completion/run_delegated).
 tempfile = "3"
 
+# Test fixtures — only built with `--features test-fixtures` (kept out of `cargo install`).
 [[bin]]
 name = "mcp_fixture"
 path = "src/bin/mcp_fixture.rs"
+required-features = ["test-fixtures"]
 
 # A fake `claude` CLI for hermetic claude-code tests (WOOLLAMA_CLAUDE_BIN points here).
 [[bin]]
 name = "fake_claude"
 path = "src/bin/fake_claude.rs"
+required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
