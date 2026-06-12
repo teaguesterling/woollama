@@ -228,7 +228,7 @@ pub fn build_request(
     // ollama-native num_ctx routing is non-stream only (matches Python).
     let native = !stream
         && provider == "ollama"
-        && obj(&opts).and_then(|o| o.get("num_ctx")).map_or(false, |v| !v.is_null());
+        && obj(&opts).and_then(|o| o.get("num_ctx")).is_some_and(|v| !v.is_null());
 
     let (url, body, timeout) = if native {
         let mut native_opts = opts.clone().unwrap_or_else(|| json!({}));

@@ -35,7 +35,7 @@ async fn streaming_native_responses_and_orchestration() {
                     .and_then(Value::as_array)
                     .map(|ms| ms.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("tool")))
                     .unwrap_or(false);
-                let has_tools = b.get("tools").and_then(Value::as_array).map_or(false, |a| !a.is_empty());
+                let has_tools = b.get("tools").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
                 if has_tool_msg {
                     // recipe turn 2: the final answer streamed.
                     sse("data: {\"choices\":[{\"delta\":{\"content\":\"done counting\"}}]}\n\ndata: [DONE]\n\n")

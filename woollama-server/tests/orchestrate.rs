@@ -76,7 +76,7 @@ async fn woollama_recipe_orchestrates_through_mcp_registry() {
     let body: Value = r.json().await.unwrap();
     // The client sees only the final answer — the internal tool loop is hidden.
     assert_eq!(body["choices"][0]["message"]["content"], "done counting");
-    assert!(body["choices"][0]["message"]["tool_calls"].as_array().map_or(true, |a| a.is_empty())
+    assert!(body["choices"][0]["message"]["tool_calls"].as_array().is_none_or(|a| a.is_empty())
         || body["choices"][0]["message"]["tool_calls"].is_null());
 
     // Same recipe over /v1/responses → Responses shape with the final text.

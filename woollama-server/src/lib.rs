@@ -560,7 +560,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
         Err(e) => return engine_err_response(e),
     };
 
-    let bare = model.splitn(2, '/').nth(1).unwrap_or("").to_string();
+    let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
     let mut fwd = body.clone();
     fwd["model"] = json!(bare);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -632,7 +632,7 @@ async fn responses_create(State(state): State<Arc<AppState>>, Json(body): Json<V
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
     };
 
-    let nonnull = |k: &str| body.get(k).map_or(false, |v| !v.is_null());
+    let nonnull = |k: &str| body.get(k).is_some_and(|v| !v.is_null());
     let stateful = body.get("store").and_then(Value::as_bool).unwrap_or(false)
         || nonnull("conversation")
         || nonnull("previous_response_id")

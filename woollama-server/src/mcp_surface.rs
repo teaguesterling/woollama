@@ -2,7 +2,7 @@
 //! `mcp_server.py`. An MCP client connecting to woollama sees:
 //!   - the `chat` tool   — runs a recipe end-to-end, returns only the final answer.
 //!   - re-exported tools — every downstream server's tools, namespaced `<server>.<tool>`,
-//!                         with input + output schema mirrored, proxied to the registry.
+//!     with input + output schema mirrored, proxied to the registry.
 //!   - recipe prompts    — one per recipe; get returns its system message.
 //!
 //! Served two ways from the SAME handler: stdio (`woollamad mcp`) and a

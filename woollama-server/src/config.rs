@@ -56,6 +56,7 @@ fn read_user_or_default(filename: &str, default: &str) -> String {
 ///      packaged install (the dir is 116K, so it ships with the binary);
 ///   3. the source checkout's `examples/` (`<crate>/../examples`) — dev runs, `cargo run`,
 ///      and the integration suite spawning `target/<profile>/woollama-server`.
+///
 /// If none exist it stays unset, so the bundled example servers are cleanly SKIPPED rather
 /// than spawned from a bogus empty path (the bug the live oracle surfaced). Idempotent —
 /// resolves to a deterministic value, safe to call once per `build_state`.

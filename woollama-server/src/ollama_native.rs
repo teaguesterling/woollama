@@ -32,7 +32,7 @@ pub fn wants_native(body: &Value) -> bool {
         .get("options")
         .and_then(Value::as_object)
         .and_then(|o| o.get("num_ctx"))
-        .map_or(false, |v| !v.is_null());
+        .is_some_and(|v| !v.is_null());
     let no_tools = match body.get("tools") {
         None | Some(Value::Null) => true,
         Some(Value::Array(a)) => a.is_empty(),
