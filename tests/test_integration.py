@@ -1088,6 +1088,14 @@ async def test_anthropic_inferencer_completes_live(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_unix_socket_serves_http_end_to_end(tmp_path, monkeypatch):
+    # This exercises the Python `woollama.binding` IN-PROCESS — it does not drive the
+    # WOOLLAMA_TEST_CMD target. When that target is woollamad (the default, or any non-Python
+    # override), skip: woollamad's own unix-socket surface is covered by the Rust
+    # `woollama-server/tests/binding.rs`. Run here only when the oracle targets Python, so the
+    # pass count means "the selected implementation passed", not "Python's binding passed".
+    if "python" not in os.environ.get("WOOLLAMA_TEST_CMD", ""):
+        pytest.skip("Python binding.py test; oracle target is woollamad (see Rust tests/binding.rs)")
+
     import threading
 
     import uvicorn

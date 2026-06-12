@@ -190,8 +190,11 @@ woollama/                         (cargo workspace root = the woollama placehold
    the differential oracle). Done UDS-first: slice 9a ported the unix-socket + addr-file
    surface to `woollamad` so local MCP clients don't regress (`binding.rs`, two serve tasks
    on TCP + UDS). The live oracle default flipped to `woollamad` (Python is now the opt-in
-   `WOOLLAMA_TEST_CMD="python -m woollama"`); 17/0/8 both ways. Packaging: `cargo install
-   woollama-server` → `woollamad` (crates.io, publishable but not yet published). Wheel stays
+   `WOOLLAMA_TEST_CMD="python -m woollama"`): **16/0/9 against woollamad** (the in-process
+   `binding.py` unix test skips — woollamad's UDS is covered by the Rust `tests/binding.rs`,
+   so every pass is genuine woollamad evidence) and 17/0/8 against the Python reference.
+   Packaging: `cargo install woollama-server` → `woollamad` (crates.io, publishable but not
+   yet published). Wheel stays
    the auxiliary embed surface; re-pin lackpy to it (still pending the woollama-core publish).
 
 ## Verification strategy (the strongest asset)
