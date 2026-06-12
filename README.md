@@ -114,18 +114,43 @@ loopback TCP port written to `$XDG_RUNTIME_DIR/woollama.addr` for clients to
 discover. The `<port>` above is that ephemeral port. Same pattern as a local
 `fabric --serve` instance.
 
-## Install (development)
+## Install
+
+The router is **`woollamad`** — a small Rust daemon. The Python implementation is
+kept as a reference server and the differential-test oracle (see below), but
+`woollamad` is the canonical router.
+
+**From crates.io** (once published — `cargo install` ships only the binary, so
+bring your own `mcp.json`):
+
+```sh
+cargo install woollama-server     # installs the `woollamad` binary
+woollamad                         # starts the router; prints its address
+```
+
+**From this checkout** (works today; includes the bundled example MCP servers):
 
 ```sh
 git clone https://github.com/teaguesterling/woollama
 cd woollama
-uv sync                           # creates .venv and installs deps
-uv run woollama                   # starts the router; prints its address
+cargo build --release             # builds target/release/woollamad
+./target/release/woollamad        # starts the router; prints its address
 ```
 
-On startup woollama prints its `OpenAI base_url` (e.g.
+On startup `woollamad` prints its `OpenAI base_url` (e.g.
 `http://127.0.0.1:<port>/v1`) — copy that into your OpenAI client. (It's also
-written to `$XDG_RUNTIME_DIR/woollama.addr` for programmatic discovery.)
+written to `$XDG_RUNTIME_DIR/woollama.addr` for programmatic discovery, and it
+serves the same surface over the `woollama.sock` unix socket.)
+
+### The Python reference server
+
+The original Python implementation still runs and is used as the live oracle that
+keeps `woollamad` honest:
+
+```sh
+uv sync                           # creates .venv and installs deps
+uv run woollama                   # the Python reference server
+```
 
 > **Prerequisite for the examples below:** they use `ollama/qwen3:14b-iq4xs`, so
 > install [Ollama](https://ollama.ai), `ollama serve`, and
@@ -136,11 +161,21 @@ written to `$XDG_RUNTIME_DIR/woollama.addr` for programmatic discovery.)
 ### Tests & lint
 
 ```sh
+# Rust (woollamad): the daemon's own suites
+cargo test --tests --features test-fixtures
+cargo build --release            # so the live oracle can spawn the binary
+
+# Python: hermetic suite + lint
 uv run --extra dev pytest        # hermetic suite (live tests are opt-in: -m integration)
 uv run ruff check .              # lint — the CI gate
+
+# The live differential oracle — same tests, against woollamad by default:
+uv run --extra dev pytest -m integration            # targets target/release/woollamad
+WOOLLAMA_TEST_CMD="python -m woollama" \
+  uv run --extra dev pytest -m integration          # opt in to the Python reference
 ```
 
-CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every PR.
+CI (`.github/workflows/ci.yml`) runs the Rust + Python gates on every push to `main` and PR.
 For the same lint gate locally on commit, opt into the pre-commit hook:
 
 ```sh

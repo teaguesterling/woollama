@@ -185,8 +185,14 @@ woollama/                         (cargo workspace root = the woollama placehold
    `inferencer_to_json` unchanged so conformance is untouched); server `/v1/models` does
    static + live discovery (namespaced, fnmatch-filtered) + recipes. Gate: a mock-`/v1/models`
    e2e covering live discover, pattern filtering, static models, and recipes.
-9. **Cutover.** `woollama` entrypoint = the Rust binary; Python server retired to
-   reference. Wheel stays as the auxiliary embed surface; re-pin lackpy to it.
+9. **Cutover.** ✅ DONE. `woollamad` (the Rust daemon) is the canonical router; the Python
+   server is demoted to reference/oracle (still runnable via `python -m woollama`, kept as
+   the differential oracle). Done UDS-first: slice 9a ported the unix-socket + addr-file
+   surface to `woollamad` so local MCP clients don't regress (`binding.rs`, two serve tasks
+   on TCP + UDS). The live oracle default flipped to `woollamad` (Python is now the opt-in
+   `WOOLLAMA_TEST_CMD="python -m woollama"`); 17/0/8 both ways. Packaging: `cargo install
+   woollama-server` → `woollamad` (crates.io, publishable but not yet published). Wheel stays
+   the auxiliary embed surface; re-pin lackpy to it (still pending the woollama-core publish).
 
 ## Verification strategy (the strongest asset)
 

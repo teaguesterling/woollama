@@ -35,19 +35,27 @@ def _woollama_argv(*extra):
     """Full argv to launch woollama, with *extra appended (e.g. "mcp" for the
     stdio MCP subcommand).
 
-    Default is the Python module (`python -m woollama`). Set WOOLLAMA_TEST_CMD
-    (shlex-split) to launch a different implementation — e.g. the Rust daemon:
+    POST-CUTOVER DEFAULT: the `woollamad` Rust daemon (`target/release/woollamad`)
+    — the canonical router. The Python server is now the OPT-IN target, for
+    differential comparison:
 
-        WOOLLAMA_TEST_CMD="$PWD/target/release/woollamad"
+        WOOLLAMA_TEST_CMD="python -m woollama"   # test the Python reference server
 
-    That turns this suite into a DIFFERENTIAL ORACLE: the exact same live tests
-    run against both implementations, so a behavioral divergence shows up as a
-    test that passes on one and fails on the other. (The Rust binary also needs
-    WOOLLAMA_EXAMPLES_DIR exported so the bundled mcp.json can find the example
-    servers — the Python loader sets that itself; the Rust one does not yet.)"""
+    The suite is a DIFFERENTIAL ORACLE either way: the exact same live tests run
+    against whichever implementation is selected, so a behavioral divergence shows
+    up as a test that passes on one and fails on the other. (woollamad resolves
+    WOOLLAMA_EXAMPLES_DIR itself via config::ensure_examples_dir, so the bundled
+    mcp.json's example servers spawn with no env juggling.)"""
     override = os.environ.get("WOOLLAMA_TEST_CMD")
-    base = shlex.split(override) if override else [sys.executable, "-m", "woollama"]
-    return [*base, *extra]
+    if override:
+        return [*shlex.split(override), *extra]
+    binary = REPO_ROOT / "target" / "release" / "woollamad"
+    if not binary.exists():
+        pytest.skip(
+            f"woollamad not built ({binary}); run `cargo build --release` "
+            'or set WOOLLAMA_TEST_CMD (e.g. "python -m woollama")'
+        )
+    return [str(binary), *extra]
 
 
 def _ollama_reachable() -> bool:
