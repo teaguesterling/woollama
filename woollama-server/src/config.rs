@@ -1,16 +1,18 @@
 //! Recipe + MCP-server config loading — ported from Python `woollama.config`.
 //!
 //! A user file in `config_dir()` is used if present, else the bundled default
-//! (embedded from the Python package's `defaults/` so the two stay in sync). `${VAR}`
-//! in mcp.json is expanded from the environment at load time.
+//! (embedded from this crate's own `defaults/` so the crate is self-contained for a
+//! crates.io publish). Those vendored copies are kept byte-identical to the Python
+//! package's `src/woollama/defaults/` by `tests/defaults_sync.rs`. `${VAR}` in mcp.json
+//! is expanded from the environment at load time.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 use woollama_engine as engine;
 
-const DEFAULT_RECIPES: &str = include_str!("../../src/woollama/defaults/recipes.toml");
-const DEFAULT_MCP: &str = include_str!("../../src/woollama/defaults/mcp.json");
+const DEFAULT_RECIPES: &str = include_str!("../defaults/recipes.toml");
+const DEFAULT_MCP: &str = include_str!("../defaults/mcp.json");
 
 /// A composed recipe: a system prompt + an inferencer + an allow-list of namespaced
 /// `<server>.<tool>` names (+ optional per-recipe inference params).
