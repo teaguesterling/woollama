@@ -46,6 +46,31 @@ jobs:
       - name: Hermetic tests
         run: uv run --extra dev pytest
 
+  # The Rust gate for `woollamad` (the canonical router). The dev box has no rustup
+  # (distro rust, no clippy/rustfmt), so build+test are the locally-verified gates;
+  # clippy runs here where the component exists. `cargo fmt --check` is intentionally
+  # NOT run — the project hand-formats (same stance as not running `ruff format`).
+  rust:
+    name: Rust (woollamad)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Hermetic Rust suites need the test-fixture bins (mcp_fixture/fake_claude),
+      # gated behind the `test-fixtures` feature so `cargo install` doesn't ship them.
+      # Scope with -p: the workspace-root `woollama` placeholder has neither the feature
+      # nor the bin, so a bare `--features`/`--bin` from root errors.
+      - name: Test (with fixtures)
+        run: cargo test --tests -p woollama-server -p woollama-engine --features test-fixtures
+      - name: Clippy (lint gate)
+        run: cargo clippy -p woollama-server -p woollama-engine --all-targets --features test-fixtures -- -D warnings
+      - name: Release build (the woollamad binary)
+        run: cargo build --release -p woollama-server --bin woollamad
+
   # ┌─────────────────────────────────────────────────────────────────────────┐
   # │ Publishes to PyPI on a `vX.Y.Z` tag, AFTER the gate passes, via PyPI      │
   # │ Trusted Publishing (OIDC — no token in the repo). ONE-TIME SETUP before   │
@@ -73,3 +98,29 @@ jobs:
         run: uv build
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ Publishes the Rust crates to crates.io on a `vX.Y.Z` tag, after the Rust  │
+  # │ gate passes. Order is woollama-engine → woollama-server (the server's     │
+  # │ versioned path dep resolves only once the engine is on the index).        │
+  # │ ONE-TIME SETUP: add a `CRATES_IO_TOKEN` repo secret (a crates.io API      │
+  # │ token with publish-new + publish-update scope). Until it exists this job  │
+  # │ fails harmlessly — publish manually with `cargo publish -p woollama-engine`│
+  # │ then `cargo publish -p woollama-server`.                                   │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  publish-crates:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint-and-test, rust]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Engine first; `cargo publish` waits for the new version to be downloadable
+      # before returning, so the server publish that follows can resolve it.
+      - name: Publish woollama-engine
+        run: cargo publish -p woollama-engine
+      - name: Publish woollama-server
+        run: cargo publish -p woollama-server
