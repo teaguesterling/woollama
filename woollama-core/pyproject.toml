@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "woollama-core"
-version = "0.4.0"
+version = "0.5.0"
 description = "The embeddable woollama model-management core (Rust) — start of the v1.0 port."
 requires-python = ">=3.11"
 classifiers = [

@@ -118,9 +118,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Engine first; `cargo publish` waits for the new version to be downloadable
-      # before returning, so the server publish that follows can resolve it.
-      - name: Publish woollama-engine
-        run: cargo publish -p woollama-engine
-      - name: Publish woollama-server
-        run: cargo publish -p woollama-server
+      # Idempotent: skip a crate whose exact version is already on crates.io (these are also
+      # sometimes published manually out-of-band). The existence check is an unauthenticated
+      # crates.io API call, so a skip needs no token — the tag stays green either way. Engine
+      # first; `cargo publish` waits for the new version to be downloadable before returning,
+      # so the server publish that follows can resolve it.
+      - name: Publish crates (skip already-published)
+        run: |
+          publish_if_new() {
+            crate="$1"
+            ver=$(grep -m1 '^version' "$crate/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
+            if curl -sf -o /dev/null "https://crates.io/api/v1/crates/$crate/$ver"; then
+              echo "$crate $ver already on crates.io — skipping"
+            else
+              cargo publish -p "$crate"
+            fi
+          }
+          publish_if_new woollama-engine
+          publish_if_new woollama-server
