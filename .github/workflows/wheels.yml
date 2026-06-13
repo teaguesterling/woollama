@@ -19,6 +19,10 @@ jobs:
   # all interpreters at once via `-i`. aarch64 cross-compiles in the container (no QEMU).
   linux:
     runs-on: ubuntu-latest
+    # aarch64-glibc cross-builds are flaky in the manylinux containers; keep that leg
+    # best-effort so it never blocks publishing the other wheels (aarch64 users still get
+    # the musllinux wheel + the sdist). x86_64 stays required.
+    continue-on-error: ${{ matrix.target == 'aarch64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,7 +34,7 @@ jobs:
         with:
           working-directory: woollama-core
           target: ${{ matrix.target }}
-          manylinux: auto
+          manylinux: "2014"
           args: --release --out dist -i 3.11 3.12 3.13
       - uses: actions/upload-artifact@v4
         with:

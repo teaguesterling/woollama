@@ -128,7 +128,7 @@ jobs:
           publish_if_new() {
             crate="$1"
             ver=$(grep -m1 '^version' "$crate/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')
-            if curl -sf -o /dev/null "https://crates.io/api/v1/crates/$crate/$ver"; then
+            if curl -sf -A "woollama-release (github.com/teaguesterling/woollama)" -o /dev/null "https://crates.io/api/v1/crates/$crate/$ver"; then
               echo "$crate $ver already on crates.io — skipping"
             else
               cargo publish -p "$crate"
