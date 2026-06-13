@@ -1,6 +1,6 @@
 [package]
 name = "woollama-core"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "The embeddable woollama model-management core (Rust) — start of the v1.0 port."
 license = "MIT"

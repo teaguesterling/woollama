@@ -62,10 +62,13 @@ jobs:
           name: wheels-musllinux-${{ matrix.target }}
           path: woollama-core/dist
 
-  # macOS — no build container, so matrix over (arch, python). x86_64 on macos-13, arm64 on
-  # macos-14. setup-python provides each interpreter; maturin builds against it.
+  # macOS — always the arm64 runner (macos-14). macos-13 (Intel) runners are scarce and queue
+  # for ~an hour, which would block the publish (a queued job never "fails", so it can't be
+  # tolerated). Build aarch64 natively; cross-compile x86_64 from arm64 (best-effort — if the
+  # cross-build fails, Intel users get the sdist rather than blocking the release).
   macos:
-    runs-on: ${{ matrix.target == 'x86_64' && 'macos-13' || 'macos-14' }}
+    runs-on: macos-14
+    continue-on-error: ${{ matrix.target == 'x86_64' }}
     strategy:
       fail-fast: false
       matrix:
@@ -157,3 +160,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true

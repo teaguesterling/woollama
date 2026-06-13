@@ -98,6 +98,8 @@ jobs:
         run: uv build
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   # ┌─────────────────────────────────────────────────────────────────────────┐
   # │ Publishes the Rust crates to crates.io on a `vX.Y.Z` tag, after the Rust  │
