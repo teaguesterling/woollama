@@ -1,6 +1,6 @@
 [package]
 name = "woollama-engine"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "The pure-Rust woollama engine (no PyO3): inferencer registry, complete/stream, the recipe<->tool orchestrate loop. Consumed by the woollama-core wheel and the woollamad daemon (woollama-server crate)."
 license = "MIT"
@@ -15,7 +15,10 @@ name = "woollama_engine"
 async-stream = "0.3"
 async-trait = "0.1"
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+# rustls (not native-tls/OpenSSL): pure-Rust TLS so woollama-core's wheels cross-compile
+# cleanly (incl. aarch64) without a system OpenSSL. `native-roots` keeps the system trust
+# store, matching the previous native-tls behavior.
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots", "http2", "charset"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 toml = "0.8"
