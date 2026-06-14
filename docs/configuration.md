@@ -40,6 +40,16 @@ Shape matches Claude Code's `mcpServers` block:
 woollama starts one long-lived connection per server and aggregates their tools
 (namespaced `<server>.<tool>`).
 
+> **Interpreter & `PATH`.** `command` is resolved against woollama's *own*
+> environment when the server is spawned. A bare name (`python`, `uvx`, `node` —
+> including in the `conversationStore` examples below) picks whatever is first on
+> `PATH` at spawn time, which need not be the interpreter that has the server's
+> dependencies when woollama runs **outside its virtualenv** (launched by an
+> absolute path, or as a `systemd` unit with a minimal `PATH`). Because a
+> downstream server that fails to start **aborts woollama startup**, pin `command`
+> to an absolute interpreter (e.g. your venv's `python`) if startup is sensitive
+> to which environment launched it.
+
 ### Selecting a conversation store
 
 An **external** conversation store makes non-claude models stateful (issue #2) —
