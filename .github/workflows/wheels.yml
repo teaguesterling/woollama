@@ -19,9 +19,10 @@ jobs:
   # all interpreters at once via `-i`. aarch64 cross-compiles in the container (no QEMU).
   linux:
     runs-on: ubuntu-latest
-    # aarch64-glibc cross-builds are flaky in the manylinux containers; keep that leg
-    # best-effort so it never blocks publishing the other wheels (aarch64 users still get
-    # the musllinux wheel + the sdist). x86_64 stays required.
+    # aarch64 needs manylinux_2_28: the manylinux2014 cross image ships gcc 4.8.5, which
+    # doesn't define __ARM_ARCH, so ring's ARM asm fails to compile ("ARM assembler must
+    # define __ARM_ARCH"). The 2_28 cross image (gcc 7.5) defines it. x86_64 stays on 2014
+    # for the broadest glibc compatibility. Kept best-effort as a safety net.
     continue-on-error: ${{ matrix.target == 'aarch64' }}
     strategy:
       fail-fast: false
@@ -34,7 +35,7 @@ jobs:
         with:
           working-directory: woollama-core
           target: ${{ matrix.target }}
-          manylinux: "2014"
+          manylinux: ${{ matrix.target == 'aarch64' && '2_28' || '2014' }}
           args: --release --out dist -i 3.11 3.12 3.13
       - uses: actions/upload-artifact@v4
         with:
