@@ -5,6 +5,13 @@ slice, each with the decisions, the load-bearing findings, and what was
 verified. For *current status and what's next*, see
 [`roadmap.md`](roadmap.md); this file is the detailed history behind it.
 
+> **Historical note.** These slices are the **Python** prototype (slices e–k).
+> woollama has since cut over to the Rust daemon **`woollamad`** (published to
+> crates.io + PyPI, v0.5.x). So the Python commands recorded below map to today's
+> binary: `woollama mcp` → **`woollamad mcp`**, `python -m woollama` →
+> **`woollamad`**. The entries are kept verbatim as the build record; for how to
+> run woollama now see [`getting-started.md`](getting-started.md).
+
 (Started life as the slice (e) handoff note; it now spans slices e → k. The
 original slice (e) plan is preserved verbatim below, followed by each follow-on.)
 
