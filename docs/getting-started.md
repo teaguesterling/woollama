@@ -1,14 +1,36 @@
 # Getting started
 
-## Install (development)
+## Install
 
-woollama uses [`uv`](https://docs.astral.sh/uv/) for environment management.
+The router is **`woollamad`** — a small Rust daemon. Install it from crates.io:
+
+```sh
+cargo install woollama-server     # installs the `woollamad` binary
+woollamad                         # starts the router; prints its address
+```
+
+`cargo install` ships only the binary, so bring your own `mcp.json` (or point
+`WOOLLAMA_EXAMPLES_DIR` at this repo's `examples/` for the bundled demo servers).
+
+### From a checkout (with the bundled example servers)
 
 ```sh
 git clone https://github.com/teaguesterling/woollama
 cd woollama
+cargo build --release             # builds target/release/woollamad
+./target/release/woollamad        # starts the router; prints its address
+```
+
+### The Python reference server
+
+The original Python implementation still runs and is the differential-test
+**oracle** that keeps `woollamad` honest. It's on PyPI (`pip install woollama`,
+which also pulls the native `woollama-core` engine), or run it from the checkout
+with [`uv`](https://docs.astral.sh/uv/):
+
+```sh
 uv sync                           # creates .venv and installs deps
-uv run woollama                   # starts the router; prints its address
+uv run woollama                   # the Python reference server
 ```
 
 !!! note "Prerequisite for the examples"
@@ -21,7 +43,7 @@ uv run woollama                   # starts the router; prints its address
 
 ## The address
 
-On startup woollama prints its `OpenAI base_url` — copy that into your client:
+On startup the router prints its `OpenAI base_url` — copy that into your client:
 
 ```
 OpenAI base_url:      http://127.0.0.1:<port>/v1
@@ -106,12 +128,29 @@ Configurable env vars: **[Environment variables](environment.md)**.
 ## Tests & lint
 
 ```sh
+# Rust (woollamad) — the daemon's own suites:
+cargo test --tests -p woollama-server -p woollama-engine --features test-fixtures
+
+# Python (reference server) + lint:
 uv run --extra dev pytest        # hermetic suite (live tests are opt-in: -m integration)
 uv run ruff check .              # lint — the CI gate
 ```
 
-CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every PR.
-For the same lint gate locally on commit, opt into the pre-commit hook:
+The live **differential oracle** runs the *same* integration suite against
+whichever implementation you select — `woollamad` by default (build it first so
+the suite can spawn it), or the Python reference via `WOOLLAMA_TEST_CMD`:
+
+```sh
+cargo build --release
+uv run --extra dev pytest -m integration                      # targets woollamad
+WOOLLAMA_TEST_CMD="python -m woollama" \
+  uv run --extra dev pytest -m integration                    # targets the Python server
+```
+
+CI runs the Rust + Python gates on every push to `main` and every PR
+(`.github/workflows/ci.yml`); `.github/workflows/wheels.yml` builds the
+cross-platform `woollama-core` wheels. For the same lint gate locally on commit,
+opt into the pre-commit hook:
 
 ```sh
 uv tool install pre-commit && pre-commit install

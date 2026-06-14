@@ -39,15 +39,15 @@ protocol.
 
 ## Status
 
-**Python prototype — multi-backend router, both surfaces live.** woollama works
-end-to-end as:
+**The Rust daemon `woollamad` — a multi-backend router, both surfaces live,
+published to crates.io + PyPI.** woollama works end-to-end as:
 
 - an **OpenAI-compatible server**: `/v1/chat/completions` (pass-through *and*
   hidden chat-loop orchestration of recipes, both with `stream:true` → OpenAI
   SSE), `/v1/models`, `/v1/tools`, and a **stateful surface** —
   `/v1/responses` + `/v1/conversations` (OpenAI Responses/Conversations shape;
   see below);
-- an **MCP server** to its own clients — over **stdio** (`woollama mcp`) and
+- an **MCP server** to its own clients — over **stdio** (`woollamad mcp`) and
   over **Streamable HTTP** at `/mcp`, mounted on the *same port* as `/v1/*`. It
   re-exports every discovered downstream tool (namespaced, with `output_schema`)
   plus a `chat` verb that emits live tool-progress notifications — i.e. it's an
@@ -73,14 +73,15 @@ connections. Served on **both a Unix socket** (`$XDG_RUNTIME_DIR/woollama.sock`,
 mode 0600 — the default for local MCP clients) and an ephemeral loopback TCP
 port; never `0.0.0.0` without explicit opt-in.
 
-Not production-ready. **Current status and what's next live in
+**Current status and what's next live in
 [`docs/roadmap.md`](docs/roadmap.md).**
 
-> **Implementation note: woollama will be a Rust program at v1.0.**
-> The Python in `src/woollama/` is a prototype used to iterate the
-> architecture quickly. The Rust port lands when the design surface is
-> stable. See [`docs/rust-transition.md`](docs/rust-transition.md) for the
-> explicit transition criteria.
+> **The Rust port is done (v0.5.x).** `woollamad` is the canonical router,
+> published to crates.io (`cargo install woollama-server`) and PyPI
+> (`pip install woollama`). The Python in `src/woollama/` is kept as the
+> reference server and differential-test oracle — not deleted. See
+> [`docs/rust-transition.md`](docs/rust-transition.md) for the (completed)
+> transition criteria.
 
 See `docs/architecture.md` for the full target design and
 `docs/build-log.md` for the slice-by-slice history.
@@ -223,7 +224,7 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 - **Tool delegation**: a `claude-code` recipe with tools runs as an *executor* —
   Claude owns the agentic loop and calls the recipe's allow-listed MCP tools
   itself (per-recipe `--mcp-config` + `--allowedTools` containment)
-- MCP server side: stdio (`woollama mcp`) **and** Streamable HTTP at `/mcp` on
+- MCP server side: stdio (`woollamad mcp`) **and** Streamable HTTP at `/mcp` on
   the same port — recipes as prompts, a `chat` verb (with live tool-progress
   notifications), and every downstream tool re-exported with its `output_schema`
   (aggregator)
@@ -238,11 +239,11 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 - The live, interactive Claude-in-tmux session backend (a separate Rust session
   driver) — gated on spikes that need a real terminal. (The interactive
   `requires_action` path itself already works via the managed-agents backend.)
-- A `store-backed` conversations provider for non-claude models — the woollama
-  side is built behind an un-wired seam; it's pending the fabric session
-  read/append contract (cross-repo)
-- cosmic-fabric actually consuming the conversations surface (the last v1.0 gate)
-- The Rust v1.0 port
+- cosmic-fabric actually consuming the conversations surface (the last open
+  integration milestone). The generic `store-backed` mechanism + two reference
+  store providers (MCP + REST) already ship; what's pending is the cross-repo
+  fabric provider + wiring.
+- lackpy re-pinning to the now-published `woollama-core` wheel.
 
 Full scorecard, ordering, and pending verifications:
 **[`docs/roadmap.md`](docs/roadmap.md)**.

@@ -53,19 +53,21 @@ See [Architecture](architecture.md) for the full design.
 
 ## Status
 
-!!! warning "Python prototype — not production-ready"
-    woollama works end-to-end as both an **OpenAI-compatible server** and an
-    **MCP server**, across multiple inference backends and both surfaces. It is
-    a prototype; **v1.0 will be a Rust rewrite** once the design stabilizes (see
-    [Rust transition](rust-transition.md)). Authoritative live status lives in
-    the [Roadmap](roadmap.md).
+!!! success "Shipped — the Rust daemon `woollamad`"
+    woollama is now a small **Rust daemon, `woollamad`**, published to crates.io
+    (`cargo install woollama-server`) and PyPI (`pip install woollama`). It works
+    end-to-end as both an **OpenAI-compatible server** and an **MCP server**
+    across multiple inference backends. The original Python implementation is kept
+    as a **reference server and differential-test oracle** (`python -m woollama`),
+    not deleted — the Rust port is complete (the [Rust transition](rust-transition.md)
+    is done). Authoritative live status lives in the [Roadmap](roadmap.md).
 
 What works today:
 
 - **OpenAI surface** — `/v1/chat/completions` (pass-through *and* hidden
   recipe orchestration, both streaming → OpenAI SSE), `/v1/models`, `/v1/tools`,
   plus a **stateful surface**: `/v1/responses` + `/v1/conversations`.
-- **MCP surface** — stdio (`woollama mcp`) and Streamable HTTP at `/mcp` on the
+- **MCP surface** — stdio (`woollamad mcp`) and Streamable HTTP at `/mcp` on the
   same port; an aggregator that re-exports every downstream tool (namespaced,
   with `output_schema`) plus a `chat` verb with live tool-progress events.
 - **Multi-backend routing** — ollama, anthropic, openai, groq, together,

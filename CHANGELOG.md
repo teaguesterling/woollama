@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## v0.5.0 — 2026-06-14
+
+**The Rust cutover.** woollama is now the Rust daemon **`woollamad`** (the
+`woollama-server` crate), and it's **published**: `cargo install woollama-server`
+installs the daemon, and `pip install woollama` pulls the pure-Python package plus
+the native `woollama-core` engine wheel. The Python implementation in
+`src/woollama/` is kept as the reference server and differential-test oracle, not
+deleted. Authoritative live status is `docs/roadmap.md`.
+
+*(Shipped across 0.5.0–0.5.3: 0.5.0 = crates.io publish of `woollama-engine` +
+`woollama-server`; 0.5.1–0.5.3 = PyPI wheel publish of `woollama` +
+`woollama-core` and fixes to the cross-platform wheel CI, notably the
+manylinux-aarch64 build.)*
+
+- **`woollamad`, the Rust router.** The full router surface ported to Rust on
+  `woollama-engine` (pure engine) + `axum` + `rmcp`: OpenAI-compatible HTTP
+  (`/v1/models`, `/v1/chat/completions` passthrough + recipe orchestration +
+  streaming, `/v1/responses`, `/v1/conversations`), the MCP aggregator at `/mcp`
+  and over stdio (`woollamad mcp`), the claude-code executor, stateful
+  conversations (claude-resume / store-backed / managed-agents), and `/v1/models`
+  discovery. Binds a unix socket (`$XDG_RUNTIME_DIR/woollama.sock`) + the loopback
+  TCP port, same as the Python server.
+- **Verified by a differential oracle.** The Python live integration suite runs
+  against either implementation (`WOOLLAMA_TEST_CMD`), with `woollamad` the
+  default target. Real behavioral divergences were caught and fixed (MCP
+  capability advertisement, the `chat` tool's structured output, tool-level vs
+  JSON-RPC error semantics).
+- **Published.** crates.io: `woollama-engine` + `woollama-server` 0.5.0. PyPI:
+  `woollama` + `woollama-core` 0.5.3, with cross-platform wheels (manylinux
+  x86_64 + aarch64, musllinux, macOS x86_64 + arm64, Windows; cp311/312/313) +
+  sdist, built by `.github/workflows/wheels.yml` (maturin-action).
+- **TLS:** the engine's HTTP client moved from native-tls (OpenSSL) to **rustls**
+  (system trust store via native-roots), so the native wheels build without a
+  system OpenSSL and cross-compile to aarch64.
+
 ## v0.4.0 — 2026-06-10
 
 Still the Python prototype (v1.0 is the Rust rewrite). The big shift: woollama is

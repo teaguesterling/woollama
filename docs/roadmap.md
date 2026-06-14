@@ -1,13 +1,23 @@
 # woollama roadmap & status
 
 Single source of truth for *what's built, what's next, and in what order.*
-Updated 2026-06-07. Detailed history: [`build-log.md`](build-log.md). Target
-design: [`architecture.md`](architecture.md). v1.0 gate:
-[`rust-transition.md`](rust-transition.md).
+Updated 2026-06-14. Detailed history: [`build-log.md`](build-log.md). Target
+design: [`architecture.md`](architecture.md).
 
 woollama is a **router** between OpenAI-/MCP-speaking clients and OpenAI-/MCP-
 speaking backends. It owns routing and composition (recipes); it does not own
-inference or tools. Still the **Python prototype** — Rust is v1.0 (see gate).
+inference or tools.
+
+!!! success "The Rust cutover is DONE (v0.5.x)"
+    The router is now the Rust daemon **`woollamad`** (the `woollama-server`
+    crate), published to **crates.io** (`cargo install woollama-server`) and
+    **PyPI** (`pip install woollama` + the native `woollama-core` engine wheel,
+    v0.5.3). The Python implementation in `src/woollama/` is kept as the reference
+    server and **differential-test oracle**, not deleted. The "Shipped" table
+    below names the Python module where each capability was first built; the Rust
+    daemon implements the same surface, verified by repointing the live
+    integration suite at `woollamad` (the oracle). See
+    [`rust-router-port.md`](rust-router-port.md) for the slice-by-slice port.
 
 ## Shipped
 
@@ -158,16 +168,19 @@ and `woollama mcp` (stdio) — served on BOTH a Unix socket
      sessions (verified). Remaining (cross-repo, not guessed): the fabric
      read/append contract — woollama's `create/get/append/delete` proposal was fed
      back to cosmic-fabric (#2) — then a thin fabric provider + the wiring.
-4. **Rust port (v1.0)** — last, once the design freezes. See the gate.
+4. ~~**Rust port (v1.0)**~~ — ✅ DONE. `woollamad` is the canonical router, on
+   crates.io + PyPI (v0.5.x); the Python server is the differential-test oracle.
+   Slice-by-slice record: [`rust-router-port.md`](rust-router-port.md).
 
-Planned (designed, not yet built):
-- **`woollama.core` library extraction** — split a server-free `woollama.core`
-  subpackage (config + provider/model routing + the recipe loop) out from the
-  FastAPI/MCP router, so other Python projects (first: **lackpy**) embed woollama
-  for model management instead of running it as a sidecar. Includes the lossless
-  MCP↔OpenAI tool seam (`ToolProvider`/`ToolSpec`/`ToolResult` + per-model
-  renderer) and per-call key/base_url overrides. Full design + phased plan:
-  **[Core library extraction](core-extraction.md)**.
+Shipped since (was "planned"):
+- ~~**`woollama.core` library extraction**~~ — ✅ DONE (v0.4.0). A server-free
+  `woollama.core` subpackage (config + provider/model routing + the recipe loop)
+  other Python projects embed for model management instead of running a sidecar —
+  now backed by the Rust engine via the `woollama-core` wheel on PyPI. Ships the
+  lossless MCP↔OpenAI tool seam (`ToolProvider`/`ToolSpec`/`ToolResult` + per-model
+  renderer) and per-call key/base_url overrides. Design:
+  **[Core library extraction](core-extraction.md)**. (Remaining: lackpy's re-pin
+  to the published wheel.)
 
 Smaller follow-ons (not blocking):
 - ~~**Honor `num_ctx` for ollama**~~ (#1) — ✅ DONE 2026-06-07. `ollama/<model>`
@@ -255,10 +268,12 @@ Smaller follow-ons (not blocking):
   `managed-agents` interactive `requires_action` live gate is written but
   best-effort/unrun (paid + nondeterministic).
 
-## v1.0 (Rust) gate — progress
+## v1.0 (Rust) cutover — DONE
 
-From [`rust-transition.md`](rust-transition.md), criterion #2 ("Python surface
-covers the v1.0 feature set"):
+The Rust cutover happened (v0.5.x): **`woollamad` is published and is the
+canonical router**; the Python server is the differential-test oracle. The
+[`rust-transition.md`](rust-transition.md) criterion #2 ("Python surface covers
+the v1.0 feature set") was met before the port:
 
 - [x] real config files (`recipes.toml` + `mcp.json`)
 - [x] multi-MCP-server discovery + unified tool registry
@@ -268,9 +283,9 @@ covers the v1.0 feature set"):
 - [x] streaming on both sides (OpenAI SSE out — passthrough + orchestration; MCP
       progress events on the `chat` tool)
 - [x] Unix socket alongside HTTP loopback
-- [ ] the panel-confirm round-trip equivalent (the conversations surface +
-      cosmic-fabric consuming it)
+- [ ] the panel-confirm round-trip equivalent — the conversations surface IS
+      shipped; the open half is **cosmic-fabric consuming it**.
 
-Criteria #1 (architecture stable), #3 (a real consumer — cosmic-fabric actively
-using it), #4 (a specific Python limit biting) are not yet all met → keep
-iterating Python.
+The one remaining follow-on is criterion #3 (a real consumer — cosmic-fabric
+actively driving woollama through its OpenAI/MCP surfaces). It doesn't block the
+cutover, which already happened; it's the next integration milestone.

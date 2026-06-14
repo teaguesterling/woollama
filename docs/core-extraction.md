@@ -1,6 +1,8 @@
 # Core library extraction — `woollama.core`
 
-> **Status: design of record, not yet implemented.** This describes the target
+> **Status: SHIPPED (v0.4.0+).** `woollama.core` is the embeddable subpackage today — now
+> backed by the Rust engine via the `woollama-core` wheel on PyPI (`pip install woollama-core`).
+> This records the
 > split: a server-free `woollama.core` subpackage that other Python projects
 > (first consumer: **lackpy**) embed for model management, routing, and recipe
 > orchestration — with the FastAPI/MCP **router** layered on top of it. Signatures

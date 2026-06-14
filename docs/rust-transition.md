@@ -1,14 +1,24 @@
-# Rust transition criteria
+# Rust transition criteria — COMPLETED
 
-woollama is **a Rust program at v1.0.** The Python implementation in
-`src/woollama/` is a prototype used to iterate the architecture quickly while
-the design surface is in flux. This doc captures *when* we stop iterating
-Python and start the Rust rewrite — to prevent the prototype from becoming
-the de facto production system by inertia.
+> **Status: DONE (v0.5.x).** The transition described here happened. The router is
+> now the Rust daemon **`woollamad`** (the `woollama-server` crate), published to
+> crates.io (`cargo install woollama-server`) and PyPI (`pip install woollama` +
+> the native `woollama-core` wheel). The Python implementation in `src/woollama/`
+> is kept as the reference server and **differential-test oracle** — the live
+> integration suite runs against either, which is how the Rust port was verified.
+> This doc is retained as the record of the criteria we set for *when* to move
+> (all the gating ones were met; the one open follow-on is cosmic-fabric
+> consuming the surface) and what the port preserved vs. replaced.
 
-## When we transition
+woollama is now **a Rust program (`woollamad`).** The Python implementation in
+`src/woollama/` was the prototype used to iterate the architecture quickly while
+the design surface was in flux; it is now the oracle. This doc captured *when* we
+stop iterating Python and start the Rust rewrite — to prevent the prototype from
+becoming the de facto production system by inertia.
 
-The Rust port begins when **all four** of these are true:
+## When we transition (the criteria — all gating ones now met)
+
+The Rust port was gated on **all four** of these being true:
 
 1. **The architecture is stable.** No more major design questions like "MCP
    extension vs. cos-fab tool" or "where does substitution live" — the
@@ -56,12 +66,17 @@ Python a while longer."
   don't change.
 - **The `examples/` and `docs/`** stay as-is.
 
-## What the Rust port replaces
+## What the Rust port changed (as built)
 
-- `src/woollama/*.py` → `src/*.rs`
-- `pyproject.toml` → `Cargo.toml` (already a placeholder)
-- `uv sync` → `cargo build --release`
-- `python -m woollama` → `woollama` binary
+- The router moved to a Cargo **workspace**: `woollama-engine` (the pure engine,
+  no PyO3) + `woollama-core` (the PyO3 wheel that provides `woollama.core`) +
+  `woollama-server` (which builds the **`woollamad`** daemon).
+- The canonical run command is the **`woollamad`** binary
+  (`cargo install woollama-server`, or `cargo build --release`), not
+  `python -m woollama`.
+- `src/woollama/*.py` is **kept**, not deleted — it's the reference server and
+  differential-test oracle; `python -m woollama` (and `pip install woollama`)
+  still run it.
 
 ## What the Rust port lets us do that Python doesn't
 

@@ -1,6 +1,8 @@
 # Porting the woollama **router service** to Rust
 
-Status: **plan** (not started). Supersedes the "should we go all-Rust?" discussion.
+Status: **DONE — shipped.** `woollamad` (the `woollama-server` crate) is on crates.io and is
+the canonical router as of v0.5.0; the Python server is the reference/oracle. This stays as the
+slice-by-slice record of the completed port. Supersedes the "should we go all-Rust?" discussion.
 
 ## Framing (the decision that sets scope)
 
