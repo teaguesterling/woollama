@@ -4,16 +4,22 @@
 //! requires_action + required_action; answering resumes → completed; /items served from
 //! the event log; delete.
 //!
-//! NOTE: the mock implements the *simplified* protocol this client targets — the REAL
-//! Anthropic wire format is validated only by the opt-in live @needs_anthropic test (paid).
-//! This test gates the woollama routing, not the Anthropic wire shapes.
+//! The mock now implements the REAL event+SSE protocol shape (reconciled against the docs
+//! 2026-06-15): turns are `POST …/events` then an SSE `GET …/events` (accept:
+//! text/event-stream) of `agent.message` / `agent.custom_tool_use` / `session.status_idle`
+//! events; resume is a `user.custom_tool_result` event. This still gates the woollama ROUTING
+//! and the SSE parsing against the documented shapes — NOT the live Anthropic API (that's the
+//! opt-in @needs_anthropic test; this mock encodes our reading of the docs).
 //!
 //! Separate test binary so the global env can't race other files.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use axum::body::Body;
 use axum::extract::Path;
-use axum::routing::{delete, get, post};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -24,32 +30,80 @@ async fn spawn(router: Router) -> String {
     format!("http://{addr}")
 }
 
+fn sse(events: &[Value]) -> Response {
+    let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 #[tokio::test]
 async fn managed_agents_routing_pause_resume_items() {
+    // The mock's "what does the next streamed turn produce" state, set by the POST /events
+    // and consumed by the SSE GET /events — mirrors the real send-event-then-stream split.
+    let next: Arc<Mutex<String>> = Arc::new(Mutex::new("hello".to_string()));
+    let next_post = next.clone();
+    let next_get = next.clone();
+
     let anthropic = Router::new()
         .route("/v1/environments", post(|| async { Json(json!({"id": "env1"})) }))
         .route("/v1/agents", post(|| async { Json(json!({"id": "agent1"})) }))
         .route("/v1/sessions", post(|| async { Json(json!({"id": "sess1"})) }))
         .route(
-            "/v1/sessions/{id}/turns",
-            post(|Path(_id): Path<String>, Json(b): Json<Value>| async move {
-                if b.get("tool_use_id").is_some() {
-                    let ans = b.get("answer").and_then(Value::as_str).unwrap_or("");
-                    Json(json!({"text": format!("answered: {ans}"), "pending": Value::Null}))
-                } else if b.get("input").and_then(Value::as_str).unwrap_or("").contains("ask") {
-                    Json(json!({"text": "", "pending": {"id": "tu1", "input": {"question": "What is your name?"}}}))
-                } else {
-                    Json(json!({"text": "hello", "pending": Value::Null}))
-                }
-            }),
-        )
-        .route(
             "/v1/sessions/{id}/events",
-            get(|Path(_id): Path<String>| async {
-                Json(json!({"data": [
-                    {"type": "user.message", "content": [{"type": "text", "text": "hi"}]},
-                    {"type": "agent.message", "content": [{"type": "text", "text": "hello"}]}
-                ]}))
+            post(move |Path(_id): Path<String>, Json(b): Json<Value>| {
+                let next = next_post.clone();
+                async move {
+                    let ev = &b["events"][0];
+                    let kind = match ev.get("type").and_then(Value::as_str) {
+                        Some("user.custom_tool_result") => {
+                            let ans = ev["content"][0]["text"].as_str().unwrap_or("");
+                            format!("answered: {ans}")
+                        }
+                        Some("user.message")
+                            if ev["content"][0]["text"].as_str().unwrap_or("").contains("ask") =>
+                        {
+                            "ask".to_string()
+                        }
+                        _ => "hello".to_string(),
+                    };
+                    *next.lock().unwrap() = kind;
+                    Json(json!({"ok": true}))
+                }
+            })
+            .get(move |Path(_id): Path<String>, headers: HeaderMap| {
+                let next = next_get.clone();
+                async move {
+                    let streaming = headers
+                        .get("accept")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|a| a.contains("text/event-stream"))
+                        .unwrap_or(false);
+                    if !streaming {
+                        // history (list events)
+                        return Json(json!({"data": [
+                            {"type": "user.message", "content": [{"type": "text", "text": "hi"}]},
+                            {"type": "agent.message", "content": [{"type": "text", "text": "hello"}]}
+                        ]}))
+                        .into_response();
+                    }
+                    let kind = next.lock().unwrap().clone();
+                    if kind == "ask" {
+                        sse(&[
+                            json!({"type": "agent.custom_tool_use", "id": "evt_tool_1",
+                                   "name": "ask_user", "input": {"question": "What is your name?"}}),
+                            json!({"type": "session.status_idle",
+                                   "stop_reason": {"type": "requires_action", "event_ids": ["evt_tool_1"]}}),
+                        ])
+                    } else {
+                        let text = if kind == "hello" { "hello".to_string() } else { kind };
+                        sse(&[
+                            json!({"type": "agent.message", "content": [{"type": "text", "text": text}]}),
+                            json!({"type": "session.status_idle", "stop_reason": {"type": "end_turn"}}),
+                        ])
+                    }
+                }
             }),
         )
         .route("/v1/sessions/{id}", delete(|Path(_id): Path<String>| async { Json(json!({"deleted": true})) }));
@@ -78,7 +132,7 @@ async fn managed_agents_routing_pause_resume_items() {
     let cid = conv["id"].as_str().unwrap().to_string();
     assert_eq!(conv["backend"], "managed-agents");
 
-    // A normal turn → completed, text from the (mock) hosted session.
+    // A normal turn → completed, text streamed from the (mock) hosted session.
     let r1: Value = c
         .post(format!("{base}/v1/responses"))
         .json(&json!({"model": "claude-agent/haiku", "conversation": cid, "input": "hi"}))
@@ -104,7 +158,7 @@ async fn managed_agents_routing_pause_resume_items() {
     assert_eq!(r2["status"], "requires_action");
     assert_eq!(r2["required_action"]["type"], "ask_user");
 
-    // Answering resumes → completed.
+    // Answering resumes → completed (via a user.custom_tool_result event).
     let r3: Value = c
         .post(format!("{base}/v1/responses"))
         .json(&json!({"model": "claude-agent/haiku", "conversation": cid, "input": "Alice"}))
