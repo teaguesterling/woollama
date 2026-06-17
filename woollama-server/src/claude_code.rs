@@ -301,6 +301,22 @@ mod tests {
     }
 
     #[test]
+    fn resume_path_keeps_the_lockdown() {
+        // run_resumable is a live tool-less session backend; the lockdown flags are added
+        // BEFORE the resume branch, so --resume must not drop them. Pins that against a
+        // refactor that might move them into the resume.is_none() arm.
+        let a = build_args("hi", "", "haiku", Some("sess-123"));
+        let s = a.join(" ");
+        assert!(a.windows(2).any(|w| w == ["--tools", ""]), "allow-list of none survives --resume");
+        assert!(s.contains("--disallowedTools Bash,Read"));
+        assert!(s.contains("--permission-mode dontAsk"));
+        assert!(s.contains("--strict-mcp-config"));
+        assert!(s.contains("--setting-sources project"));
+        assert!(a.windows(2).any(|w| w == ["--resume", "sess-123"]));
+        assert!(!s.contains("--system-prompt"), "--resume carries the session's system prompt, don't re-send");
+    }
+
+    #[test]
     fn delegate_args_allowlist_is_exactly_the_recipe_tools() {
         // The adversarial boundary: tools=[hello.count_to] grants ONLY that, never a
         // sibling/other-server tool — woollama can't widen Claude's grant.
