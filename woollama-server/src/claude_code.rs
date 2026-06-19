@@ -24,7 +24,7 @@ const DENY_TOOLS: &str = "Bash,Read,Write,Edit,NotebookEdit,WebFetch,WebSearch,G
 /// Operational vars only — no provider keys / secrets / parent-harness vars reach the
 /// `claude` child or the MCP servers it spawns. (ANTHROPIC_API_KEY and CLAUDE_CODE*/
 /// CLAUDECODE are deliberately absent.)
-const CHILD_ENV_ALLOW: &[&str] = &[
+pub(crate) const CHILD_ENV_ALLOW: &[&str] = &[
     "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "TMPDIR", "LANG", "LANGUAGE",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
 ];

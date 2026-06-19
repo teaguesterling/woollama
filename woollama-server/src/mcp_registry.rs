@@ -29,19 +29,49 @@ pub struct McpRegistry {
     servers: HashMap<String, ServerConn>,
 }
 
+/// Allow-listed env for a spawned MCP server. Shares `claude_code::CHILD_ENV_ALLOW` (single
+/// source of truth) so the downstream-server scrub can't drift from the claude-code one —
+/// provider secrets in the daemon env (ANTHROPIC_API_KEY etc.) never reach a tool server.
+fn scrubbed_env() -> HashMap<String, String> {
+    std::env::vars()
+        .filter(|(k, _)| crate::claude_code::CHILD_ENV_ALLOW.contains(&k.as_str()) || k.starts_with("LC_"))
+        .collect()
+}
+
+/// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
+/// default 30s. Bounds startup so a hung downstream server can't wedge the daemon.
+fn connect_timeout() -> std::time::Duration {
+    let secs = std::env::var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
 impl McpRegistry {
-    /// Connect to every configured server (best-effort: one that fails to start is
-    /// logged and skipped, so a single bad server doesn't take the whole router down).
+    /// Connect to every configured server CONCURRENTLY, each bounded by a per-server timeout
+    /// (best-effort: a server that fails to start OR hangs on the handshake is logged and
+    /// skipped, so a single bad/slow server can neither take the router down nor block its
+    /// startup). The timeout is `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS` (default 30s).
     pub async fn connect(specs: HashMap<String, McpServerSpec>) -> McpRegistry {
+        let timeout = connect_timeout();
+        let results = futures::future::join_all(
+            specs
+                .into_iter()
+                .map(|(name, spec)| async move { (name, tokio::time::timeout(timeout, Self::connect_one(&spec)).await) }),
+        )
+        .await;
         let mut servers = HashMap::new();
-        for (name, spec) in specs {
-            match Self::connect_one(&spec).await {
-                Ok(conn) => {
-                    servers.insert(name.clone(), conn);
+        for (name, res) in results {
+            match res {
+                Ok(Ok(conn)) => {
+                    servers.insert(name, conn);
                 }
-                Err(e) => {
-                    eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}");
-                }
+                Ok(Err(e)) => eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}"),
+                Err(_) => eprintln!(
+                    "woollamad: MCP server '{name}' timed out after {}s connecting, skipping",
+                    timeout.as_secs()
+                ),
             }
         }
         McpRegistry { servers }
@@ -49,7 +79,10 @@ impl McpRegistry {
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
         let mut cmd = tokio::process::Command::new(&spec.command);
-        cmd.args(&spec.args);
+        // Scrub the child env: a downstream tool server must NOT inherit the daemon's
+        // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
+        // and the Python MCP SDK's default-scrubbed stdio environment.
+        cmd.args(&spec.args).env_clear().envs(scrubbed_env());
         let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
         let running = ().serve(transport).await.map_err(|e| e.to_string())?;
         let peer = running.peer().clone();
@@ -180,4 +213,49 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
         body = if body.is_empty() { "[tool error]".to_string() } else { format!("[tool error] {body}") };
     }
     (body, !is_error)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn scrubbed_env_excludes_provider_secrets() {
+        std::env::set_var("ANTHROPIC_API_KEY", "leak-me");
+        std::env::set_var("OPENAI_API_KEY", "leak-me-2");
+        let env = scrubbed_env();
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"), "provider key must not reach MCP servers");
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+        if std::env::var_os("PATH").is_some() {
+            assert!(env.contains_key("PATH"), "PATH must survive so the server interpreter resolves");
+        }
+        for k in env.keys() {
+            assert!(
+                crate::claude_code::CHILD_ENV_ALLOW.contains(&k.as_str()) || k.starts_with("LC_"),
+                "leaked non-allow-listed var to an MCP server: {k}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hung_server_does_not_block_startup() {
+        std::env::set_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS", "1");
+        let mut specs = HashMap::new();
+        // `sleep` spawns but never speaks MCP -> the initialize handshake hangs -> timed out.
+        specs.insert("hung".to_string(), McpServerSpec { command: "sleep".into(), args: vec!["30".into()] });
+        // `false` exits immediately -> connect_one errors -> skipped.
+        specs.insert("dead".to_string(), McpServerSpec { command: "false".into(), args: vec![] });
+        let start = std::time::Instant::now();
+        let reg = McpRegistry::connect(specs).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "a hung downstream server must not block startup (took {elapsed:?})"
+        );
+        assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
+        std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
+    }
 }
