@@ -877,6 +877,10 @@ async fn claude_resume_turn(state: &AppState, conv_id: &str, model: &str, messag
         let dir = std::env::temp_dir().join(format!("woollama-conv-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).map_err(|e| EngineError::new(e.to_string(), "server_error", 500))?;
         workdir = Some(dir.to_string_lossy().to_string());
+        // Record the workdir BEFORE the turn so a first-turn failure still leaves it referenced
+        // for teardown to reclaim (else an errored first turn leaks an orphaned
+        // /tmp/woollama-conv-* dir with no table reference). A retry reuses the same dir.
+        state.conversations.table.lock().await.set_native(conv_id, native_id.clone(), workdir.clone());
     }
     let cc_model = model.strip_prefix("claude-code/").unwrap_or("");
     let (resp, sid) = claude_code::run_resumable(messages, cc_model, native_id.as_deref(), workdir.as_deref().unwrap())
