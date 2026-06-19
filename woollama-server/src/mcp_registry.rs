@@ -68,6 +68,27 @@ fn wire_name(server: &str, tool: &str) -> String {
     }
 }
 
+/// Per-call timeout for a downstream tool invocation. `WOOLLAMA_MCP_CALL_TIMEOUT_SECS`,
+/// default 120s. A hung downstream tool fails the one request instead of hanging it (and
+/// leaking the request task) forever.
+fn call_timeout() -> std::time::Duration {
+    let secs = std::env::var("WOOLLAMA_MCP_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Invoke a downstream tool with the per-call timeout applied.
+async fn call_with_timeout(peer: &Peer<RoleClient>, params: CallToolRequestParams) -> Result<CallToolResult, String> {
+    let dur = call_timeout();
+    match tokio::time::timeout(dur, peer.call_tool(params)).await {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("downstream tool call timed out after {}s", dur.as_secs())),
+    }
+}
+
 impl McpRegistry {
     /// Connect to every configured server CONCURRENTLY, each bounded by a per-server timeout
     /// (best-effort: a server that fails to start OR hangs on the handshake is logged and
@@ -162,7 +183,7 @@ impl McpRegistry {
         if let Some(obj) = args.as_object() {
             params = params.with_arguments(obj.clone());
         }
-        conn.peer.call_tool(params).await.map_err(|e| e.to_string())
+        call_with_timeout(&conn.peer, params).await
     }
 
     /// Dispatch a namespaced tool and return the RAW `CallToolResult` (content +
@@ -176,7 +197,7 @@ impl McpRegistry {
         if let Some(obj) = args.as_object() {
             params = params.with_arguments(obj.clone());
         }
-        peer.call_tool(params).await.map_err(|e| e.to_string())
+        call_with_timeout(&peer, params).await
     }
 }
 
@@ -217,7 +238,7 @@ impl ToolProvider for RegistryToolProvider {
         if let Some(obj) = args.as_object() {
             params = params.with_arguments(obj.clone());
         }
-        match peer.call_tool(params).await {
+        match call_with_timeout(&peer, params).await {
             Ok(res) => render_result(&res),
             Err(e) => (format!("ERROR: {e}"), false),
         }
@@ -297,5 +318,14 @@ mod tests {
         // An overlong combination falls back to a hashed, still-valid name.
         let long = wire_name(&"s".repeat(50), &"t".repeat(50));
         assert!(ok(&long) && long.starts_with("mcp__"), "overlong name must hash to a valid form");
+    }
+
+    #[test]
+    fn call_timeout_honors_env_and_default() {
+        std::env::remove_var("WOOLLAMA_MCP_CALL_TIMEOUT_SECS");
+        assert_eq!(call_timeout().as_secs(), 120, "default per-call timeout");
+        std::env::set_var("WOOLLAMA_MCP_CALL_TIMEOUT_SECS", "7");
+        assert_eq!(call_timeout().as_secs(), 7, "env override");
+        std::env::remove_var("WOOLLAMA_MCP_CALL_TIMEOUT_SECS");
     }
 }
