@@ -6,22 +6,28 @@
 //! claude-resume/claude-code subscription path). One tool-less agent per model is
 //! created lazily + cached (an agent is a reusable account object — never per session).
 //!
-//! WIRE FORMAT (reconciled 2026-06-15 against the official docs — Managed Agents is
-//! **event-driven + SSE-streamed**, NOT a synchronous turn endpoint):
+//! WIRE FORMAT (reconciled against the official `anthropic` SDK 0.109 + LIVE-VERIFIED against
+//! the real API 2026-06-18 — Managed Agents is **event-driven + SSE-streamed**, NOT a
+//! synchronous turn endpoint):
 //!
-//! - create session: `POST /v1/sessions {agent, environment_id}` → `{id}`.
+//! - create env+agent (lazy, cached): `POST /v1/environments {name, config:{type:"cloud", networking:{type:"unrestricted"}}}` then `POST /v1/agents {name, model, tools}`.
+//! - create session: `POST /v1/sessions {agent, environment_id}` → `{id}` (`agent` accepts the bare id string).
 //! - send a turn: `POST /v1/sessions/{id}/events?beta=true` with `{events:[{type:"user.message", content:[{type:"text",text}]}]}`.
-//! - read the answer: `GET /v1/sessions/{id}/events?beta=true` with `accept: text/event-stream` → SSE; assistant text arrives as `agent.message` events; the turn ends at `session.status_idle` (`stop_reason.type` = `end_turn`, or `requires_action` when the agent paused on a custom tool, with `stop_reason.event_ids` listing the blocking `agent.custom_tool_use` event ids).
+//! - read the answer: `GET /v1/sessions/{id}/events/stream?beta=true` (the DEDICATED stream route, distinct from the list route) with `accept: text/event-stream` → SSE.
+//! - the stream live-tails the CURRENT turn from its start (it replays the just-posted `user.message`, so send→stream is race-free) and does NOT replay prior turns (verified: turn-2 carried only fresh event ids).
+//! - assistant text arrives as `agent.message` events (`content:[{type:"text",text}]`); the turn ends at `session.status_idle` whose `stop_reason.type` is `end_turn`, or `requires_action` (with `stop_reason.event_ids` naming the blocking `agent.custom_tool_use` ids) when the agent paused on a custom tool.
+//! - other events (status_running, thinking, spans, thread_status_*) are ignored.
 //! - resume (ask_user): `POST …/events?beta=true` with `{events:[{type:"user.custom_tool_result", custom_tool_use_id, content:[{type:"text",text}]}]}`.
-//! - history: `GET /v1/sessions/{id}/events?beta=true` (list).
+//! - history: `GET /v1/sessions/{id}/events?beta=true` (the LIST route) → `{data:[...all events...]}`.
+//! - teardown: `DELETE /v1/sessions/{id}?beta=true` (agents archive via `POST …/archive`, not delete).
 //!
 //! Docs: platform.claude.com/docs/en/managed-agents/{overview,sessions,events-and-streaming}.
 //!
-//! ⚠️ CONFIDENCE: this matches the docs but is **NOT live-verified** — there's no paid key in
-//! the repo. The opt-in `@needs_anthropic` integration test is the real gate; known unknowns
-//! it must confirm: the GET-events stream's replay semantics (do we over-collect prior turns'
-//! text?), the exact `agent.custom_tool_use` id field, the custom-tool agent-config shape, and
-//! the list-events (history) response envelope. The woollama-side ROUTING is the tested value.
+//! ✅ CONFIDENCE: LIVE-VERIFIED 2026-06-18 against api.anthropic.com (haiku, 2-turn recall +
+//! history + teardown). The reconciliation found one real bug — the stream route is
+//! `…/events/stream`, NOT `…/events` — now fixed. The remaining live-untested path is the
+//! `requires_action`/`ask_user` pause-resume branch (the probe didn't trigger a custom-tool
+//! call); its shapes match the SDK types but the round-trip isn't yet exercised end-to-end.
 
 use std::collections::HashMap;
 
@@ -171,7 +177,7 @@ impl ManagedAgents {
     /// collecting `agent.message` text and detecting a custom-tool pause.
     async fn stream_turn(&self, session_id: &str) -> Result<Turn, ManagedAgentsError> {
         let resp = self
-            .request(reqwest::Method::GET, &format!("/v1/sessions/{session_id}/events?beta=true"))?
+            .request(reqwest::Method::GET, &format!("/v1/sessions/{session_id}/events/stream?beta=true"))?
             .header("accept", "text/event-stream")
             .send()
             .await
@@ -269,7 +275,7 @@ impl ManagedAgents {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<(), ManagedAgentsError> {
-        self.request(reqwest::Method::DELETE, &format!("/v1/sessions/{session_id}"))?
+        self.request(reqwest::Method::DELETE, &format!("/v1/sessions/{session_id}?beta=true"))?
             .send()
             .await
             .map_err(|e| ManagedAgentsError(format!("managed-agents API error: {e}")))?;

@@ -4,12 +4,16 @@
 //! requires_action + required_action; answering resumes → completed; /items served from
 //! the event log; delete.
 //!
-//! The mock now implements the REAL event+SSE protocol shape (reconciled against the docs
-//! 2026-06-15): turns are `POST …/events` then an SSE `GET …/events` (accept:
-//! text/event-stream) of `agent.message` / `agent.custom_tool_use` / `session.status_idle`
-//! events; resume is a `user.custom_tool_result` event. This still gates the woollama ROUTING
-//! and the SSE parsing against the documented shapes — NOT the live Anthropic API (that's the
-//! opt-in @needs_anthropic test; this mock encodes our reading of the docs).
+//! The mock implements the REAL event+SSE protocol shape, reconciled against the official
+//! `anthropic` SDK 0.109 and LIVE-VERIFIED against api.anthropic.com (2026-06-18):
+//! - send a turn: `POST /v1/sessions/{id}/events` ({events:[user.message]})
+//! - read the answer: `GET /v1/sessions/{id}/events/stream` (SSE; the DEDICATED stream route)
+//! - history (items): `GET /v1/sessions/{id}/events` ({data:[...all events...]})
+//! - resume: `POST /v1/sessions/{id}/events` ({events:[user.custom_tool_result]})
+//!
+//! The stream route is distinct from the list route — getting that wrong was the one bug the
+//! live reconciliation caught. This gates the woollama ROUTING and the SSE parsing against the
+//! verified shapes; the live API itself is the opt-in @needs_anthropic test.
 //!
 //! Separate test binary so the global env can't race other files.
 
@@ -17,9 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::Path;
-use axum::http::HeaderMap;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, post};
+use axum::response::Response;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -41,7 +44,7 @@ fn sse(events: &[Value]) -> Response {
 #[tokio::test]
 async fn managed_agents_routing_pause_resume_items() {
     // The mock's "what does the next streamed turn produce" state, set by the POST /events
-    // and consumed by the SSE GET /events — mirrors the real send-event-then-stream split.
+    // and consumed by the SSE GET /events/stream — mirrors the real send-event-then-stream split.
     let next: Arc<Mutex<String>> = Arc::new(Mutex::new("hello".to_string()));
     let next_post = next.clone();
     let next_get = next.clone();
@@ -52,6 +55,8 @@ async fn managed_agents_routing_pause_resume_items() {
         .route("/v1/sessions", post(|| async { Json(json!({"id": "sess1"})) }))
         .route(
             "/v1/sessions/{id}/events",
+            // POST = send an event (decides what the NEXT stream produces);
+            // GET  = history list ({data:[...]}) — NOT the SSE stream (that's /events/stream).
             post(move |Path(_id): Path<String>, Json(b): Json<Value>| {
                 let next = next_post.clone();
                 async move {
@@ -72,22 +77,19 @@ async fn managed_agents_routing_pause_resume_items() {
                     Json(json!({"ok": true}))
                 }
             })
-            .get(move |Path(_id): Path<String>, headers: HeaderMap| {
+            .get(|Path(_id): Path<String>| async {
+                // history (list events) — the envelope the live API returns.
+                Json(json!({"data": [
+                    {"type": "user.message", "content": [{"type": "text", "text": "hi"}]},
+                    {"type": "agent.message", "content": [{"type": "text", "text": "hello"}]}
+                ]}))
+            }),
+        )
+        .route(
+            "/v1/sessions/{id}/events/stream",
+            get(move |Path(_id): Path<String>| {
                 let next = next_get.clone();
                 async move {
-                    let streaming = headers
-                        .get("accept")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|a| a.contains("text/event-stream"))
-                        .unwrap_or(false);
-                    if !streaming {
-                        // history (list events)
-                        return Json(json!({"data": [
-                            {"type": "user.message", "content": [{"type": "text", "text": "hi"}]},
-                            {"type": "agent.message", "content": [{"type": "text", "text": "hello"}]}
-                        ]}))
-                        .into_response();
-                    }
                     let kind = next.lock().unwrap().clone();
                     if kind == "ask" {
                         sse(&[
