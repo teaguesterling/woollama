@@ -606,10 +606,14 @@ pub fn build_setup(
 
     // tool_schemas(allow) → the model-facing schemas (the lossless seam).
     let schemas = tools.tool_schemas(&tool_names)?;
-    // The allow-list is the BOUNDARY; the schema's function name IS the namespaced
-    // allow-list name, so membership matches directly.
-    let allowed: std::collections::HashSet<String> = tool_names.iter().cloned().collect();
-    let mut sorted_allowed: Vec<String> = tool_names.clone();
+    // The allow-list is the BOUNDARY and must match the name the model echoes back: derive it
+    // from the advertised function names (a provider may rename — e.g. the MCP provider's
+    // `mcp__server__tool`), not from the raw recipe entries.
+    let allowed: std::collections::HashSet<String> = schemas
+        .iter()
+        .filter_map(|s| s.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut sorted_allowed: Vec<String> = allowed.iter().cloned().collect();
     sorted_allowed.sort();
 
     // messages = [system] + user_msgs

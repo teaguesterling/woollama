@@ -46,7 +46,7 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
                 Json(json!({"choices": [{"message": {
                     "role": "assistant", "content": Value::Null,
                     "tool_calls": [{"id": "c1", "type": "function",
-                        "function": {"name": "fix.count_to", "arguments": "{\"n\":3}"}}]
+                        "function": {"name": "mcp__fix__count_to", "arguments": "{\"n\":3}"}}]
                 }}]}))
             }
         }),
@@ -85,12 +85,12 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
     let tools = client.list_tools(None).await.unwrap();
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(names.contains(&"chat"), "chat tool present; got {names:?}");
-    let ct = tools.tools.iter().find(|t| t.name == "fix.count_to").expect("re-exported tool");
+    let ct = tools.tools.iter().find(|t| t.name == "mcp__fix__count_to").expect("re-exported tool");
     assert!(ct.output_schema.is_some(), "downstream output_schema must be mirrored");
 
     // Proxy passthrough: structured_content forwarded verbatim.
     let res = client
-        .call_tool(CallToolRequestParams::new("fix.count_to").with_arguments(
+        .call_tool(CallToolRequestParams::new("mcp__fix__count_to").with_arguments(
             serde_json::from_value(json!({"n": 3})).unwrap(),
         ))
         .await
@@ -152,11 +152,11 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
     let client2 = mcp_client(&base).await;
     let (r1, r2) = tokio::join!(
         client.call_tool(
-            CallToolRequestParams::new("fix.count_to")
+            CallToolRequestParams::new("mcp__fix__count_to")
                 .with_arguments(serde_json::from_value(json!({"n": 1})).unwrap())
         ),
         client2.call_tool(
-            CallToolRequestParams::new("fix.count_to")
+            CallToolRequestParams::new("mcp__fix__count_to")
                 .with_arguments(serde_json::from_value(json!({"n": 2})).unwrap())
         ),
     );

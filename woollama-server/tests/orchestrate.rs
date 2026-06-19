@@ -37,7 +37,7 @@ async fn woollama_recipe_orchestrates_through_mcp_registry() {
                     "role": "assistant", "content": Value::Null,
                     "tool_calls": [{
                         "id": "c1", "type": "function",
-                        "function": {"name": "fix.count_to", "arguments": "{\"n\":3}"}
+                        "function": {"name": "mcp__fix__count_to", "arguments": "{\"n\":3}"}
                     }]
                 }}]}))
             }

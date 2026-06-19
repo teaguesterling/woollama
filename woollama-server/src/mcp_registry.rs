@@ -27,6 +27,10 @@ struct ServerConn {
 /// All configured downstream MCP servers, connected and tool-listed.
 pub struct McpRegistry {
     servers: HashMap<String, ServerConn>,
+    /// Reverse map: advertised wire name (`mcp__server__tool`) -> (server, bare tool). Built
+    /// once at connect so dispatch resolves the model's tool_call name unambiguously (no
+    /// dot-splitting, and it works for the hashed >64-char fallback too).
+    wire_index: HashMap<String, (String, String)>,
 }
 
 /// Allow-listed env for a spawned MCP server. Shares `claude_code::CHILD_ENV_ALLOW` (single
@@ -46,6 +50,22 @@ fn connect_timeout() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30);
     std::time::Duration::from_secs(secs)
+}
+
+/// Map (server, tool) to a wire-safe tool name: `mcp__<server>__<tool>` — the same scheme
+/// claude-code uses, and valid OpenAI/MCP function-name grammar (`[A-Za-z0-9_-]{1,64}`).
+/// A dotted `server.tool` is rejected by strict OpenAI-compatible inferencers; a name that
+/// would exceed 64 chars falls back to a deterministic hash (resolved via the reverse map).
+fn wire_name(server: &str, tool: &str) -> String {
+    let full = format!("mcp__{server}__{tool}");
+    if full.len() <= 64 {
+        full
+    } else {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        full.hash(&mut h);
+        format!("mcp__{:016x}", h.finish())
+    }
 }
 
 impl McpRegistry {
@@ -74,7 +94,13 @@ impl McpRegistry {
                 ),
             }
         }
-        McpRegistry { servers }
+        let mut wire_index = HashMap::new();
+        for (server, conn) in &servers {
+            for t in &conn.tools {
+                wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
+            }
+        }
+        McpRegistry { servers, wire_index }
     }
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
@@ -95,12 +121,12 @@ impl McpRegistry {
         Ok(ServerConn { peer, tools })
     }
 
-    /// Resolve a namespaced `<server>.<tool>` to (server peer, bare tool name).
-    fn resolve(&self, namespaced: &str) -> Option<(Peer<RoleClient>, String)> {
-        let (server, bare) = namespaced.split_once('.')?;
+    /// Resolve an advertised wire name (`mcp__server__tool`) to (server peer, bare tool) via
+    /// the reverse map built at connect — unambiguous, unlike splitting on a separator.
+    fn resolve(&self, wire: &str) -> Option<(Peer<RoleClient>, String)> {
+        let (server, bare) = self.wire_index.get(wire)?;
         let conn = self.servers.get(server)?;
-        conn.tools.iter().find(|t| t.name == bare)?;
-        Some((conn.peer.clone(), bare.to_string()))
+        Some((conn.peer.clone(), bare.clone()))
     }
 
     fn tool(&self, namespaced: &str) -> Option<&Tool> {
@@ -115,7 +141,7 @@ impl McpRegistry {
         for (server, conn) in &self.servers {
             for t in &conn.tools {
                 let mut nt = Tool::new(
-                    format!("{server}.{}", t.name),
+                    wire_name(server, &t.name),
                     t.description.clone().unwrap_or_default(),
                     t.input_schema.clone(),
                 );
@@ -168,11 +194,13 @@ impl ToolProvider for RegistryToolProvider {
                 eprintln!("woollamad: recipe references unknown tool '{namespaced}', skipping");
                 continue;
             };
-            // The namespaced name flows out, so the model emits tool_calls we can route.
+            // Recipe config is human-friendly `server.tool`; advertise the wire-safe
+            // `mcp__server__tool` so the model emits a name we resolve via the reverse map.
+            let Some((server, bare)) = namespaced.split_once('.') else { continue };
             out.push(json!({
                 "type": "function",
                 "function": {
-                    "name": namespaced,
+                    "name": wire_name(server, bare),
                     "description": tool.description.as_deref().unwrap_or(""),
                     "parameters": Value::Object((*tool.input_schema).clone()),
                 },
@@ -257,5 +285,17 @@ mod tests {
         );
         assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
         std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn wire_name_is_valid_and_namespaced() {
+        let w = wire_name("hello", "count_to");
+        assert_eq!(w, "mcp__hello__count_to");
+        let ok = |s: &str| s.len() <= 64 && !s.is_empty()
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        assert!(ok(&w), "must satisfy the OpenAI/MCP function-name grammar (no dots, <=64)");
+        // An overlong combination falls back to a hashed, still-valid name.
+        let long = wire_name(&"s".repeat(50), &"t".repeat(50));
+        assert!(ok(&long) && long.starts_with("mcp__"), "overlong name must hash to a valid form");
     }
 }
