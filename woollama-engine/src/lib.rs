@@ -280,39 +280,48 @@ fn parse_response(data: &Value, native: bool) -> Result<String, String> {
 
 /// Run one stateless turn and return the assistant text (async).
 pub async fn run_complete(req: Request) -> Result<String, EngineError> {
-    let out: Result<String, String> = async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(req.timeout))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut rb = client.post(&req.url).json(&req.body);
-        for (k, v) in &req.headers {
-            rb = rb.header(k, v);
-        }
-        let resp = rb.send().await.map_err(|e| e.to_string())?;
-        let data: Value = resp.json().await.map_err(|e| e.to_string())?;
-        parse_response(&data, req.native)
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(req.timeout))
+        .build()
+        .map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    let mut rb = client.post(&req.url).json(&req.body);
+    for (k, v) in &req.headers {
+        rb = rb.header(k, v);
     }
-    .await;
-    out.map_err(|e| EngineError::new(e, "server_error", 502))
+    let resp = rb.send().await.map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    // Preserve the real upstream status + body — don't collapse 401/429/503 to a generic 502.
+    if resp.status().as_u16() >= 400 {
+        let status = resp.status().as_u16() as i64;
+        let body = resp.text().await.unwrap_or_default();
+        return Err(EngineError::with_payload(
+            "inferencer error", "server_error", status, serde_json::from_str::<Value>(&body).ok(),
+        ));
+    }
+    let data: Value = resp.json().await.map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    parse_response(&data, req.native).map_err(|e| EngineError::new(e, "server_error", 502))
 }
 
 /// Synchronous variant — for non-async embedders. Blocks the calling thread.
 pub fn run_complete_blocking(req: Request) -> Result<String, EngineError> {
-    let out: Result<String, String> = (|| {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(req.timeout))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut rb = client.post(&req.url).json(&req.body);
-        for (k, v) in &req.headers {
-            rb = rb.header(k, v);
-        }
-        let resp = rb.send().map_err(|e| e.to_string())?;
-        let data = resp.json::<Value>().map_err(|e| e.to_string())?;
-        parse_response(&data, req.native)
-    })();
-    out.map_err(|e| EngineError::new(e, "server_error", 502))
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(req.timeout))
+        .build()
+        .map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    let mut rb = client.post(&req.url).json(&req.body);
+    for (k, v) in &req.headers {
+        rb = rb.header(k, v);
+    }
+    let resp = rb.send().map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    // Preserve the real upstream status + body — don't collapse 401/429/503 to a generic 502.
+    if resp.status().as_u16() >= 400 {
+        let status = resp.status().as_u16() as i64;
+        let body = resp.text().unwrap_or_default();
+        return Err(EngineError::with_payload(
+            "inferencer error", "server_error", status, serde_json::from_str::<Value>(&body).ok(),
+        ));
+    }
+    let data = resp.json::<Value>().map_err(|e| EngineError::new(e.to_string(), "server_error", 502))?;
+    parse_response(&data, req.native).map_err(|e| EngineError::new(e, "server_error", 502))
 }
 
 // --- config-driven inferencers (inferencers.toml) + Registry ------------------
@@ -716,17 +725,20 @@ pub fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = Resu
                 Ok(r) => r,
                 Err(e) => { yield Err(EngineError::new(e.to_string(), "server_error", 502)); return; }
             };
+            // Preserve the real upstream status + body for any 4xx/5xx (don't collapse to 502);
+            // hoisted so it covers BOTH the streaming and non-streaming branches below.
+            if resp.status().as_u16() >= 400 {
+                let status = resp.status().as_u16() as i64;
+                let err_body = resp.text().await.unwrap_or_default();
+                yield Err(EngineError::with_payload("inferencer error", "server_error", status,
+                                                    serde_json::from_str::<Value>(&err_body).ok()));
+                return;
+            }
 
             let content: String;
             let calls: Vec<Value>;
             let response: Value;
             if stream_mode {
-                if resp.status().as_u16() >= 400 {
-                    let err_body = resp.text().await.unwrap_or_default();
-                    yield Err(EngineError::with_payload("inferencer error", "server_error", 502,
-                                                        serde_json::from_str::<Value>(&err_body).ok()));
-                    return;
-                }
                 let mut resp = resp;
                 let mut buf: Vec<u8> = Vec::new();
                 let mut parts: Vec<String> = Vec::new();
@@ -882,5 +894,52 @@ pub fn complete_stream_events(req: Request) -> impl Stream<Item = Result<String,
                 },
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A one-shot HTTP server that replies to a single request with `status_line` + `body`.
+    fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf); // small request fits in one read; content ignored
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    fn req(url: String) -> Request {
+        Request { url, body: json!({"model": "m", "messages": []}), headers: HashMap::new(), timeout: 5, native: false }
+    }
+
+    #[test]
+    fn blocking_preserves_real_upstream_status_and_body() {
+        let url = serve_once("429 Too Many Requests", r#"{"error":{"message":"rate limited"}}"#);
+        let err = run_complete_blocking(req(url)).unwrap_err();
+        assert_eq!(err.status, Some(429), "real upstream status must survive, not collapse to 502");
+        assert_eq!(err.payload.expect("upstream body carried")["error"]["message"], "rate limited");
+    }
+
+    #[test]
+    fn async_preserves_real_upstream_status_and_body() {
+        let url = serve_once("503 Service Unavailable", r#"{"error":"upstream down"}"#);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(run_complete(req(url))).unwrap_err();
+        assert_eq!(err.status, Some(503));
+        assert_eq!(err.payload.expect("upstream body carried")["error"], "upstream down");
     }
 }
