@@ -781,6 +781,15 @@ async fn responses_stateful(state: &AppState, body: &Value, model: &str, message
     let lock = state.conversations.conv_lock(&conv.id).await;
     let _guard = lock.lock().await;
 
+    // Re-read the row now that we hold the per-conv lock: the snapshot above was taken under
+    // the table lock, which we then released, so a concurrent same-conversation turn could
+    // have advanced status/pending/native_id. Acting on the stale snapshot would re-resolve an
+    // already-answered managed-agents custom_tool_use_id (double-resume).
+    let conv = {
+        let t = state.conversations.table.lock().await;
+        t.get(&conv.id).unwrap_or(conv)
+    };
+
     let options = body.get("options").cloned();
     let turn: Result<(String, Option<Value>), EngineError> = match conv.backend.as_str() {
         "claude-resume" => claude_resume_turn(state, &conv.id, &conv.model, messages).await.map(|t| (t, None)),
