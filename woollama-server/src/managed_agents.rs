@@ -29,7 +29,8 @@
 //! `requires_action`/`ask_user` pause-resume branch (the probe didn't trigger a custom-tool
 //! call); its shapes match the SDK types but the round-trip isn't yet exercised end-to-end.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -74,9 +75,14 @@ pub fn resolve_model(model: &str) -> String {
 }
 
 /// The managed-agents backend: holds the lazily-created, reused environment + per-model
-/// agents (created once, never per session — the documented anti-pattern).
+/// agents (created once, never per session — the documented anti-pattern). When
+/// `persist_path` is `Some` (opt-in via `WOOLLAMA_MANAGED_AGENTS_PERSIST`), the env + agent
+/// ids are written there and REUSED across daemon restarts — verified-on-first-use, so a
+/// since-archived id self-heals by recreating instead of bricking the path. When `None`
+/// (default), the ids live only for this process (each restart creates its own).
 pub struct ManagedAgents {
     base_url: String,
+    persist_path: Option<PathBuf>,
     state: Mutex<Setup>,
 }
 
@@ -84,15 +90,27 @@ pub struct ManagedAgents {
 struct Setup {
     env_id: Option<String>,
     agents: HashMap<String, String>, // full model id → agent_id
+    loaded: bool,                     // have we seeded from persist_path yet
+    env_verified: bool,               // confirmed the persisted env_id still exists this process
+    agents_verified: HashSet<String>, // model keys whose persisted agent_id we've confirmed
 }
 
 impl ManagedAgents {
-    pub fn new() -> Self {
+    pub fn new(persist_path: Option<PathBuf>) -> Self {
         let base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-        ManagedAgents { base_url: base_url.trim_end_matches('/').to_string(), state: Mutex::new(Setup::default()) }
+        Self::with_base_url(base_url, persist_path)
+    }
+
+    #[doc(hidden)]
+    pub fn with_base_url(base_url: String, persist_path: Option<PathBuf>) -> Self {
+        ManagedAgents {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            persist_path,
+            state: Mutex::new(Setup::default()),
+        }
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder, ManagedAgentsError> {
@@ -127,16 +145,78 @@ impl ManagedAgents {
         r.json().await.map_err(|e| ManagedAgentsError(format!("managed-agents bad json: {e}")))
     }
 
-    /// Lazily create + cache the shared environment and a per-model agent.
+    /// `GET` an object by id to confirm it still exists server-side (200 vs 404). Used to
+    /// validate a PERSISTED id on first use so a since-archived env/agent self-heals.
+    async fn exists(&self, prefix: &str, id: &str) -> bool {
+        match self.request(reqwest::Method::GET, &format!("{prefix}{id}?beta=true")) {
+            Ok(rb) => rb.send().await.map(|r| r.status().is_success()).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Write the current env + agent ids to `persist_path` (best-effort; a write failure only
+    /// costs cross-restart reuse, never correctness).
+    fn persist(&self, s: &Setup) {
+        if let Some(p) = &self.persist_path {
+            let body = json!({"env_id": s.env_id, "agents": s.agents});
+            if let Err(e) = std::fs::write(p, body.to_string()) {
+                eprintln!("woollamad: managed-agents persist write failed ({}): {e}", p.display());
+            }
+        }
+    }
+
+    /// Lazily create + cache the shared environment and a per-model agent. With persistence
+    /// enabled, seed from disk once, verify a reused id on first use, and recreate + rewrite
+    /// only when absent or gone.
     async fn ensure_agent(&self, model: &str) -> Result<(String, String), ManagedAgentsError> {
         let full = resolve_model(model);
         let mut s = self.state.lock().await;
+
+        // Seed the cache from the persisted file once (opt-in; absent file = empty seed).
+        if !s.loaded {
+            if let Some(p) = &self.persist_path {
+                if let Ok(bytes) = std::fs::read(p) {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        s.env_id = v.get("env_id").and_then(Value::as_str).map(String::from);
+                        if let Some(map) = v.get("agents").and_then(Value::as_object) {
+                            s.agents = map
+                                .iter()
+                                .filter_map(|(k, val)| val.as_str().map(|x| (k.clone(), x.to_string())))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            s.loaded = true;
+        }
+
+        let mut changed = false;
+
+        // Environment: verify a persisted id on first use; drop it if the server no longer has it.
+        if let Some(env) = s.env_id.clone() {
+            if self.persist_path.is_some() && !s.env_verified && !self.exists("/v1/environments/", &env).await {
+                s.env_id = None;
+            }
+            s.env_verified = true;
+        }
         if s.env_id.is_none() {
             let env = self.post("/v1/environments", json!({
                 "name": "woollama-agents",
                 "config": {"type": "cloud", "networking": {"type": "unrestricted"}}
             })).await?;
             s.env_id = Some(env["id"].as_str().unwrap_or_default().to_string());
+            changed = true;
+        }
+
+        // Per-model agent: same verify-then-create.
+        if let Some(agent) = s.agents.get(&full).cloned() {
+            if self.persist_path.is_some()
+                && !s.agents_verified.contains(&full)
+                && !self.exists("/v1/agents/", &agent).await
+            {
+                s.agents.remove(&full);
+            }
+            s.agents_verified.insert(full.clone());
         }
         if !s.agents.contains_key(&full) {
             let agent = self.post("/v1/agents", json!({
@@ -145,6 +225,11 @@ impl ManagedAgents {
                 "tools": [ask_user_tool()],
             })).await?;
             s.agents.insert(full.clone(), agent["id"].as_str().unwrap_or_default().to_string());
+            changed = true;
+        }
+
+        if changed {
+            self.persist(&s);
         }
         Ok((s.agents[&full].clone(), s.env_id.clone().unwrap()))
     }
@@ -325,4 +410,131 @@ fn event_text(event: &Value) -> String {
                 .collect::<String>()
         })
         .unwrap_or_default()
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use axum::extract::Path as AxPath;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    #[derive(Default)]
+    struct Counts {
+        env: AtomicUsize,   // POST /v1/environments
+        agent: AtomicUsize, // POST /v1/agents
+        get: AtomicUsize,   // retrieve GETs (verification calls)
+    }
+
+    async fn spawn(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    // A mock Anthropic that COUNTS create-POSTs and serves retrieve GETs (200 if `retrieve_ok`,
+    // else 404 so a persisted id reads as "gone").
+    fn mock(counts: Arc<Counts>, retrieve_ok: bool) -> Router {
+        let (ce, ca, cg1, cg2) = (counts.clone(), counts.clone(), counts.clone(), counts.clone());
+        Router::new()
+            .route(
+                "/v1/environments",
+                post(move || {
+                    let c = ce.clone();
+                    async move { Json(json!({"id": format!("env-{}", c.env.fetch_add(1, Ordering::SeqCst))})) }
+                }),
+            )
+            .route(
+                "/v1/agents",
+                post(move || {
+                    let c = ca.clone();
+                    async move { Json(json!({"id": format!("agent-{}", c.agent.fetch_add(1, Ordering::SeqCst))})) }
+                }),
+            )
+            .route("/v1/sessions", post(|| async { Json(json!({"id": "sess1"})) }))
+            .route(
+                "/v1/environments/{id}",
+                get(move |AxPath(id): AxPath<String>| {
+                    let c = cg1.clone();
+                    async move {
+                        c.get.fetch_add(1, Ordering::SeqCst);
+                        if retrieve_ok { (StatusCode::OK, Json(json!({"id": id}))).into_response() } else { StatusCode::NOT_FOUND.into_response() }
+                    }
+                }),
+            )
+            .route(
+                "/v1/agents/{id}",
+                get(move |AxPath(id): AxPath<String>| {
+                    let c = cg2.clone();
+                    async move {
+                        c.get.fetch_add(1, Ordering::SeqCst);
+                        if retrieve_ok { (StatusCode::OK, Json(json!({"id": id}))).into_response() } else { StatusCode::NOT_FOUND.into_response() }
+                    }
+                }),
+            )
+    }
+
+    #[tokio::test]
+    async fn persisted_ids_are_reused_across_instances() {
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        let counts = Arc::new(Counts::default());
+        let url = spawn(mock(counts.clone(), true)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed_agents.json");
+
+        // First "process": one env + one agent, reused within the process.
+        let a = ManagedAgents::with_base_url(url.clone(), Some(path.clone()));
+        a.create_session("haiku", None, &json!({})).await.unwrap();
+        a.create_session("haiku", None, &json!({})).await.unwrap();
+        assert_eq!(counts.env.load(Ordering::SeqCst), 1, "env created once");
+        assert_eq!(counts.agent.load(Ordering::SeqCst), 1, "agent created once");
+        assert!(path.exists(), "ids were persisted to disk");
+
+        // Second "process" (fresh instance, SAME file): reuses — no new env/agent (the leak fix).
+        let b = ManagedAgents::with_base_url(url.clone(), Some(path.clone()));
+        b.create_session("haiku", None, &json!({})).await.unwrap();
+        assert_eq!(counts.env.load(Ordering::SeqCst), 1, "env reused across restart, not recreated");
+        assert_eq!(counts.agent.load(Ordering::SeqCst), 1, "agent reused across restart, not recreated");
+        assert!(counts.get.load(Ordering::SeqCst) >= 2, "reused ids were verified-on-first-use");
+    }
+
+    #[tokio::test]
+    async fn stale_persisted_ids_self_heal() {
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        let counts = Arc::new(Counts::default());
+        let url = spawn(mock(counts.clone(), false)).await; // retrieve -> 404: the ids are gone
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("managed_agents.json");
+        std::fs::write(
+            &path,
+            json!({"env_id": "gone-env", "agents": {"claude-haiku-4-5": "gone-agent"}}).to_string(),
+        )
+        .unwrap();
+
+        // The persisted ids 404 on verify -> woollama recreates instead of bricking the path.
+        let a = ManagedAgents::with_base_url(url, Some(path));
+        a.create_session("haiku", None, &json!({})).await.unwrap();
+        assert_eq!(counts.env.load(Ordering::SeqCst), 1, "stale env recreated");
+        assert_eq!(counts.agent.load(Ordering::SeqCst), 1, "stale agent recreated");
+    }
+
+    #[tokio::test]
+    async fn no_persist_path_means_no_file() {
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        let counts = Arc::new(Counts::default());
+        let url = spawn(mock(counts.clone(), true)).await;
+        // Default (opt-in OFF): create works, nothing persisted, no verify GETs.
+        let a = ManagedAgents::with_base_url(url, None);
+        a.create_session("haiku", None, &json!({})).await.unwrap();
+        assert_eq!(counts.env.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.agent.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.get.load(Ordering::SeqCst), 0, "ephemeral mode never verifies/persists");
+    }
 }

@@ -108,7 +108,23 @@ pub async fn build_state() -> AppState {
             None
         }
     };
-    let managed_agents = Arc::new(managed_agents::ManagedAgents::new());
+    // Opt-in: persist + reuse the managed-agents env/agent ids across restarts (default off →
+    // each process creates its own). Requires WOOLLAMA_STATE_DIR for somewhere to write them.
+    let ma_persist = {
+        let on = std::env::var("WOOLLAMA_MANAGED_AGENTS_PERSIST")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        let dir = std::env::var("WOOLLAMA_STATE_DIR").ok().filter(|s| !s.is_empty());
+        match (on, dir) {
+            (true, Some(d)) => Some(std::path::PathBuf::from(d).join("managed_agents.json")),
+            (true, None) => {
+                eprintln!("woollamad: WOOLLAMA_MANAGED_AGENTS_PERSIST is set but WOOLLAMA_STATE_DIR is unset \u{2014} env/agent ids will NOT persist");
+                None
+            }
+            _ => None,
+        }
+    };
+    let managed_agents = Arc::new(managed_agents::ManagedAgents::new(ma_persist));
     AppState { recipes, registry, inferencers, mcp_specs: specs, conversations, store, managed_agents }
 }
 
