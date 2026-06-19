@@ -157,11 +157,20 @@ impl ManagedAgents {
     /// Write the current env + agent ids to `persist_path` (best-effort; a write failure only
     /// costs cross-restart reuse, never correctness).
     fn persist(&self, s: &Setup) {
-        if let Some(p) = &self.persist_path {
-            let body = json!({"env_id": s.env_id, "agents": s.agents});
-            if let Err(e) = std::fs::write(p, body.to_string()) {
-                eprintln!("woollamad: managed-agents persist write failed ({}): {e}", p.display());
+        let Some(p) = &self.persist_path else { return };
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = json!({"env_id": s.env_id, "agents": s.agents});
+        let tmp = p.with_extension("json.tmp");
+        // Atomic write (temp + rename), mirroring the conversation table: a crash mid-write
+        // must not truncate the file into an empty seed that would orphan the cloud env/agent.
+        if std::fs::write(&tmp, body.to_string()).is_ok() {
+            if let Err(e) = std::fs::rename(&tmp, p) {
+                eprintln!("woollamad: managed-agents persist rename failed ({}): {e}", p.display());
             }
+        } else {
+            eprintln!("woollamad: managed-agents persist write failed ({})", p.display());
         }
     }
 
@@ -496,6 +505,7 @@ mod tests {
         assert_eq!(counts.env.load(Ordering::SeqCst), 1, "env created once");
         assert_eq!(counts.agent.load(Ordering::SeqCst), 1, "agent created once");
         assert!(path.exists(), "ids were persisted to disk");
+        assert!(!path.with_extension("json.tmp").exists(), "atomic write leaves no .tmp behind");
 
         // Second "process" (fresh instance, SAME file): reuses — no new env/agent (the leak fix).
         let b = ManagedAgents::with_base_url(url.clone(), Some(path.clone()));
