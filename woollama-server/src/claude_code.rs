@@ -176,6 +176,7 @@ async fn invoke(
         .current_dir(cwd)
         .env_clear() // the allow-listed env REPLACES the inherited one
         .envs(env)
+        .kill_on_drop(true) // on timeout the Child is dropped — kill it, don't orphan it
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let child = cmd
@@ -353,5 +354,23 @@ mod tests {
         assert!(!err);
         assert_eq!(sid.as_deref(), Some("s1"));
         assert!(extract(r#"[{"type":"assistant"}]"#).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn timed_out_child_is_killed_not_orphaned() {
+        // A child that would create a marker file ~2s in. With kill_on_drop(true), the 0.3s
+        // timeout drops (and kills) the Child before it runs; without it the orphan survives
+        // the timeout and touches the marker.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let script = format!("sleep 2; touch {}", marker.display());
+        let args = vec!["/bin/sh".to_string(), "-c".to_string(), script];
+        let env = child_env();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let res = invoke(&args, &env, &cwd, 0.3).await;
+        assert!(res.is_err(), "should report a timeout");
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "a timed-out child must be killed, not left running to completion");
     }
 }
