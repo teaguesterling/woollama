@@ -51,7 +51,7 @@ async fn fabric_proxy_passes_through_verbatim() {
     std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
 
     let state = Arc::new(woollama_server::build_state().await);
-    assert!(state.fabric.is_some(), "fabric backend must connect to the mock");
+    assert!(!state.pattern_backends.is_empty(), "fabric backend must register");
     let base = spawn(woollama_server::router(state)).await;
     let c = reqwest::Client::new();
 

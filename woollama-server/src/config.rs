@@ -67,22 +67,30 @@ impl Recipe {
     /// its JSON rendering; unsupplied `{{x}}` tokens are left verbatim. This is a pure
     /// server-layer transform applied before the existing orchestration path runs.
     pub fn render(&self, variables: &serde_json::Map<String, Value>, model_override: Option<&str>) -> Recipe {
-        let mut system = self.system.clone();
-        for (k, v) in variables {
-            let rep = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            system = system.replace(&format!("{{{{{k}}}}}"), &rep);
-        }
         Recipe {
             inferencer: model_override.map(String::from).unwrap_or_else(|| self.inferencer.clone()),
-            system,
+            system: render_system(&self.system, variables),
             tools: self.tools.clone(),
             params: self.params.clone(),
             source: self.source,
         }
     }
+}
+
+/// Substitute `{{k}}` → value in a system prompt (the shared primitive behind
+/// [`Recipe::render`] and the fabric-sourced render path, which has only a raw system string,
+/// not a `Recipe`). Dumb string replace — byte-for-byte fabric's `sysp.replace`. A non-string
+/// value uses its JSON rendering; unsupplied tokens stay verbatim.
+pub fn render_system(system: &str, variables: &serde_json::Map<String, Value>) -> String {
+    let mut out = system.to_string();
+    for (k, v) in variables {
+        let rep = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        out = out.replace(&format!("{{{{{k}}}}}"), &rep);
+    }
+    out
 }
 
 /// The variable names a pattern exposes — every distinct `{{name}}` token scanned from a

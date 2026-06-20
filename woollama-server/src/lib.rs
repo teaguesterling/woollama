@@ -42,9 +42,11 @@ mod managed_agents;
 mod mcp_registry;
 mod mcp_surface;
 mod ollama_native;
+mod pattern_backend;
 mod responses;
 
 use mcp_surface::WoollamaMcp;
+use pattern_backend::PatternBackend;
 
 pub use config::{load_mcp_servers, load_recipes};
 
@@ -65,9 +67,10 @@ pub struct AppState {
     /// The Anthropic Managed Agents backend (claude-agent/* models). Paid; errors at
     /// turn time if ANTHROPIC_API_KEY is unset.
     pub managed_agents: Arc<managed_agents::ManagedAgents>,
-    /// The managed/routed fabric backend (Part 2). `None` unless `fabric` is configured in
-    /// mcp.json. Backs `/fabric/*` (transparent proxy) + fabric-sourced `/w1/` patterns.
-    pub fabric: Option<Arc<fabric::FabricBackend>>,
+    /// Pluggable `/w1/` pattern backends (fabric, future providers), constructed from config.
+    /// The native recipes path is the built-in core; these are consulted after it (recipes win
+    /// on a name collision, then registration order). See `pattern_backend`.
+    pub pattern_backends: Vec<Arc<dyn PatternBackend>>,
 }
 
 impl AppState {
@@ -139,15 +142,19 @@ pub async fn build_state() -> AppState {
         }
     };
     let managed_agents = Arc::new(managed_agents::ManagedAgents::new(ma_persist));
-    // Opt-in fabric backend (mcp.json `fabric`): spawn/supervise or route to `fabric --serve`.
-    let fabric = match config::load_fabric_config() {
-        Ok(Some(cfg)) => fabric::FabricBackend::connect(cfg).await,
-        Ok(None) => None,
-        Err(e) => {
-            eprintln!("woollamad: fabric config error: {e}");
-            None
+    // Pluggable pattern backends, constructed from config (registration order = dispatch order
+    // after native). Today: the opt-in fabric backend (mcp.json `fabric`); future backends slot
+    // in here without touching the /w1 handlers.
+    let mut pattern_backends: Vec<Arc<dyn PatternBackend>> = Vec::new();
+    match config::load_fabric_config() {
+        Ok(Some(cfg)) => {
+            if let Some(fb) = fabric::FabricBackend::connect(cfg).await {
+                pattern_backends.push(fb);
+            }
         }
-    };
+        Ok(None) => {}
+        Err(e) => eprintln!("woollamad: fabric config error: {e}"),
+    }
     AppState {
         recipes,
         registry,
@@ -156,7 +163,7 @@ pub async fn build_state() -> AppState {
         conversations,
         store,
         managed_agents,
-        fabric,
+        pattern_backends,
     }
 }
 
@@ -187,7 +194,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         Arc::new(LocalSessionManager::default()),
         Default::default(),
     );
-    Router::new()
+    let mut router = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses_create))
@@ -196,12 +203,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/conversations/{conv_id}/items", get(conversations_items))
         .route("/w1/patterns", get(w1_patterns))
         .route("/w1/patterns/{name}/render", post(w1_render))
-        .route("/w1/patterns/{name}/run", post(w1_run))
-        .route("/fabric", any(fabric_proxy))
-        .route("/fabric/", any(fabric_proxy))
-        .route("/fabric/{*rest}", any(fabric_proxy))
-        .nest_service("/mcp", mcp_svc)
-        .with_state(state)
+        .route("/w1/patterns/{name}/run", post(w1_run));
+    // Mount a transparent reverse-proxy at `/{id}/*` for each backend that offers one — the id
+    // comes from `backend.id()`, so no backend name is hardcoded here. Reserved prefixes are
+    // skipped so a backend can't shadow woollama's own surface.
+    const RESERVED: &[&str] = &["v1", "w1", "mcp"];
+    for b in &state.pattern_backends {
+        let id = b.id();
+        if !b.proxies() {
+            continue;
+        }
+        if RESERVED.contains(&id) {
+            eprintln!("woollamad: backend '{id}' proxy NOT mounted — reserved path prefix");
+            continue;
+        }
+        router = router
+            .route(&format!("/{id}"), any(backend_proxy))
+            .route(&format!("/{id}/"), any(backend_proxy))
+            .route(&format!("/{id}/{{*rest}}"), any(backend_proxy));
+    }
+    router.nest_service("/mcp", mcp_svc).with_state(state)
 }
 
 /// Serve woollama's MCP surface over stdio — the `woollamad mcp` subcommand (what
@@ -255,23 +276,23 @@ async fn relay_json(resp: reqwest::Response) -> Response {
 
 // --- SSE helpers --------------------------------------------------------------
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-fn chatcmpl_id() -> String {
+pub(crate) fn chatcmpl_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
 }
 
 /// Next complete `\n`-terminated line from a raw byte buffer (UTF-8-safe), or None.
-fn take_line(buf: &mut Vec<u8>) -> Option<String> {
+pub(crate) fn take_line(buf: &mut Vec<u8>) -> Option<String> {
     let nl = buf.iter().position(|&b| b == b'\n')?;
     let line: Vec<u8> = buf.drain(..=nl).collect();
     Some(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// One OpenAI `chat.completion.chunk` SSE frame.
-fn chat_chunk(cid: &str, created: i64, model: &str, delta: Value, finish: Option<&str>) -> Bytes {
+pub(crate) fn chat_chunk(cid: &str, created: i64, model: &str, delta: Value, finish: Option<&str>) -> Bytes {
     let payload = json!({
         "id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
@@ -279,7 +300,7 @@ fn chat_chunk(cid: &str, created: i64, model: &str, delta: Value, finish: Option
     Bytes::from(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap()))
 }
 
-fn sse_response(body: Body) -> Response {
+pub(crate) fn sse_response(body: Body) -> Response {
     Response::builder()
         .header("content-type", "text/event-stream")
         .body(body)
@@ -536,6 +557,18 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     for r in recipe_names {
         data.push(json!({"id": format!("woollama/{r}"), "object": "model", "owned_by": "woollama"}));
     }
+    // Backend-sourced patterns are addressable as `woollama/<name>` too (minus names a native
+    // recipe or earlier backend already claimed).
+    let mut seen: std::collections::HashSet<String> = state.recipes.keys().cloned().collect();
+    for backend in &state.pattern_backends {
+        let mut infos = backend.list();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        for info in infos {
+            if seen.insert(info.name.clone()) {
+                data.push(json!({"id": format!("woollama/{}", info.name), "object": "model", "owned_by": "woollama"}));
+            }
+        }
+    }
     Json(json!({"object": "list", "data": data}))
 }
 
@@ -583,16 +616,30 @@ fn fnmatch(pattern: &str, name: &str) -> bool {
 // render substitutes `{{var}}`, then the EXISTING orchestration path runs. Patterns also
 // stay in `/v1/models` as `woollama/<name>` for OpenAI-client addressability.
 
-/// `GET /w1/patterns` — discovery. Each recipe with its scanned `{{var}}` names + source.
+/// `GET /w1/patterns` — discovery. Native recipes (with scanned `{{var}}` names) + fabric's
+/// library (source `"fabric"`). On a name collision the native recipe WINS (recipes.toml/dir
+/// scan override an auto-sourced fabric pattern), so it is the one listed.
 async fn w1_patterns(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut entries: Vec<(&String, &config::Recipe)> = state.recipes.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
-    let data: Vec<Value> = entries
+    let mut data: Vec<Value> = entries
         .iter()
         .map(|(name, r)| {
             json!({"name": name, "variables": config::scan_vars(&r.system), "source": r.source.as_str()})
         })
         .collect();
+    // Pluggable backends, after native (native recipes win on a name collision, then
+    // registration order). De-dup so two backends offering the same name list it once.
+    let mut seen: std::collections::HashSet<String> = state.recipes.keys().cloned().collect();
+    for backend in &state.pattern_backends {
+        let mut infos = backend.list();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        for info in infos {
+            if seen.insert(info.name.clone()) {
+                data.push(json!({"name": info.name, "variables": info.variables, "source": info.source}));
+            }
+        }
+    }
     Json(json!({"data": data}))
 }
 
@@ -603,13 +650,25 @@ async fn w1_render(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(recipe) = state.recipes.get(&name) else {
-        return err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found");
-    };
     let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
     let input = body.get("input").and_then(Value::as_str).unwrap_or("");
-    let rendered = recipe.render(&variables, None);
-    Json(json!({"prompt": format!("{}\n\n{}", rendered.system, input)})).into_response()
+    // Native recipe WINS on a name collision; else the first backend that has it.
+    let system = if let Some(recipe) = state.recipes.get(&name) {
+        Some(config::render_system(&recipe.system, &variables))
+    } else {
+        let mut rendered = None;
+        for backend in &state.pattern_backends {
+            if backend.has(&name) {
+                rendered = backend.render(&name, &variables).await;
+                break;
+            }
+        }
+        rendered
+    };
+    match system {
+        Some(system) => Json(json!({"prompt": format!("{system}\n\n{input}")})).into_response(),
+        None => err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found"),
+    }
 }
 
 /// `POST /w1/patterns/{name}/run` — templated run + infer. Body `{input (string | OpenAI
@@ -621,20 +680,27 @@ async fn w1_run(
     Path(name): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(recipe) = state.recipes.get(&name) else {
-        return err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found");
-    };
+    // Native recipe WINS on a name collision; else dispatch to the first backend that has it.
+    if let Some(recipe) = state.recipes.get(&name) {
+        return w1_run_native(&state, recipe, &name, &body).await;
+    }
+    for backend in &state.pattern_backends {
+        if backend.has(&name) {
+            return backend.run(&name, &body).await;
+        }
+    }
+    err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found")
+}
+
+/// Run a NATIVE recipe pattern through the engine path (render `{{var}}`, per-call model +
+/// options overrides, then the existing orchestration/streaming dispatch).
+async fn w1_run_native(state: &Arc<AppState>, recipe: &config::Recipe, name: &str, body: &Value) -> Response {
     let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
     let model_override = body.get("model").and_then(Value::as_str);
     let mut rendered = recipe.render(&variables, model_override);
     // Per-call `options` (e.g. temperature) override the recipe's bound params.
     if let Some(opts) = body.get("options").and_then(Value::as_object) {
-        let mut params = rendered
-            .params
-            .as_ref()
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let mut params = rendered.params.as_ref().and_then(Value::as_object).cloned().unwrap_or_default();
         for (k, v) in opts {
             params.insert(k.clone(), v.clone());
         }
@@ -650,49 +716,32 @@ async fn w1_run(
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         return orchestrate_stream(state.clone(), rendered, messages, model_label).await;
     }
-    match orchestrate_recipe(&state, &rendered, &messages).await {
+    match orchestrate_recipe(state, &rendered, &messages).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => engine_err_response(e),
     }
 }
 
-// --- /fabric/ (woollama-native): transparent fabric REST proxy ----------------
-
-/// `/fabric/*` — TRANSPARENT reverse-proxy of the managed/routed fabric's REST API. The client
-/// speaks fabric natively, so vendor names, fabric SSE, and advanced features
-/// (`context`/`strategy`/`language`/`search`/vision) pass through verbatim. The response body is
-/// STREAMED (never buffered) so fabric's `/chat` SSE stays live. Requires `fabric` configured in
-/// mcp.json; otherwise 503. (fabric's API carries provider keys, so keep woollama's bind
-/// loopback/UDS — the default.)
-async fn fabric_proxy(
+/// `/{backend-id}/*` — TRANSPARENT reverse-proxy of a pattern backend's native API. The
+/// backend (selected by the first path segment) streams the response back verbatim — SSE-safe,
+/// status + content-type preserved. Backends carry provider keys, so woollama's bind stays
+/// loopback/UDS by default. Generic: no backend name appears here.
+async fn backend_proxy(
     State(state): State<Arc<AppState>>,
     method: axum::http::Method,
     uri: axum::extract::OriginalUri,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(fab) = &state.fabric else {
-        return err_response(StatusCode::SERVICE_UNAVAILABLE, "no fabric backend configured", "server_error");
+    let full = uri.0.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let id = full.trim_start_matches('/').split(['/', '?']).next().unwrap_or("");
+    let Some(backend) = state.pattern_backends.iter().find(|b| b.id() == id && b.proxies()) else {
+        return err_response(StatusCode::SERVICE_UNAVAILABLE, format!("no backend '{id}' configured"), "server_error");
     };
-    // Strip the `/fabric` mount prefix, preserving the rest of the path + query string.
-    let full = uri.0.path_and_query().map(|pq| pq.as_str()).unwrap_or("/fabric");
-    let rest = full.strip_prefix("/fabric").unwrap_or("");
-    let rest = if rest.is_empty() { "/" } else { rest };
+    // Strip the `/{id}` mount prefix, preserving the rest of the path + query string.
+    let rest = full.strip_prefix(&format!("/{id}")).filter(|s| !s.is_empty()).unwrap_or("/");
     let ct = headers.get("content-type").and_then(|v| v.to_str().ok());
-    match fab.forward(method, rest, ct, body).await {
-        Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
-            let mut builder = Response::builder().status(status);
-            if let Some(ct) = ct {
-                builder = builder.header("content-type", ct);
-            }
-            builder.body(Body::from_stream(resp.bytes_stream())).unwrap_or_else(|_| {
-                err_response(StatusCode::BAD_GATEWAY, "fabric proxy stream build failed", "server_error")
-            })
-        }
-        Err(e) => err_response(StatusCode::BAD_GATEWAY, format!("fabric proxy error: {e}"), "server_error"),
-    }
+    backend.proxy(method, rest, ct, body).await
 }
 
 // --- POST /v1/chat/completions ------------------------------------------------

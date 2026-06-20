@@ -36,6 +36,9 @@ pub struct FabricBackend {
     /// `provider(lowercased) → fabric vendor name` (e.g. `ollama → "Ollama"`), derived from
     /// fabric's own `/models/names` `vendors` keys — so the mapping tracks fabric, not a guess.
     vendor_map: HashMap<String, String>,
+    /// fabric's pattern library, cached at connect (load-once, like recipes). Used for `/w1/`
+    /// discovery + backend selection without a GET per request.
+    names: std::collections::HashSet<String>,
 }
 
 /// `$XDG_RUNTIME_DIR/woollama.fabric-addr` — the persisted managed-fabric address (for reuse).
@@ -77,8 +80,13 @@ impl FabricBackend {
         };
 
         let vendor_map = Self::load_vendor_map(&client, &base).await;
-        eprintln!("woollamad: fabric backend ready at {base} ({} vendors)", vendor_map.len());
-        Some(std::sync::Arc::new(FabricBackend { base, client, child: Mutex::new(child), vendor_map }))
+        let names: std::collections::HashSet<String> = Self::fetch_names(&client, &base).await.into_iter().collect();
+        eprintln!(
+            "woollamad: fabric backend ready at {base} ({} patterns, {} vendors)",
+            names.len(),
+            vendor_map.len()
+        );
+        Some(std::sync::Arc::new(FabricBackend { base, client, child: Mutex::new(child), vendor_map, names }))
     }
 
     /// Liveness probe — fabric answers `GET /patterns/names` once `--serve` is up.
@@ -177,9 +185,9 @@ impl FabricBackend {
         self.vendor_map.get(&provider.to_lowercase()).cloned().unwrap_or_else(|| provider.to_string())
     }
 
-    /// fabric's pattern library (`GET /patterns/names`). Empty on error.
-    pub async fn pattern_names(&self) -> Vec<String> {
-        match self.client.get(format!("{}/patterns/names", self.base)).timeout(Duration::from_secs(10)).send().await {
+    /// Fetch fabric's pattern library (`GET /patterns/names`). Empty on error.
+    async fn fetch_names(client: &reqwest::Client, base: &str) -> Vec<String> {
+        match client.get(format!("{base}/patterns/names")).timeout(Duration::from_secs(10)).send().await {
             Ok(r) => r
                 .json::<Value>()
                 .await
@@ -237,5 +245,237 @@ impl FabricBackend {
         if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.kill().await;
         }
+    }
+
+    /// Build fabric's `/chat` request body from a `/w1/run` body. All fabric-isms
+    /// (`prompts[].userInput`/`patternName`/`vendor`, `contextName`/`strategyName`,
+    /// top-level `language`/`search`) are confined here. `Err` is a client-facing 400 message.
+    fn build_chat_body(&self, name: &str, body: &Value) -> Result<Value, String> {
+        let Some(model) = body.get("model").and_then(Value::as_str) else {
+            return Err(format!(
+                "fabric pattern '{name}' run requires a 'model' (e.g. ollama/qwen3) — fabric patterns have no bound inferencer"
+            ));
+        };
+        let (provider, bare) = model.split_once('/').unwrap_or(("", model));
+        let user_input = match body.get("input") {
+            Some(Value::String(s)) => s.clone(),
+            // last user message's content (fabric is pattern + single-input oriented).
+            Some(Value::Array(arr)) => arr
+                .iter()
+                .rev()
+                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .and_then(|m| m.get("content").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string(),
+            _ => String::new(),
+        };
+        let mut prompt = serde_json::json!({
+            "userInput": user_input,
+            "patternName": name,
+            "model": bare,
+            "vendor": self.vendor_for(provider),
+            "variables": body.get("variables").cloned().unwrap_or_else(|| serde_json::json!({})),
+        });
+        if let Some(c) = body.get("context").and_then(Value::as_str) {
+            prompt["contextName"] = serde_json::json!(c);
+        }
+        if let Some(s) = body.get("strategy").and_then(Value::as_str) {
+            prompt["strategyName"] = serde_json::json!(s);
+        }
+        let mut fbody = serde_json::json!({ "prompts": [prompt], "model": bare });
+        if let Some(l) = body.get("language").and_then(Value::as_str) {
+            fbody["language"] = serde_json::json!(l);
+        }
+        if let Some(opts) = body.get("options").and_then(Value::as_object) {
+            for (k, v) in opts {
+                fbody[k] = v.clone();
+            }
+        }
+        if body.get("search").and_then(Value::as_bool) == Some(true) {
+            fbody["search"] = serde_json::json!(true);
+        }
+        Ok(fbody)
+    }
+}
+
+/// Parse one fabric SSE line → `(content_piece, done, error)`. fabric frames are
+/// `data: {"type": "content"|"complete"|"error", "content": "..."}`. `None` = blank/unparsable.
+fn parse_fabric_line(line: &str) -> Option<(Option<String>, bool, Option<String>)> {
+    let line = line.trim();
+    let line = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+    if line.is_empty() {
+        return None;
+    }
+    if line == "[DONE]" {
+        return Some((None, true, None));
+    }
+    let ev: Value = serde_json::from_str(line).ok()?;
+    match ev.get("type").and_then(Value::as_str) {
+        Some("error") => {
+            Some((None, true, Some(ev.get("content").and_then(Value::as_str).unwrap_or("fabric error").to_string())))
+        }
+        Some("complete") => Some((None, true, None)),
+        _ => Some((ev.get("content").and_then(Value::as_str).map(String::from), false, None)),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::pattern_backend::PatternBackend for FabricBackend {
+    fn id(&self) -> &str {
+        "fabric"
+    }
+
+    fn list(&self) -> Vec<crate::pattern_backend::PatternInfo> {
+        // Names only — scanning ~250 patterns' systems per discovery call is too costly;
+        // variables resolve on render/run.
+        self.names
+            .iter()
+            .map(|n| crate::pattern_backend::PatternInfo {
+                name: n.clone(),
+                variables: Vec::new(),
+                source: "fabric".to_string(),
+            })
+            .collect()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    async fn render(&self, name: &str, variables: &serde_json::Map<String, Value>) -> Option<String> {
+        let system = self.pattern_system(name).await?;
+        Some(crate::config::render_system(&system, variables))
+    }
+
+    async fn run(&self, name: &str, body: &Value) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use futures::StreamExt;
+
+        let fbody = match self.build_chat_body(name, body) {
+            Ok(b) => b,
+            Err(msg) => {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}})),
+                )
+                    .into_response()
+            }
+        };
+        let model = body.get("model").and_then(Value::as_str).unwrap_or(name).to_string();
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+        let resp = match self.chat(&fbody).await {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({"error": {"message": format!("fabric chat error: {e}"), "type": "server_error"}})),
+                )
+                    .into_response()
+            }
+        };
+        if !resp.status().is_success() {
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let text = resp.text().await.unwrap_or_default();
+            return (
+                status,
+                axum::Json(serde_json::json!({"error": {"message": format!("fabric: {text}"), "type": "server_error"}})),
+            )
+                .into_response();
+        }
+
+        if stream {
+            // Translate fabric's native SSE → OpenAI chat.completion.chunk frames.
+            let cid = crate::chatcmpl_id();
+            let created = crate::now_secs();
+            let mut byte_stream = resp.bytes_stream();
+            let out = axum::body::Body::from_stream(async_stream::stream! {
+                yield Ok::<bytes::Bytes, std::io::Error>(crate::chat_chunk(&cid, created, &model, serde_json::json!({"role": "assistant"}), None));
+                let mut buf: Vec<u8> = Vec::new();
+                'outer: while let Some(chunk) = byte_stream.next().await {
+                    let Ok(bytes) = chunk else { break };
+                    buf.extend_from_slice(&bytes);
+                    while let Some(line) = crate::take_line(&mut buf) {
+                        if let Some((piece, done, err)) = parse_fabric_line(&line) {
+                            if let Some(e) = err {
+                                let payload = serde_json::json!({"error": {"message": e, "type": "server_error"}});
+                                yield Ok(bytes::Bytes::from(format!("data: {}\n\n", serde_json::to_string(&payload).unwrap())));
+                                break 'outer;
+                            }
+                            if done {
+                                break 'outer;
+                            }
+                            if let Some(c) = piece {
+                                yield Ok(crate::chat_chunk(&cid, created, &model, serde_json::json!({"content": c}), None));
+                            }
+                        }
+                    }
+                }
+                yield Ok(crate::chat_chunk(&cid, created, &model, serde_json::json!({}), Some("stop")));
+                yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+            });
+            return crate::sse_response(out);
+        }
+
+        // Non-stream: fabric still answers as SSE — accumulate content into one completion.
+        let text = resp.text().await.unwrap_or_default();
+        let mut content = String::new();
+        let mut error = None;
+        for line in text.lines() {
+            if let Some((piece, done, err)) = parse_fabric_line(line) {
+                if let Some(e) = err {
+                    error = Some(e);
+                    break;
+                }
+                if let Some(c) = piece {
+                    content.push_str(&c);
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+        if let Some(e) = error {
+            return (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({"error": {"message": format!("fabric: {e}"), "type": "server_error"}})),
+            )
+                .into_response();
+        }
+        axum::Json(serde_json::json!({
+            "id": crate::chatcmpl_id(),
+            "object": "chat.completion",
+            "created": crate::now_secs(),
+            "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+        }))
+        .into_response()
+    }
+
+    fn proxies(&self) -> bool {
+        true
+    }
+
+    async fn proxy(
+        &self,
+        method: axum::http::Method,
+        path_and_query: &str,
+        content_type: Option<&str>,
+        body: bytes::Bytes,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match self.forward(method, path_and_query, content_type, body).await {
+            Ok(resp) => crate::pattern_backend::stream_reqwest(resp),
+            Err(e) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({"error": {"message": format!("fabric proxy error: {e}"), "type": "server_error"}})),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn shutdown(&self) {
+        FabricBackend::shutdown(self).await;
     }
 }
