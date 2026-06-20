@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -37,6 +37,7 @@ pub mod binding;
 mod claude_code;
 mod config;
 mod conversations;
+mod fabric;
 mod managed_agents;
 mod mcp_registry;
 mod mcp_surface;
@@ -64,6 +65,9 @@ pub struct AppState {
     /// The Anthropic Managed Agents backend (claude-agent/* models). Paid; errors at
     /// turn time if ANTHROPIC_API_KEY is unset.
     pub managed_agents: Arc<managed_agents::ManagedAgents>,
+    /// The managed/routed fabric backend (Part 2). `None` unless `fabric` is configured in
+    /// mcp.json. Backs `/fabric/*` (transparent proxy) + fabric-sourced `/w1/` patterns.
+    pub fabric: Option<Arc<fabric::FabricBackend>>,
 }
 
 impl AppState {
@@ -135,7 +139,25 @@ pub async fn build_state() -> AppState {
         }
     };
     let managed_agents = Arc::new(managed_agents::ManagedAgents::new(ma_persist));
-    AppState { recipes, registry, inferencers, mcp_specs: specs, conversations, store, managed_agents }
+    // Opt-in fabric backend (mcp.json `fabric`): spawn/supervise or route to `fabric --serve`.
+    let fabric = match config::load_fabric_config() {
+        Ok(Some(cfg)) => fabric::FabricBackend::connect(cfg).await,
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("woollamad: fabric config error: {e}");
+            None
+        }
+    };
+    AppState {
+        recipes,
+        registry,
+        inferencers,
+        mcp_specs: specs,
+        conversations,
+        store,
+        managed_agents,
+        fabric,
+    }
 }
 
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
@@ -175,6 +197,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/w1/patterns", get(w1_patterns))
         .route("/w1/patterns/{name}/render", post(w1_render))
         .route("/w1/patterns/{name}/run", post(w1_run))
+        .route("/fabric", any(fabric_proxy))
+        .route("/fabric/", any(fabric_proxy))
+        .route("/fabric/{*rest}", any(fabric_proxy))
         .nest_service("/mcp", mcp_svc)
         .with_state(state)
 }
@@ -628,6 +653,45 @@ async fn w1_run(
     match orchestrate_recipe(&state, &rendered, &messages).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => engine_err_response(e),
+    }
+}
+
+// --- /fabric/ (woollama-native): transparent fabric REST proxy ----------------
+
+/// `/fabric/*` — TRANSPARENT reverse-proxy of the managed/routed fabric's REST API. The client
+/// speaks fabric natively, so vendor names, fabric SSE, and advanced features
+/// (`context`/`strategy`/`language`/`search`/vision) pass through verbatim. The response body is
+/// STREAMED (never buffered) so fabric's `/chat` SSE stays live. Requires `fabric` configured in
+/// mcp.json; otherwise 503. (fabric's API carries provider keys, so keep woollama's bind
+/// loopback/UDS — the default.)
+async fn fabric_proxy(
+    State(state): State<Arc<AppState>>,
+    method: axum::http::Method,
+    uri: axum::extract::OriginalUri,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(fab) = &state.fabric else {
+        return err_response(StatusCode::SERVICE_UNAVAILABLE, "no fabric backend configured", "server_error");
+    };
+    // Strip the `/fabric` mount prefix, preserving the rest of the path + query string.
+    let full = uri.0.path_and_query().map(|pq| pq.as_str()).unwrap_or("/fabric");
+    let rest = full.strip_prefix("/fabric").unwrap_or("");
+    let rest = if rest.is_empty() { "/" } else { rest };
+    let ct = headers.get("content-type").and_then(|v| v.to_str().ok());
+    match fab.forward(method, rest, ct, body).await {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+            let mut builder = Response::builder().status(status);
+            if let Some(ct) = ct {
+                builder = builder.header("content-type", ct);
+            }
+            builder.body(Body::from_stream(resp.bytes_stream())).unwrap_or_else(|_| {
+                err_response(StatusCode::BAD_GATEWAY, "fabric proxy stream build failed", "server_error")
+            })
+        }
+        Err(e) => err_response(StatusCode::BAD_GATEWAY, format!("fabric proxy error: {e}"), "server_error"),
     }
 }
 

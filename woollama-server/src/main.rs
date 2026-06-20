@@ -43,6 +43,7 @@ async fn main() {
 
     // Serve the SAME app on both listeners (axum 0.8 implements Listener for TcpListener AND
     // UnixListener). Two serve tasks; exit on either dying or on Ctrl-C, then clean up the socket.
+    let fabric = state.fabric.clone(); // for graceful shutdown (kill the managed fabric)
     let app = woollama_server::router(state);
     let app_tcp = app.clone();
     let tcp_task = tokio::spawn(async move { axum::serve(tcp, app_tcp).await });
@@ -64,6 +65,11 @@ async fn main() {
         }
     }
     binding::cleanup_unix(&sock_path);
+    // Graceful shutdown: kill the managed `fabric --serve` we spawned (a reused/external one
+    // has no child handle, so this is a no-op there).
+    if let Some(fabric) = fabric {
+        fabric.shutdown().await;
+    }
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM (systemd/`kill`) so we can remove the socket file

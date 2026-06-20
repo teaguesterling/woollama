@@ -292,6 +292,37 @@ pub fn load_conversation_store() -> Result<Option<ConvStoreConfig>, String> {
     }
 }
 
+/// The managed/routed fabric backend (Part 2), from the top-level `fabric` key in mcp.json.
+/// `None` ⇒ no fabric backend (the default). Lives in mcp.json (a server-owned config file,
+/// like `conversationStore`) — NOT `[inferencers.*]`: fabric is not OpenAI-compatible, and the
+/// engine's `inferencers.toml` loader requires every entry to have a `base_url` (it would
+/// error on a fabric entry), plus the engine is parity-locked.
+pub struct FabricConfig {
+    /// woollama spawns + supervises `fabric --serve` (loopback) when true and no `url` is set.
+    pub managed: bool,
+    /// Route to an externally-run fabric at this base URL instead of spawning one.
+    pub url: Option<String>,
+    /// The fabric binary to spawn in managed mode (default `"fabric"`; resolved against PATH).
+    pub command: String,
+    /// Optional fixed `host:port` to bind in managed mode (default: a persisted free loopback port).
+    pub address: Option<String>,
+}
+
+pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
+    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
+    let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
+    match v.get("fabric") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(o)) => Ok(Some(FabricConfig {
+            managed: o.get("managed").and_then(Value::as_bool).unwrap_or(false),
+            url: o.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+            command: o.get("command").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("fabric").to_string(),
+            address: o.get("address").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+        })),
+        Some(_) => Err("'fabric' must be an object (e.g. {\"managed\": true} or {\"url\": \"...\"})".to_string()),
+    }
+}
+
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
     let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
