@@ -557,10 +557,14 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     for r in recipe_names {
         data.push(json!({"id": format!("woollama/{r}"), "object": "model", "owned_by": "woollama"}));
     }
-    // Backend-sourced patterns are addressable as `woollama/<name>` too (minus names a native
-    // recipe or earlier backend already claimed).
+    // Backend-sourced patterns are addressable as `woollama/<name>` too — but only when the
+    // backend can actually run them here (no per-call model slot in /v1), so /v1/models stays
+    // honest. (They're always in /w1/patterns.) Minus names already claimed.
     let mut seen: std::collections::HashSet<String> = state.recipes.keys().cloned().collect();
     for backend in &state.pattern_backends {
+        if !backend.v1_addressable() {
+            continue;
+        }
         let mut infos = backend.list();
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         for info in infos {
@@ -750,17 +754,30 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
     let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
 
     if let Some(name) = model.strip_prefix("woollama/") {
-        let Some(recipe) = state.recipes.get(name) else {
-            return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
-        };
-        let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
-        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-            return orchestrate_stream(state.clone(), recipe.clone(), messages, model).await;
+        // Native recipe WINS; else a backend pattern (it resolves its own model — fabric uses
+        // fabric.default_model since /v1 has no per-call model slot).
+        if let Some(recipe) = state.recipes.get(name) {
+            let messages = body.get("messages").cloned().unwrap_or_else(|| json!([]));
+            if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+                return orchestrate_stream(state.clone(), recipe.clone(), messages, model).await;
+            }
+            return match orchestrate_recipe(&state, recipe, &messages).await {
+                Ok(resp) => Json(resp).into_response(),
+                Err(e) => engine_err_response(e),
+            };
         }
-        return match orchestrate_recipe(&state, recipe, &messages).await {
-            Ok(resp) => Json(resp).into_response(),
-            Err(e) => engine_err_response(e),
-        };
+        for backend in &state.pattern_backends {
+            if backend.has(name) {
+                // Re-shape the OpenAI request as a `/w1/run`-style body (messages as input);
+                // no `model` — the backend supplies it (e.g. fabric.default_model).
+                let run_body = json!({
+                    "input": body.get("messages").cloned().unwrap_or_else(|| json!([])),
+                    "stream": body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                });
+                return backend.run(name, &run_body).await;
+            }
+        }
+        return err_response(StatusCode::NOT_FOUND, format!("unknown recipe '{name}'"), "not_found");
     }
 
     let provider = model.split('/').next().unwrap_or("");

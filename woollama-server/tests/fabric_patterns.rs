@@ -53,7 +53,12 @@ async fn fabric_library_on_w1_surface() {
     let cfg = tempfile::tempdir().unwrap();
     // A native recipe named "shared" must WIN over fabric's "shared" pattern.
     std::fs::write(cfg.path().join("recipes.toml"), "[recipes.shared]\ninferencer=\"ollama/m\"\nsystem=\"native shared\"\n").unwrap();
-    std::fs::write(cfg.path().join("mcp.json"), json!({"fabric": {"url": fabric_url}}).to_string()).unwrap();
+    // default_model makes fabric patterns addressable as woollama/<name> in /v1 too.
+    std::fs::write(
+        cfg.path().join("mcp.json"),
+        json!({"fabric": {"url": fabric_url, "default_model": "ollama/def"}}).to_string(),
+    )
+    .unwrap();
     std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
 
     let state = Arc::new(woollama_server::build_state().await);
@@ -119,12 +124,35 @@ async fn fabric_library_on_w1_surface() {
     assert!(text.contains("vendor=Ollama"), "fabric content translated through: {text}");
     assert!(text.contains("data: [DONE]"), "terminated with [DONE]");
 
-    // 5) fabric run WITHOUT a model → 400 (fabric patterns have no bound inferencer).
-    let r = c
+    // 5) /w1/run without a per-call model falls back to fabric.default_model (ollama/def).
+    let r: Value = c
         .post(format!("{base}/w1/patterns/summarize/run"))
-        .json(&json!({"input": "hi"}))
+        .json(&json!({"input": "hi", "variables": {"tone": "dry"}}))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(r.status(), 400, "fabric run requires a model");
+    assert_eq!(
+        r["choices"][0]["message"]["content"],
+        "vendor=Ollama|model=def|pat=summarize|tone=dry|input=hi",
+        "default_model used when no per-call model"
+    );
+
+    // 6) a fabric pattern is runnable as woollama/<name> via /v1/chat/completions (no model
+    //    slot there → uses default_model); messages become fabric's userInput.
+    let r: Value = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model": "woollama/summarize", "messages": [{"role": "user", "content": "v1 input"}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r["choices"][0]["message"]["content"],
+        "vendor=Ollama|model=def|pat=summarize|tone=|input=v1 input"
+    );
 }

@@ -314,6 +314,11 @@ pub struct FabricConfig {
     pub command: String,
     /// Optional fixed `host:port` to bind in managed mode (default: a persisted free loopback port).
     pub address: Option<String>,
+    /// Optional fallback inferencer (e.g. `"ollama/qwen3"`) for fabric patterns when a run
+    /// omits `model` — fabric patterns have no bound inferencer. Required for a fabric pattern
+    /// to be runnable as `woollama/<name>` via `/v1/chat/completions` (which has no model slot
+    /// of its own). When unset, such patterns aren't advertised in `/v1/models`.
+    pub default_model: Option<String>,
 }
 
 pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
@@ -326,6 +331,7 @@ pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
             url: o.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
             command: o.get("command").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("fabric").to_string(),
             address: o.get("address").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+            default_model: o.get("default_model").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
         })),
         Some(_) => Err("'fabric' must be an object (e.g. {\"managed\": true} or {\"url\": \"...\"})".to_string()),
     }

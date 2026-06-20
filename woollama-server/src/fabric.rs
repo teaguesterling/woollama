@@ -39,6 +39,8 @@ pub struct FabricBackend {
     /// fabric's pattern library, cached at connect (load-once, like recipes). Used for `/w1/`
     /// discovery + backend selection without a GET per request.
     names: std::collections::HashSet<String>,
+    /// Fallback inferencer for runs that omit `model` (fabric patterns have no bound one).
+    default_model: Option<String>,
 }
 
 /// `$XDG_RUNTIME_DIR/woollama.fabric-addr` — the persisted managed-fabric address (for reuse).
@@ -86,7 +88,14 @@ impl FabricBackend {
             names.len(),
             vendor_map.len()
         );
-        Some(std::sync::Arc::new(FabricBackend { base, client, child: Mutex::new(child), vendor_map, names }))
+        Some(std::sync::Arc::new(FabricBackend {
+            base,
+            client,
+            child: Mutex::new(child),
+            vendor_map,
+            names,
+            default_model: cfg.default_model,
+        }))
     }
 
     /// Liveness probe — fabric answers `GET /patterns/names` once `--serve` is up.
@@ -251,10 +260,12 @@ impl FabricBackend {
     /// (`prompts[].userInput`/`patternName`/`vendor`, `contextName`/`strategyName`,
     /// top-level `language`/`search`) are confined here. `Err` is a client-facing 400 message.
     fn build_chat_body(&self, name: &str, body: &Value) -> Result<Value, String> {
-        let Some(model) = body.get("model").and_then(Value::as_str) else {
-            return Err(format!(
-                "fabric pattern '{name}' run requires a 'model' (e.g. ollama/qwen3) — fabric patterns have no bound inferencer"
-            ));
+        // Per-call `model` wins; else the configured `default_model`; else error.
+        let model = match body.get("model").and_then(Value::as_str) {
+            Some(m) => m,
+            None => self.default_model.as_deref().ok_or_else(|| {
+                format!("fabric pattern '{name}' run requires a 'model' (e.g. ollama/qwen3) — fabric patterns have no bound inferencer (set fabric.default_model in mcp.json to make it optional)")
+            })?,
         };
         let (provider, bare) = model.split_once('/').unwrap_or(("", model));
         let user_input = match body.get("input") {
@@ -451,6 +462,12 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
             "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
         }))
         .into_response()
+    }
+
+    fn v1_addressable(&self) -> bool {
+        // Only addressable as woollama/<name> in /v1 when a default model is configured (there
+        // is no per-call model slot there); otherwise the pattern is /w1-only.
+        self.default_model.is_some()
     }
 
     fn proxies(&self) -> bool {

@@ -51,6 +51,14 @@ pub trait PatternBackend: Send + Sync {
     /// `stream:true`). Only called after `has(name)` returned true.
     async fn run(&self, name: &str, body: &Value) -> Response;
 
+    /// Whether this backend's patterns are runnable as `woollama/<name>` via
+    /// `/v1/chat/completions` (which has no per-call model slot) — i.e. they resolve a model
+    /// on their own. Gates `/v1/models` advertising so it stays honest; `/w1/patterns` lists
+    /// them regardless (there a model can be passed per call). Default: yes.
+    fn v1_addressable(&self) -> bool {
+        true
+    }
+
     /// Whether this backend exposes a transparent reverse-proxy of its native API at `/{id}/*`.
     fn proxies(&self) -> bool {
         false
