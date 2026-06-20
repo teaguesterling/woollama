@@ -225,9 +225,17 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
   Claude owns the agentic loop and calls the recipe's allow-listed MCP tools
   itself (per-recipe `--mcp-config` + `--allowedTools` containment)
 - MCP server side: stdio (`woollamad mcp`) **and** Streamable HTTP at `/mcp` on
-  the same port — recipes as prompts, a `chat` verb (with live tool-progress
-  notifications), and every downstream tool re-exported with its `output_schema`
-  (aggregator)
+  the same port — recipes as **parameterized prompts** (their `{{var}}` tokens →
+  arguments), a `chat` verb (with live tool-progress notifications), and every
+  downstream tool re-exported with its `output_schema` (aggregator)
+- **Pattern templating** on woollama's own `/w1/` namespace (not OpenAI's `/v1/`):
+  parameterized recipes/patterns with `{{var}}` substitution —
+  `GET /w1/patterns` (discovery), `POST /w1/patterns/{name}/render` (assemble),
+  `POST /w1/patterns/{name}/run` (render + infer, streaming). Patterns also come
+  from a fabric-style directory scan (`[patterns]`) and a **fabric backend**:
+  woollama can run/own `fabric --serve`, surface its library on `/w1/`, and
+  transparently proxy fabric's API at `/fabric/*`. Pattern backends are pluggable
+  (the `PatternBackend` trait — see `docs/extending.md`)
 - File-driven config (`mcp.json`, `recipes.toml`, `inferencers.toml`), multi-
   MCP-server discovery + unified tool registry, long-lived MCP connections
 - Recipe allow-list enforced as a security boundary (in-loop AND in delegation);
@@ -242,7 +250,8 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 - cosmic-fabric actually consuming the conversations surface (the last open
   integration milestone). The generic `store-backed` mechanism + two reference
   store providers (MCP + REST) already ship; what's pending is the cross-repo
-  fabric provider + wiring.
+  wiring. (Pattern templating + the fabric backend it needed have **shipped** —
+  see `docs/patterns.md`.)
 - lackpy re-pinning to the now-published `woollama-core` wheel.
 
 Full scorecard, ordering, and pending verifications:

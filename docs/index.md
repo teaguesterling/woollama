@@ -69,7 +69,14 @@ What works today:
   plus a **stateful surface**: `/v1/responses` + `/v1/conversations`.
 - **MCP surface** — stdio (`woollamad mcp`) and Streamable HTTP at `/mcp` on the
   same port; an aggregator that re-exports every downstream tool (namespaced,
-  with `output_schema`) plus a `chat` verb with live tool-progress events.
+  with `output_schema`) plus a `chat` verb with live tool-progress events. Recipes
+  are exposed as **parameterized MCP prompts** (their `{{var}}` tokens → arguments).
+- **Pattern templating** — woollama owns prompt templating on its own `/w1/`
+  namespace: parameterized recipes/patterns with `{{var}}` substitution
+  (`/w1/patterns` discovery, render, run). A **fabric backend** can put fabric's
+  full library behind woollama and proxy fabric's API at `/fabric/*`. Pattern
+  backends are pluggable (see [Pattern templating](patterns.md) ·
+  [Extending woollama](extending.md)).
 - **Multi-backend routing** — ollama, anthropic, openai, groq, together,
   openrouter, `claude-code`, and any OpenAI-compatible endpoint via
   `inferencers.toml`.
@@ -82,6 +89,10 @@ What works today:
 - **[Getting started](getting-started.md)** — install, run, and drive it from an
   OpenAI client.
 - **[Architecture](architecture.md)** — the model/tool/executor router design.
+- **[Pattern templating](patterns.md)** — the `/w1/` namespace, parameterized
+  patterns, and the fabric backend.
+- **[Extending woollama](extending.md)** — add a pattern backend behind the
+  `PatternBackend` trait.
 - **[Conversations API](conversations-api-design.md)** — the stateful surface and
   the handles-not-state principle.
 - **[Roadmap](roadmap.md)** — the authoritative scorecard of what's built and

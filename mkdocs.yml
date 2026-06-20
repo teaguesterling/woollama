@@ -45,6 +45,8 @@ nav:
       - Naming: naming.md
   - Reference:
       - Configuration: configuration.md
+      - Pattern templating (/w1/): patterns.md
+      - Extending woollama: extending.md
       - Environment variables: environment.md
       - Security model: security.md
   - Design:

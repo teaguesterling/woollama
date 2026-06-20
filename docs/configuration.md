@@ -93,6 +93,44 @@ Once set, **every** non-claude model (`ollama/*`, cloud providers, and
 `woollama/<recipe>`) becomes stateful on `/v1/responses` + `/v1/conversations`.
 See the [Conversations design](conversations-api-design.md) §10 for the contract.
 
+### Fabric backend
+
+The top-level `fabric` key (a sibling of `mcpServers`) puts a
+[fabric](https://github.com/danielmiessler/fabric) deployment **behind woollama**:
+its pattern library appears on `/w1/patterns`, and fabric's REST API is
+transparently proxied at `/fabric/*`. woollama either spawns + supervises
+`fabric --serve` (managed) or routes to an externally-run one (`url`).
+
+```jsonc
+{
+  "fabric": {
+    "managed": true,                            // spawn + supervise `fabric --serve`
+    "default_model": "ollama/qwen3:14b-iq4xs"   // fabric patterns have no bound model;
+                                                //   this is the fallback (and what makes
+                                                //   them woollama/<name> in /v1/models)
+  }
+}
+// or route to an externally-run fabric:
+{ "fabric": { "url": "http://127.0.0.1:8999" } }
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `managed` | — | `true` ⇒ woollama spawns + supervises `fabric --serve` (loopback). Reuse + graceful-kill: the address is persisted, so a restart reuses the live fabric; killed only on clean shutdown. |
+| `url` | — | Route to an externally-run fabric at this base URL instead of spawning. Takes precedence over `managed`. |
+| `command` | — | The fabric binary for managed mode (default `"fabric"`, resolved on `PATH`). |
+| `address` | — | Fixed `host:port` to bind in managed mode (default: a persisted free loopback port). |
+| `default_model` | — | Fallback `<provider>/<model>` for fabric patterns when a run omits `model`. Required for a fabric pattern to be addressable as `woollama/<name>` via `/v1/chat/completions` (which has no per-call model slot). |
+
+> **Why here and not `inferencers.toml`?** fabric is not OpenAI-compatible, and the
+> engine's `inferencers.toml` loader requires every entry to have a `base_url` —
+> a fabric entry there would break config load. The fabric backend is a
+> server-layer plugin, not an engine inferencer.
+
+Omitted (the default) ⇒ no fabric backend. See [Pattern templating](patterns.md)
+for the `/w1/` + `/fabric/` surfaces, and [Extending woollama](extending.md) to
+add your own backend.
+
 ## `recipes.toml`
 
 A recipe binds a system prompt + an allow-listed tool set + an inferencer into a
@@ -115,6 +153,31 @@ tools = ["hello.count_to"]
 | `inferencer` | ✅ | `<provider>/<model>` that runs the recipe's inference. |
 | `system` | ✅ | System prompt (whitespace-trimmed). |
 | `tools` | ✅ | Allow-list of `<server>.<tool>` names; `[]` for a tool-less recipe. **Enforced as a security boundary** — a recipe can't call a tool outside this list (in the in-loop path *and* in claude-code delegation). |
+
+> **Recipes are also `/w1/` patterns.** A `system` prompt may contain `{{var}}`
+> tokens that the [pattern surface](patterns.md) substitutes per call (and that
+> MCP clients see as prompt arguments). Plain recipes simply have no `{{var}}`.
+
+### `[patterns]` — a fabric-style pattern directory (optional)
+
+Discover patterns from a directory of `<name>/system.md` files (e.g. fabric's
+pattern library on disk), with no fabric process — woollama reads the files and
+renders/runs them natively. Opt-in via a `[patterns]` block in `recipes.toml`:
+
+```toml
+[patterns]
+dir = "~/.config/fabric/patterns"          # each <name>/system.md becomes a pattern
+default_inferencer = "ollama/qwen3:14b-iq4xs"  # model for these patterns
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `dir` | ✅ | Directory scanned for `<name>/system.md` files. `~` is expanded. A missing dir is ignored (no patterns). |
+| `default_inferencer` | — | `<provider>/<model>` the discovered patterns run on. |
+
+A `recipes.toml` recipe **wins** over a scanned pattern of the same name. For a
+*live* fabric instance (the full library + fabric's own assembly) instead of a
+file scan, use the [fabric backend](#fabric-backend) below.
 
 ## `inferencers.toml`
 
@@ -154,4 +217,5 @@ Models are still **routable by raw id** (`anthropic/claude-opus-4-8`) whether or
 not they're listed — `models`/`discover` only control *discoverability* in
 `GET /v1/models` (what a list-backed picker can offer).
 
-See also: [Environment variables](environment.md) · [Security model](security.md).
+See also: [Pattern templating](patterns.md) · [Extending woollama](extending.md) ·
+[Environment variables](environment.md) · [Security model](security.md).
