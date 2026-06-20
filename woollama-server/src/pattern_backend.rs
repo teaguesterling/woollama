@@ -17,11 +17,27 @@
 //! managed-vs-url, address) — NOT protocol. A backend's wire format (endpoints, body shape,
 //! SSE event types) is code, inside its own module; it cannot be expressed in config.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Map, Value};
+
+/// The single COMPOSITION ROOT for pattern-backend plugins. `build_state` calls only this — it
+/// never names a concrete backend. To add a non-OpenAI system (a new provider, another prompt
+/// service): write a module with `impl PatternBackend for YourBackend` + a
+/// `pub async fn register(&mut Vec<Arc<dyn PatternBackend>>)` entry point, then add ONE line
+/// here. Nothing in `lib.rs`'s request handling changes — handlers iterate the trait objects.
+/// Order here = dispatch order after native recipes (which win on a name collision).
+pub async fn register_all() -> Vec<Arc<dyn PatternBackend>> {
+    let mut backends: Vec<Arc<dyn PatternBackend>> = Vec::new();
+    crate::fabric::register(&mut backends).await;
+    // future backends slot in here, e.g.:
+    // crate::other_backend::register(&mut backends).await;
+    backends
+}
 
 /// A discovery entry for `GET /w1/patterns`.
 pub struct PatternInfo {

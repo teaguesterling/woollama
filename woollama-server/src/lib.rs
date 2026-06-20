@@ -142,19 +142,10 @@ pub async fn build_state() -> AppState {
         }
     };
     let managed_agents = Arc::new(managed_agents::ManagedAgents::new(ma_persist));
-    // Pluggable pattern backends, constructed from config (registration order = dispatch order
-    // after native). Today: the opt-in fabric backend (mcp.json `fabric`); future backends slot
-    // in here without touching the /w1 handlers.
-    let mut pattern_backends: Vec<Arc<dyn PatternBackend>> = Vec::new();
-    match config::load_fabric_config() {
-        Ok(Some(cfg)) => {
-            if let Some(fb) = fabric::FabricBackend::connect(cfg).await {
-                pattern_backends.push(fb);
-            }
-        }
-        Ok(None) => {}
-        Err(e) => eprintln!("woollamad: fabric config error: {e}"),
-    }
+    // Pluggable pattern backends, assembled from config by the composition root — this is the
+    // ONLY place backends are constructed, and it names no concrete backend type (see
+    // `pattern_backend::register_all`). Registration order = dispatch order after native recipes.
+    let pattern_backends = pattern_backend::register_all().await;
     AppState {
         recipes,
         registry,

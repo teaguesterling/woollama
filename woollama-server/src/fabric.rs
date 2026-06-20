@@ -54,6 +54,22 @@ fn free_port() -> Option<u16> {
     l.local_addr().ok().map(|a| a.port())
 }
 
+/// The per-backend registration entry point (see `pattern_backend::register_all`): add the
+/// fabric backend to the set IF mcp.json configures it. Every backend module exposes one of
+/// these; the composition root calls them in order. Config/connect failures degrade to "no
+/// fabric backend" (logged) rather than failing startup.
+pub async fn register(backends: &mut Vec<std::sync::Arc<dyn crate::pattern_backend::PatternBackend>>) {
+    match crate::config::load_fabric_config() {
+        Ok(Some(cfg)) => {
+            if let Some(fb) = FabricBackend::connect(cfg).await {
+                backends.push(fb);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("woollamad: fabric config error: {e}"),
+    }
+}
+
 impl FabricBackend {
     /// Resolve config → a live fabric (or `None` if it can't be reached/spawned). Errors are
     /// logged and degrade to `None` (the router still starts; `/fabric/*` then 503s).
