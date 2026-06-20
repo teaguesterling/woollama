@@ -147,12 +147,21 @@ impl ServerHandler for WoollamaMcp {
         _p: Option<PaginatedRequestParams>,
         _c: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, McpError> {
+        // Recipes are MCP prompts; their `{{var}}` tokens become prompt ARGUMENTS, so an MCP
+        // client gets the same parameterized templating as the HTTP `/w1/` surface. (No vars ⇒
+        // `None`, the plain-prompt shape.)
         let prompts = self
             .state
             .recipes
-            .keys()
-            .map(|name| {
-                Prompt::new(name.clone(), Some(format!("woollama recipe '{name}' — its system prompt")), None)
+            .iter()
+            .map(|(name, recipe)| {
+                let vars = crate::config::scan_vars(&recipe.system);
+                let args: Option<Vec<PromptArgument>> = if vars.is_empty() {
+                    None
+                } else {
+                    Some(vars.into_iter().map(PromptArgument::new).collect())
+                };
+                Prompt::new(name.clone(), Some(format!("woollama recipe '{name}' — its system prompt")), args)
             })
             .collect();
         Ok(ListPromptsResult::with_all_items(prompts))
@@ -166,9 +175,14 @@ impl ServerHandler for WoollamaMcp {
         let Some(recipe) = self.state.recipes.get(req.name.as_str()) else {
             return Err(McpError::invalid_params(format!("unknown recipe '{}'", req.name), None));
         };
+        // Substitute the supplied arguments into `{{var}}` (the same `Recipe::render` the
+        // `/w1/` surface uses). Unsupplied tokens stay verbatim. MCP prompt roles are only
+        // User/Assistant — there is no System role — so the system prompt is returned as User.
+        let args = req.arguments.unwrap_or_default();
+        let rendered = recipe.render(&args, None);
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,
-            recipe.system.clone(),
+            rendered.system,
         )]))
     }
 }

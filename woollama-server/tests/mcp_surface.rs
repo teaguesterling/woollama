@@ -56,7 +56,8 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
     let cfg = tempfile::tempdir().unwrap();
     std::fs::write(
         cfg.path().join("recipes.toml"),
-        "[recipes.counter]\ninferencer=\"ollama/m\"\ntools=[\"fix.count_to\"]\nsystem=\"count helper\"\n",
+        "[recipes.counter]\ninferencer=\"ollama/m\"\ntools=[\"fix.count_to\"]\nsystem=\"count helper\"\n\
+         [recipes.greeter]\ninferencer=\"ollama/m\"\nsystem=\"You are a {{tone}} greeter.\"\n",
     )
     .unwrap();
     let fixture = env!("CARGO_BIN_EXE_mcp_fixture");
@@ -105,6 +106,31 @@ async fn woollama_mcp_surface_aggregates_and_orchestrates() {
         .await
         .unwrap();
     assert_eq!(got.messages.len(), 1);
+
+    // templated recipe → MCP prompt with ARGUMENTS; get_prompt substitutes them.
+    let greeter = prompts.prompts.iter().find(|p| p.name == "greeter").expect("greeter prompt listed");
+    let arg_names: Vec<&str> =
+        greeter.arguments.as_ref().map(|a| a.iter().map(|x| x.name.as_str()).collect()).unwrap_or_default();
+    assert_eq!(arg_names, vec!["tone"], "{{tone}} surfaces as a prompt argument");
+    // counter has no {{var}} → no arguments advertised.
+    let counter = prompts.prompts.iter().find(|p| p.name == "counter").unwrap();
+    assert!(counter.arguments.is_none(), "non-templated recipe advertises no arguments");
+    let rendered = client
+        .get_prompt(
+            rmcp::model::GetPromptRequestParams::new("greeter")
+                .with_arguments(serde_json::from_value(json!({"tone": "warm"})).unwrap()),
+        )
+        .await
+        .unwrap();
+    let text: String = rendered
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            rmcp::model::PromptMessageContent::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "You are a warm greeter.", "get_prompt substitutes {{tone}}");
 
     // chat: orchestrate the recipe through the registry; client sees only the final answer.
     let chat = client
