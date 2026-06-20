@@ -1,7 +1,7 @@
 # woollama roadmap & status
 
 Single source of truth for *what's built, what's next, and in what order.*
-Updated 2026-06-14. Detailed history: [`build-log.md`](build-log.md). Target
+Updated 2026-06-20. Detailed history: [`build-log.md`](build-log.md). Target
 design: [`architecture.md`](architecture.md).
 
 woollama is a **router** between OpenAI-/MCP-speaking clients and OpenAI-/MCP-
@@ -52,7 +52,9 @@ inference or tools.
 | **Streaming `/v1/responses`** — stateless `stream:true` → OpenAI Responses SSE (recipe or inferencer deltas) | `router.py` | conv-9 |
 | **Ollama `num_ctx` honored** — `ollama/<model>` with `options.num_ctx` routes to native `/api/chat` (passthrough + stateful) | `ollama_native.py`, `router.py` | #1 |
 | **Cloud models in `/v1/models`** — per-inferencer static `models` + opt-in `discover`/`model_patterns` (field-merge over built-ins) | `inferencers.py`, `config.py`, `router.py` | #3 |
-| Lint-clean (`ruff check .`) | tree-wide | — |
+| Pattern templating (`/w1/`): recipes/patterns with double-brace variable substitution; `GET /w1/patterns`, `/render`, `/run` (streaming); `[patterns]` dir scan; MCP prompts parameterized. Rust-only (`woollama-server`); engine untouched | `config.rs`, `lib.rs`, `mcp_surface.rs` | w1 |
+| Fabric backend: managed/routed `fabric --serve` behind woollama; its library on `/w1/`, a transparent fabric REST proxy; behind a pluggable `PatternBackend` trait (the model for new backends) | `fabric.rs`, `pattern_backend.rs` | w1-fabric |
+| Lint-clean (`ruff check .`); Rust suite + `clippy -D warnings` | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
 orchestration, both with `stream:true` → OpenAI SSE), `/v1/responses` (stateless
