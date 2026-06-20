@@ -4,7 +4,7 @@ woollama's `/w1/` pattern surface is **pluggable**. The native path (recipes
 dispatched through `woollama-engine`) is built in; any *additional* source of
 patterns — a prompt library, another templating service, a non-OpenAI inference
 system — plugs in behind one trait: **`PatternBackend`**. The bundled
-[fabric backend](patterns.md#the-fabric-backend-fabric---serve-behind-woollama)
+[fabric backend](patterns.md#the-fabric-backend)
 is the reference implementation.
 
 This guide is for contributors adding a backend to `woollama-server`. It is a

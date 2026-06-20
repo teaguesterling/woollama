@@ -91,7 +91,7 @@ pattern with the arguments you supply. So an MCP client (Claude Desktop, etc.)
 gets the same parameterized templating as `/w1` — MCP covers *render*; *run* is
 the `chat` verb.
 
-## The fabric backend (`fabric --serve` behind woollama)
+## The fabric backend
 
 woollama can **own a fabric deployment** so clients get fabric's full machinery —
 its ~250-pattern library, real prompt assembly, named contexts, prompt
