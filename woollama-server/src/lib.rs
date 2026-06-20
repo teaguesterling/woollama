@@ -77,10 +77,20 @@ impl AppState {
 pub async fn build_state() -> AppState {
     // Resolve WOOLLAMA_EXAMPLES_DIR before any config load — the bundled mcp.json expands it.
     config::ensure_examples_dir();
-    let recipes = config::load_recipes().unwrap_or_else(|e| {
+    let mut recipes = config::load_recipes().unwrap_or_else(|e| {
         eprintln!("woollamad: recipes load error: {e}");
         HashMap::new()
     });
+    // Opt-in `[patterns]` directory scan (fabric-style patterns). recipes.toml wins on a
+    // name collision — a hand-authored recipe overrides an auto-discovered pattern.
+    match config::load_patterns() {
+        Ok(patterns) => {
+            for (name, r) in patterns {
+                recipes.entry(name).or_insert(r);
+            }
+        }
+        Err(e) => eprintln!("woollamad: patterns load error: {e}"),
+    }
     let specs = config::load_mcp_servers().unwrap_or_else(|e| {
         eprintln!("woollamad: mcp.json load error: {e}");
         HashMap::new()
@@ -162,6 +172,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/conversations", post(conversations_create).get(conversations_list))
         .route("/v1/conversations/{conv_id}", get(conversations_get).delete(conversations_delete))
         .route("/v1/conversations/{conv_id}/items", get(conversations_items))
+        .route("/w1/patterns", get(w1_patterns))
+        .route("/w1/patterns/{name}/render", post(w1_render))
+        .route("/w1/patterns/{name}/run", post(w1_run))
         .nest_service("/mcp", mcp_svc)
         .with_state(state)
 }
@@ -537,6 +550,85 @@ fn fnmatch(pattern: &str, name: &str) -> bool {
         }
     }
     m(pattern.as_bytes(), name.as_bytes())
+}
+
+// --- /w1/ (woollama-native): pattern templating -------------------------------
+// `/v1/*` is OpenAI-compatible; templating is not an OpenAI concept, so it lives under
+// woollama's own `/w1/` namespace. Patterns ARE recipes (see config::Recipe::render):
+// render substitutes `{{var}}`, then the EXISTING orchestration path runs. Patterns also
+// stay in `/v1/models` as `woollama/<name>` for OpenAI-client addressability.
+
+/// `GET /w1/patterns` — discovery. Each recipe with its scanned `{{var}}` names + source.
+async fn w1_patterns(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut entries: Vec<(&String, &config::Recipe)> = state.recipes.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let data: Vec<Value> = entries
+        .iter()
+        .map(|(name, r)| {
+            json!({"name": name, "variables": config::scan_vars(&r.system), "source": r.source.as_str()})
+        })
+        .collect();
+    Json(json!({"data": data}))
+}
+
+/// `POST /w1/patterns/{name}/render` — render-without-run (cosmic-fabric's `assemble`).
+/// Body `{input, variables}` → `{"prompt": "<system, {{vars}} substituted>\n\n<input>"}`.
+async fn w1_render(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(recipe) = state.recipes.get(&name) else {
+        return err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found");
+    };
+    let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
+    let input = body.get("input").and_then(Value::as_str).unwrap_or("");
+    let rendered = recipe.render(&variables, None);
+    Json(json!({"prompt": format!("{}\n\n{}", rendered.system, input)})).into_response()
+}
+
+/// `POST /w1/patterns/{name}/run` — templated run + infer. Body `{input (string | OpenAI
+/// messages array), variables, model (per-call inferencer override), stream, options}`.
+/// Renders the pattern, then reuses the EXISTING orchestration/streaming path → an OpenAI
+/// chat-completion object (or OpenAI SSE when `stream:true`).
+async fn w1_run(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(recipe) = state.recipes.get(&name) else {
+        return err_response(StatusCode::NOT_FOUND, format!("unknown pattern '{name}'"), "not_found");
+    };
+    let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
+    let model_override = body.get("model").and_then(Value::as_str);
+    let mut rendered = recipe.render(&variables, model_override);
+    // Per-call `options` (e.g. temperature) override the recipe's bound params.
+    if let Some(opts) = body.get("options").and_then(Value::as_object) {
+        let mut params = rendered
+            .params
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in opts {
+            params.insert(k.clone(), v.clone());
+        }
+        rendered.params = Some(Value::Object(params));
+    }
+    // `input` is either a bare string (→ one user message) or an OpenAI messages array.
+    let messages = match body.get("input") {
+        Some(Value::Array(arr)) => Value::Array(arr.clone()),
+        Some(Value::String(s)) => json!([{"role": "user", "content": s}]),
+        _ => json!([]),
+    };
+    let model_label = model_override.map(String::from).unwrap_or_else(|| format!("woollama/{name}"));
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return orchestrate_stream(state.clone(), rendered, messages, model_label).await;
+    }
+    match orchestrate_recipe(&state, &rendered, &messages).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => engine_err_response(e),
+    }
 }
 
 // --- POST /v1/chat/completions ------------------------------------------------
