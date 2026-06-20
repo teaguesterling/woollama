@@ -118,6 +118,53 @@ unchanged — only the URL differs.
 > The id cosmic-fabric sends is already woollama's inferencer namespace —
 > `core.py:woollama_model()` produces `ollama/...`, `anthropic/...`.
 
+## Fabric as a managed backend (woollama runs `fabric --serve` and routes to it)
+
+**Requested explicitly — do not lose fabric's capabilities.** fabric has a lot worth
+keeping: the full ~250-pattern **library**, fabric's real prompt **assembly**, named
+**contexts**, prompt **strategies**, output **language**, model-side **web search**,
+and **vision** (`fabric -a`). Rather than reimplement or drop these, woollama should be
+able to **run a `fabric --serve` instance and route to it** as a backend. This is the
+agreed *"fabric behind woollama"* architecture: cosmic-fabric talks only to woollama;
+**woollama owns the fabric deployment** (today cosmic-fabric owns it — that supervisor
+moves DOWN into woollama).
+
+So woollama has **two pattern backends**, selected per pattern/call:
+- **Native** — the directory scan + `Recipe::render` above. Lean, no fabric process,
+  naive `{{var}}` substitution. The common offline path.
+- **Fabric-routed** — woollama owns a `fabric --serve` and routes to it, gaining fabric's
+  full machinery. The same `/w1/` surface; a different backend.
+
+Design:
+1. **A `fabric` provider** (alongside ollama/anthropic in the registry). It is **NOT**
+   OpenAI-compatible — it speaks fabric's REST (`POST /chat` SSE, `GET /patterns/names`,
+   `GET /patterns/{name}`, `GET /models/names`). Config, e.g. in `inferencers.toml`:
+   ```toml
+   [inferencers.fabric]
+   kind    = "fabric"      # typed provider, not an OpenAI base_url
+   managed = true          # woollama spawns + supervises `fabric --serve`
+   # or:  url = "http://127.0.0.1:PORT"   # route to an externally-run fabric
+   ```
+2. **woollama manages the fabric process** (`managed = true`): an `ensure_serve`-style
+   supervisor *inside* woollama — pick a loopback port, `fabric --serve --address …`,
+   poll readiness, reuse across restarts. (It is exactly the supervisor cosmic-fabric has
+   today in `core.py:FabricClient.ensure_serve`; it relocates into woollama.) Or route to
+   a configured `url` for an externally-run fabric.
+3. **Patterns from fabric** — woollama sources the pattern list + assembly from the managed
+   fabric (`/patterns/names`, `/patterns/{name}`), exposing fabric's full library under
+   `/w1/patterns` and `woollama/<name>`. Alternative to / complement of the directory scan.
+4. **Advanced features pass through.** `/w1/patterns/{name}/run` accepts optional
+   `context` / `strategy` / `language` / `search`, forwarded to fabric's `/chat` when the
+   pattern's backend is fabric. (Native patterns don't support them.) This is how woollama
+   keeps these capabilities instead of dropping them.
+5. **Vision** — route image runs to the managed fabric's `-a` until woollama has native
+   multimodal; keeps vision working with zero cosmic-fabric change.
+
+**Per-pattern backend selection:** a pattern resolves to native vs fabric by its source
+(a `recipes.toml`/`[patterns]` recipe → native; a fabric-sourced pattern → fabric), or an
+explicit `backend = "fabric" | "native"` on the run call. Sensible default: fabric when a
+fabric provider is configured (full capabilities), native otherwise.
+
 ## Implementation touch points (`woollama-server/src/`)
 - **`config.rs`** — `Recipe::render`; the `[patterns]` config struct; `load_patterns()`
   + merge/precedence. (Largest change.)
@@ -125,16 +172,25 @@ unchanged — only the URL differs.
   add the 3 `/w1/...` routes + handlers (`render` calls `Recipe::render` and returns
   the prompt; `run` renders then reuses the existing dispatch; `patterns` lists). Keep
   patterns in `/v1/models`.
+- **Fabric backend** — a `fabric` provider (fabric REST client: `/chat` SSE, `/patterns`,
+  `/models`) + a `managed`-mode supervisor that spawns/owns `fabric --serve` (port the
+  ~20-line `ensure_serve` from cosmic-fabric `core.py`). Wire it as a `/w1` run/render
+  backend + a pattern source; pass `context`/`strategy`/`language`/`search`/image through
+  to fabric. (Likely its own module, e.g. `fabric.rs`.)
 - **`woollama-engine/`** — **NOT touched** (parity-locked).
 
 ## Deferred (not in the MVP)
-- **Vision** — `image_url` content parts → ollama multimodal. cosmic-fabric does
-  vision via the `fabric -a` CLI today; replacing it is independent of templating.
+- **Native multimodal** — `image_url` content parts → ollama multimodal. Until then,
+  vision is **covered by the fabric backend** (`fabric -a`), so it isn't lost.
 - **Variable metadata overlay** — defaults/choices for `/w1/patterns` (frontmatter or
   `[patterns.<name>]`).
-- **fabric advanced `/chat` features** — `context`/`strategy`/web-`search` are
-  fabric-specific and dropped; `language` becomes a `{{language}}` variable; `session`
-  is already woollama's (`/v1/responses`).
+
+> **Not dropped — provided by the fabric backend** (see above): the fabric advanced
+> features (`context` / `strategy` / `language` / `search`), the full pattern library,
+> and vision. The **native** pattern path doesn't implement them; route to the fabric
+> backend when you need them. (`session` is already woollama's via `/v1/responses`.)
+> The MVP can ship the native path first; the fabric backend can land alongside or just
+> after — but it's a first-class goal, not an afterthought.
 
 ## Verification / the executable contract
 The contract is `cosmic-fabric/src/mock-woollamad` — extend it to serve `GET
