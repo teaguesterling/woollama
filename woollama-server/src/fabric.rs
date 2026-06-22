@@ -19,8 +19,10 @@
 //! multi-second startup. It is killed only on graceful shutdown (main.rs). A hard crash leaves
 //! at most one fabric, reclaimed next start via the readiness probe.
 
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::process::Stdio;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -28,19 +30,28 @@ use tokio::sync::Mutex;
 use crate::config::FabricConfig;
 
 pub struct FabricBackend {
-    /// The fabric REST base, e.g. `http://127.0.0.1:PORT` (no trailing slash).
+    /// The fabric REST base, e.g. `http://127.0.0.1:PORT` (no trailing slash). Immutable —
+    /// managed respawns reuse the SAME address so this never changes.
     pub base: String,
     client: reqwest::Client,
-    /// The supervised child (managed mode only); killed on graceful shutdown.
+    /// The supervised child (managed mode only); killed on graceful shutdown. Also the
+    /// **heal lock**: `ensure_alive` holds it to single-flight respawns.
     child: Mutex<Option<tokio::process::Child>>,
     /// `provider(lowercased) → fabric vendor name` (e.g. `ollama → "Ollama"`), derived from
     /// fabric's own `/models/names` `vendors` keys — so the mapping tracks fabric, not a guess.
     vendor_map: HashMap<String, String>,
-    /// fabric's pattern library, cached at connect (load-once, like recipes). Used for `/w1/`
-    /// discovery + backend selection without a GET per request.
-    names: std::collections::HashSet<String>,
+    /// fabric's pattern library. Seeded at connect, then refreshed: traffic-driven on a TTL
+    /// (fabric hot-reloads its pattern dir) and after every respawn. Behind a lock so the sync
+    /// `has`/`list` can read it while a background task swaps it.
+    names: Arc<RwLock<HashSet<String>>>,
     /// Fallback inferencer for runs that omit `model` (fabric patterns have no bound one).
     default_model: Option<String>,
+    /// Whether we supervise the child and MAY respawn it (managed mode). False in url mode.
+    managed: bool,
+    /// The fabric binary to (re)spawn in managed mode.
+    command: String,
+    /// Last time the name cache was (or began) refreshing — the TTL gate for `maybe_kick_refresh`.
+    last_refresh: Arc<std::sync::Mutex<Instant>>,
 }
 
 /// `$XDG_RUNTIME_DIR/woollama.fabric-addr` — the persisted managed-fabric address (for reuse).
@@ -78,6 +89,8 @@ impl FabricBackend {
             .connect_timeout(Duration::from_secs(5))
             .build()
             .ok()?;
+        // Managed = we own (and may respawn) the child. url mode routes only, never respawns.
+        let is_managed = cfg.url.is_none() && cfg.managed;
 
         let (base, child) = if let Some(url) = &cfg.url {
             // External fabric — route to it, never spawn.
@@ -98,7 +111,7 @@ impl FabricBackend {
         };
 
         let vendor_map = Self::load_vendor_map(&client, &base).await;
-        let names: std::collections::HashSet<String> = Self::fetch_names(&client, &base).await.into_iter().collect();
+        let names: HashSet<String> = Self::fetch_names(&client, &base).await.into_iter().collect();
         eprintln!(
             "woollamad: fabric backend ready at {base} ({} patterns, {} vendors)",
             names.len(),
@@ -109,8 +122,11 @@ impl FabricBackend {
             client,
             child: Mutex::new(child),
             vendor_map,
-            names,
+            names: Arc::new(RwLock::new(names)),
             default_model: cfg.default_model,
+            managed: is_managed,
+            command: cfg.command,
+            last_refresh: Arc::new(std::sync::Mutex::new(Instant::now())),
         }))
     }
 
@@ -136,39 +152,126 @@ impl FabricBackend {
             eprintln!("woollamad: reusing live fabric at {base}");
             return Some((base, None));
         }
-
-        // PATH: prepend ~/.local/bin (fabric's common install location). fabric is the user's
-        // own tool and NEEDS provider keys to run /chat, so it inherits the full env (unlike the
-        // untrusted MCP children, which are env-scrubbed).
-        let mut path = std::env::var("PATH").unwrap_or_default();
-        if let Ok(home) = std::env::var("HOME") {
-            path = format!("{home}/.local/bin:{path}");
-        }
-        eprintln!("woollamad: spawning `{} --serve --address {addr}`", cfg.command);
-        let mut child = tokio::process::Command::new(&cfg.command)
-            .args(["--serve", "--address", &addr])
-            .env("PATH", path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            // Detached: NO kill_on_drop — survive a woollamad restart (reuse). Killed only on
-            // graceful shutdown via `shutdown()`.
-            .kill_on_drop(false)
-            .spawn()
-            .map_err(|e| eprintln!("woollamad: failed to spawn fabric: {e}"))
-            .ok()?;
-
-        // Poll readiness (~25s, like cosmic-fabric).
-        for _ in 0..50 {
-            if Self::ready(client, &base).await {
-                eprintln!("woollamad: fabric --serve is up at {base}");
-                return Some((base, Some(child)));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut child = Self::spawn_fabric(&cfg.command, &addr)?;
+        if Self::poll_ready(client, &base, 50).await {
+            eprintln!("woollamad: fabric --serve is up at {base}");
+            return Some((base, Some(child)));
         }
         eprintln!("woollamad: fabric --serve did not come up at {base} in time");
         let _ = child.kill().await;
         None
+    }
+
+    /// Spawn a detached `<command> --serve --address <addr>`. fabric is the user's own tool and
+    /// NEEDS provider keys to run `/chat`, so it inherits the full env (PATH gets ~/.local/bin
+    /// prepended — fabric's common install location). Unlike the untrusted MCP children, which
+    /// are env-scrubbed. NO `kill_on_drop`: detached so a woollamad restart can reuse it.
+    fn spawn_fabric(command: &str, addr: &str) -> Option<tokio::process::Child> {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        if let Ok(home) = std::env::var("HOME") {
+            path = format!("{home}/.local/bin:{path}");
+        }
+        eprintln!("woollamad: spawning `{command} --serve --address {addr}`");
+        tokio::process::Command::new(command)
+            .args(["--serve", "--address", addr])
+            .env("PATH", path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false)
+            .spawn()
+            .map_err(|e| eprintln!("woollamad: failed to spawn fabric: {e}"))
+            .ok()
+    }
+
+    /// Poll `ready` up to `tries` times, 500ms apart (~25s at 50) — fabric's startup window.
+    async fn poll_ready(client: &reqwest::Client, base: &str, tries: u32) -> bool {
+        for _ in 0..tries {
+            if Self::ready(client, base).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    /// Re-probe fabric and, in managed mode, respawn a dead/hung child on the SAME address.
+    /// Single-flight via the `child` lock: concurrent callers serialize, and each re-probes
+    /// first, so only the one that still finds fabric down does the kill+respawn. Returns whether
+    /// fabric is live afterward. url mode (not ours) can only re-probe — it never respawns.
+    async fn ensure_alive(&self) -> bool {
+        let mut guard = self.child.lock().await;
+        if Self::ready(&self.client, &self.base).await {
+            return true; // already healthy (or a concurrent caller just healed it)
+        }
+        if !self.managed {
+            return false; // url mode: not ours to respawn
+        }
+        // Reap the stale/hung child BEFORE rebinding — else the held port → "address in use".
+        if let Some(mut old) = guard.take() {
+            let _ = old.kill().await;
+        }
+        let addr = self.base.strip_prefix("http://").unwrap_or(&self.base).to_string();
+        let Some(mut child) = Self::spawn_fabric(&self.command, &addr) else {
+            return false;
+        };
+        if Self::poll_ready(&self.client, &self.base, 50).await {
+            *guard = Some(child);
+            // Re-source names across the restart (patterns may have been gained/lost).
+            Self::refresh_names_into(&self.client, &self.base, &self.names).await;
+            eprintln!("woollamad: fabric respawned at {}", self.base);
+            true
+        } else {
+            let _ = child.kill().await;
+            false
+        }
+    }
+
+    /// Re-fetch fabric's pattern list and swap it into the shared cache. Never panics (runs in a
+    /// detached task). An empty result (transient failure / fabric momentarily down) does NOT
+    /// wipe the cache — we keep the last-known-good names.
+    async fn refresh_names_into(client: &reqwest::Client, base: &str, names: &RwLock<HashSet<String>>) {
+        let fresh: HashSet<String> = Self::fetch_names(client, base).await.into_iter().collect();
+        if fresh.is_empty() {
+            return;
+        }
+        if let Ok(mut w) = names.write() {
+            *w = fresh;
+        }
+    }
+
+    /// The name-cache TTL — default 60s, overridable via `WOOLLAMA_FABRIC_REFRESH_SECS` (0 =
+    /// refresh on every read, for tests).
+    fn refresh_ttl() -> Duration {
+        std::env::var("WOOLLAMA_FABRIC_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    /// Traffic-driven, single-flight name refresh. If the TTL has elapsed, claim the slot and
+    /// spawn a detached re-source; otherwise a cheap no-op. fabric hot-reloads its pattern dir,
+    /// so this picks up patterns gained/lost without a restart — eventually: the triggering call
+    /// still sees the pre-refresh cache, the next one sees the update.
+    fn maybe_kick_refresh(&self) {
+        {
+            let Ok(mut lr) = self.last_refresh.lock() else {
+                return;
+            };
+            if lr.elapsed() < Self::refresh_ttl() {
+                return;
+            }
+            *lr = Instant::now(); // claim before spawning — single-flight the kick
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            let base = self.base.clone();
+            let names = self.names.clone();
+            handle.spawn(async move {
+                Self::refresh_names_into(&client, &base, &names).await;
+            });
+        }
     }
 
     /// Address precedence: explicit `address` config; else a persisted port from a prior run
@@ -284,16 +387,20 @@ impl FabricBackend {
             })?,
         };
         let (provider, bare) = model.split_once('/').unwrap_or(("", model));
+        // fabric is pattern + single-input oriented: `/chat` takes ONE `userInput` string, not a
+        // turn list. For an OpenAI-style messages array we concatenate every USER message's text
+        // (older code kept only the LAST, silently dropping the rest). Non-user turns
+        // (assistant/system) are NOT sent — fabric patterns operate on raw content, and role
+        // scaffolding would change what the pattern sees. Multi-turn assistant context is lost on
+        // this path by design; a client needing it should use `/fabric/*` (native fabric) directly.
         let user_input = match body.get("input") {
             Some(Value::String(s)) => s.clone(),
-            // last user message's content (fabric is pattern + single-input oriented).
             Some(Value::Array(arr)) => arr
                 .iter()
-                .rev()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .and_then(|m| m.get("content").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_string(),
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                .filter_map(|m| m.get("content").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             _ => String::new(),
         };
         let mut prompt = serde_json::json!({
@@ -355,22 +462,38 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
     fn list(&self) -> Vec<crate::pattern_backend::PatternInfo> {
         // Names only — scanning ~250 patterns' systems per discovery call is too costly;
         // variables resolve on render/run.
+        self.maybe_kick_refresh();
         self.names
-            .iter()
-            .map(|n| crate::pattern_backend::PatternInfo {
-                name: n.clone(),
-                variables: Vec::new(),
-                source: "fabric".to_string(),
+            .read()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|n| crate::pattern_backend::PatternInfo {
+                        name: n.clone(),
+                        variables: Vec::new(),
+                        source: "fabric".to_string(),
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default()
     }
 
     fn has(&self, name: &str) -> bool {
-        self.names.contains(name)
+        self.maybe_kick_refresh();
+        self.names.read().map(|n| n.contains(name)).unwrap_or(false)
     }
 
     async fn render(&self, name: &str, variables: &serde_json::Map<String, Value>) -> Option<String> {
-        let system = self.pattern_system(name).await?;
+        let system = match self.pattern_system(name).await {
+            Some(s) => s,
+            // Could be a genuine 404, or fabric is down — try to heal, then retry once.
+            None => {
+                if !self.ensure_alive().await {
+                    return None;
+                }
+                self.pattern_system(name).await?
+            }
+        };
         Some(crate::config::render_system(&system, variables))
     }
 
@@ -391,14 +514,22 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
         let model = body.get("model").and_then(Value::as_str).unwrap_or(name).to_string();
         let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
+        // A transport error may mean fabric died — try to heal (respawn in managed mode) and
+        // retry once before giving up.
         let resp = match self.chat(&fbody).await {
             Ok(r) => r,
             Err(e) => {
-                return (
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    axum::Json(serde_json::json!({"error": {"message": format!("fabric chat error: {e}"), "type": "server_error"}})),
-                )
-                    .into_response()
+                let retry = if self.ensure_alive().await { self.chat(&fbody).await.ok() } else { None };
+                match retry {
+                    Some(r) => r,
+                    None => {
+                        return (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            axum::Json(serde_json::json!({"error": {"message": format!("fabric chat error: {e}"), "type": "server_error"}})),
+                        )
+                            .into_response()
+                    }
+                }
             }
         };
         if !resp.status().is_success() {
@@ -498,7 +629,13 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
         body: bytes::Bytes,
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
-        match self.forward(method, path_and_query, content_type, body).await {
+        // Heal-and-retry once on a transport error (fabric may have died). Bytes clone is cheap
+        // (refcounted), so the body can be replayed for the retry.
+        let mut result = self.forward(method.clone(), path_and_query, content_type, body.clone()).await;
+        if result.is_err() && self.ensure_alive().await {
+            result = self.forward(method, path_and_query, content_type, body).await;
+        }
+        match result {
             Ok(resp) => crate::pattern_backend::stream_reqwest(resp),
             Err(e) => (
                 axum::http::StatusCode::BAD_GATEWAY,

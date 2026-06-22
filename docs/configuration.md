@@ -127,6 +127,16 @@ transparently proxied at `/fabric/*`. woollama either spawns + supervises
 > a fabric entry there would break config load. The fabric backend is a
 > server-layer plugin, not an engine inferencer.
 
+**Resilience.** The fabric pattern list is cached and kept fresh two ways: it is
+**re-sourced on a TTL** as requests arrive (fabric hot-reloads its pattern dir, so
+patterns added/removed at runtime show up — eventually; the triggering call still
+sees the prior list), and it is re-sourced after any respawn. In **managed** mode a
+dead or hung fabric is **respawned on the same address and the request retried
+once** (single-flight, so concurrent requests don't race spawns); in `url` mode
+woollama re-probes but never respawns (the process isn't woollama's to own). The
+TTL defaults to 60s; override with the env var `WOOLLAMA_FABRIC_REFRESH_SECS`
+(`0` = refresh on every read).
+
 Omitted (the default) ⇒ no fabric backend. See [Pattern templating](patterns.md)
 for the `/w1/` + `/fabric/` surfaces, and [Extending woollama](extending.md) to
 add your own backend.

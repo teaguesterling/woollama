@@ -82,6 +82,13 @@ parsers work unchanged — only the URL differs.
 - For a **fabric-backed** pattern (which has no bound inferencer), `model` is
   required unless `fabric.default_model` is set.
 - `options` (e.g. `temperature`) are merged into the inference request.
+- **`input` as a messages array, for fabric patterns:** fabric's `/chat` takes a
+  single `userInput` string, so woollama concatenates every `user` message's text
+  (`\n\n`-joined). Non-user turns (assistant/system) are **not** sent — fabric
+  patterns operate on raw content, and role scaffolding would change what the
+  pattern sees. If you need full multi-turn context, talk to fabric directly via
+  [`/fabric/*`](#the-fabric-backend). (Native recipes run through the engine and
+  keep the messages array intact.)
 
 ## MCP prompts get the same templating
 
