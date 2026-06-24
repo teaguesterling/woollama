@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## v0.6.0 — 2026-06-22
+
+**Pattern templating (`/w1/`) + the fabric backend.** woollama can now own prompt
+templating and front a full fabric deployment, behind a pluggable backend seam.
+
+- **`/w1/` — woollama-native pattern templating.** A namespace parallel to `/v1/`:
+  `GET /w1/patterns` (discovery), `POST /w1/patterns/{name}/render` (substitute
+  `{{vars}}` without running), `POST /w1/patterns/{name}/run` (render then infer →
+  an OpenAI completion/SSE). Patterns *are* recipes — a recipe whose `system`
+  carries `{{var}}` tokens — plus an optional fabric-style `[patterns]` directory
+  scan. Substitution is byte-compatible with fabric's (a dumb `{{k}}`→value
+  replace); the engine never sees a `{{var}}`.
+- **MCP prompts.** Recipes are exposed as MCP prompts on `/mcp`; their `{{var}}`
+  tokens become prompt arguments and `prompts/get` renders them.
+- **The fabric backend.** An optional `fabric` key in `mcp.json`: woollama spawns +
+  supervises a `fabric --serve` (managed; reuse + graceful-kill) or routes to an
+  external one (`url`). It **merges** fabric's ~250-pattern library into
+  `/w1/patterns` (a `recipes.toml` recipe wins on a name collision) and
+  **reverse-proxies fabric's REST verbatim at `/fabric/*`** (SSE, advanced
+  `context`/`strategy`/`language`/`search`, and vision all pass through). On the
+  `/w1` path, fabric's native SSE is translated to/from the OpenAI shape.
+- **`PatternBackend` plugin seam.** Additional non-OpenAI prompt/inference systems
+  plug in behind one trait + a single composition root; native recipes stay the
+  built-in core, and the fabric backend is the reference impl. See
+  `docs/extending.md`.
+- **Self-healing fabric.** The pattern cache re-sources on a TTL
+  (`WOOLLAMA_FABRIC_REFRESH_SECS`, default 60s — fabric hot-reloads its pattern
+  dir) and after every respawn; a dead/hung **managed** fabric is respawned on the
+  same address and the request retried once (single-flight, kill-before-rebind).
+  `url` mode re-probes but never respawns a process it doesn't own.
+- **Version family realigned to 0.6.0** across `woollama-engine`,
+  `woollama-server`, `woollama-core`, and the `woollama` Python dist (the Rust
+  crates had lagged at 0.5.0, the wheels at 0.5.3).
+
+Docs: `docs/patterns.md` (the `/w1/` + `/fabric/` reference), `docs/extending.md`
+(adding a backend), `docs/configuration.md` (the `fabric` key + resilience).
+
 ## v0.5.0 — 2026-06-14
 
 **The Rust cutover.** woollama is now the Rust daemon **`woollamad`** (the

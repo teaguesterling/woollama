@@ -1,6 +1,6 @@
 [package]
 name = "woollama-core"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "The embeddable woollama model-management core (Rust) — start of the v1.0 port."
 license = "MIT"
@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 # The pure-Rust engine (no pyo3) lives in woollama-engine now; this crate is just
 # the thin PyO3 wrapper that wires it to Python (InferenceError, PyToolProvider, the
 # async-iterator pyclasses, the pyfunctions).
-woollama-engine = { path = "../woollama-engine", version = "0.5.0" }
+woollama-engine = { path = "../woollama-engine", version = "0.6.0" }
 # NOTE: abi3 (stable ABI) is NOT usable here — `InferenceError` is
 # `#[pyclass(extends = PyException, subclass)]`, and the limited API can't subclass built-in
 # exception types. So wheels are built per CPython version (see .github/workflows/wheels.yml).
