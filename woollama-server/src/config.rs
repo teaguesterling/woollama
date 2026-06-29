@@ -44,6 +44,28 @@ pub struct Recipe {
     pub tools: Vec<String>,
     pub params: Option<Value>,
     pub source: PatternSource,
+    /// Optional per-variable metadata, keyed by variable name, from
+    /// `[recipes.<name>.variables.<var>]` in recipes.toml. A **server-layer overlay** only:
+    /// it enriches `/w1/patterns` discovery (defaults/choices/description) and supplies
+    /// `default`s at render time, but is never sent to the parity-locked engine
+    /// (`to_value` ignores it). [`scan_vars`] stays authoritative for *which* `{{var}}`s
+    /// exist and their order; an entry whose name isn't in `system` is simply unused.
+    /// Native recipes only — fabric patterns carry no metadata (always empty).
+    pub variables: HashMap<String, VarMeta>,
+}
+
+/// Author-supplied metadata for one `{{var}}` of a native recipe. Every field is optional;
+/// absent fields are omitted from the `/w1/patterns` JSON (no `null` noise).
+#[derive(Clone, Default)]
+pub struct VarMeta {
+    /// Value to substitute when the caller doesn't supply this variable. Caller-supplied
+    /// always wins; a variable with no default and no caller value is left verbatim.
+    pub default: Option<Value>,
+    /// The allowed values, surfaced for discovery (so a UI can render a picker). **Not**
+    /// server-enforced — a caller may still pass a value outside this list.
+    pub choices: Option<Vec<Value>>,
+    /// Human-readable description of the variable.
+    pub description: Option<String>,
 }
 
 impl Recipe {
@@ -73,7 +95,23 @@ impl Recipe {
             tools: self.tools.clone(),
             params: self.params.clone(),
             source: self.source,
+            variables: self.variables.clone(),
         }
+    }
+
+    /// Merge author-configured `default`s into the caller's variables for a native recipe:
+    /// any variable with a configured default that the caller did **not** supply gets the
+    /// default. Caller-supplied always wins; a variable with no default stays absent (and is
+    /// left verbatim by [`render_system`]). The one place defaults are applied — both
+    /// `/w1/patterns/{name}/render` and `/run` route through it so they can't diverge.
+    pub fn apply_defaults(&self, variables: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+        let mut merged = variables.clone();
+        for (name, meta) in &self.variables {
+            if let Some(def) = &meta.default {
+                merged.entry(name.clone()).or_insert_with(|| def.clone());
+            }
+        }
+        merged
     }
 }
 
@@ -96,8 +134,10 @@ pub fn render_system(system: &str, variables: &serde_json::Map<String, Value>) -
 /// The variable names a pattern exposes — every distinct `{{name}}` token scanned from a
 /// system prompt, in first-seen order. A name is accepted only if it is non-empty and made
 /// of identifier chars (`[A-Za-z0-9_.-]`), so prose like `{{ not a var }}` is ignored.
-/// fabric patterns carry no variable metadata, so names are all `/w1/patterns` can honestly
-/// surface (no defaults/choices — that's a later optional overlay).
+/// This is authoritative for *which* variables a pattern exposes and their order; native
+/// recipes may additionally carry a [`Recipe::variables`] metadata overlay (defaults/
+/// choices/description), keyed by these names. fabric patterns carry no overlay, so names
+/// are all `/w1/patterns` surfaces for them.
 pub fn scan_vars(system: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let bytes = system.as_bytes();
@@ -190,11 +230,34 @@ pub fn load_recipes() -> Result<HashMap<String, Recipe>, String> {
                         .unwrap_or_default(),
                     params: r.get("params").filter(|p| !p.is_null()).cloned(),
                     source: PatternSource::Recipe,
+                    variables: parse_var_meta(r.get("variables")),
                 },
             );
         }
     }
     Ok(out)
+}
+
+/// Parse a `[recipes.<name>.variables]` table (var-name → `{default, choices, description}`)
+/// into the [`Recipe::variables`] overlay. Anything that isn't a table, or a var entry that
+/// isn't a table, yields an empty map / skipped entry — a malformed overlay degrades to
+/// name-only discovery rather than failing the whole recipe load.
+fn parse_var_meta(v: Option<&Value>) -> HashMap<String, VarMeta> {
+    let mut out = HashMap::new();
+    if let Some(table) = v.and_then(Value::as_object) {
+        for (name, meta) in table {
+            let Some(meta) = meta.as_object() else { continue };
+            out.insert(
+                name.clone(),
+                VarMeta {
+                    default: meta.get("default").filter(|d| !d.is_null()).cloned(),
+                    choices: meta.get("choices").and_then(Value::as_array).cloned(),
+                    description: meta.get("description").and_then(Value::as_str).map(String::from),
+                },
+            );
+        }
+    }
+    out
 }
 
 /// Expand a leading `~` / `~/` in a config path against `$HOME`. (`${VAR}` is handled
@@ -258,6 +321,7 @@ pub fn load_patterns() -> Result<HashMap<String, Recipe>, String> {
                 tools: Vec::new(),
                 params: None,
                 source: PatternSource::Fabric,
+                variables: HashMap::new(),
             },
         );
     }
@@ -371,6 +435,7 @@ mod tests {
             tools: vec![],
             params: None,
             source: PatternSource::Recipe,
+            variables: HashMap::new(),
         }
     }
 
@@ -413,6 +478,50 @@ mod tests {
     #[test]
     fn scan_vars_empty_when_none() {
         assert!(scan_vars("plain prompt, no tokens").is_empty());
+    }
+
+    #[test]
+    fn parse_var_meta_reads_default_choices_description() {
+        // toml → serde_json::Value, the same path load_recipes uses.
+        let v: Value = toml::from_str(
+            r#"
+            [tone]
+            default = "neutral"
+            choices = ["neutral", "terse"]
+            description = "Writing tone"
+            [depth]
+            choices = [1, 2, 3]
+            "#,
+        )
+        .unwrap();
+        let m = parse_var_meta(Some(&v));
+        let tone = m.get("tone").unwrap();
+        assert_eq!(tone.default, Some(json!("neutral")));
+        assert_eq!(tone.choices, Some(vec![json!("neutral"), json!("terse")]));
+        assert_eq!(tone.description.as_deref(), Some("Writing tone"));
+        let depth = m.get("depth").unwrap();
+        assert_eq!(depth.default, None); // absent → None (no `null` noise downstream)
+        assert_eq!(depth.choices, Some(vec![json!(1), json!(2), json!(3)]));
+        // Malformed / missing overlay degrades to empty, never panics.
+        assert!(parse_var_meta(None).is_empty());
+        assert!(parse_var_meta(Some(&json!("not a table"))).is_empty());
+    }
+
+    #[test]
+    fn apply_defaults_fills_only_unsupplied_with_a_configured_default() {
+        let mut r = recipe("You are a {{tone}} {{role}} about {{topic}}.");
+        r.variables.insert("tone".into(), VarMeta { default: Some(json!("neutral")), ..Default::default() });
+        r.variables.insert("role".into(), VarMeta { default: Some(json!("assistant")), ..Default::default() });
+        // `topic` has metadata but NO default → never auto-filled.
+        r.variables.insert("topic".into(), VarMeta { description: Some("subject".into()), ..Default::default() });
+
+        let mut supplied = serde_json::Map::new();
+        supplied.insert("tone".into(), json!("wry")); // caller value must win over the default
+        let merged = r.apply_defaults(&supplied);
+
+        assert_eq!(merged.get("tone"), Some(&json!("wry")), "caller-supplied wins");
+        assert_eq!(merged.get("role"), Some(&json!("assistant")), "unsupplied default filled");
+        assert_eq!(merged.get("topic"), None, "no default ⇒ left unset (render keeps it verbatim)");
     }
 
     #[test]

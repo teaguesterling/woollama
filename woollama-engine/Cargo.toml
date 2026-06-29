@@ -1,6 +1,6 @@
 [package]
 name = "woollama-engine"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "The pure-Rust woollama engine (no PyO3): inferencer registry, complete/stream, the recipe<->tool orchestrate loop. Consumed by the woollama-core wheel and the woollamad daemon (woollama-server crate)."
 license = "MIT"

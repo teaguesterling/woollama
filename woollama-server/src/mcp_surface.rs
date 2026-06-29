@@ -159,7 +159,19 @@ impl ServerHandler for WoollamaMcp {
                 let args: Option<Vec<PromptArgument>> = if vars.is_empty() {
                     None
                 } else {
-                    Some(vars.into_iter().map(PromptArgument::new).collect())
+                    // Carry the recipe's `[variables.<var>] description` overlay across to the
+                    // MCP argument, so an MCP client sees the same docs as `/w1/patterns`.
+                    Some(
+                        vars.into_iter()
+                            .map(|v| {
+                                let arg = PromptArgument::new(&v);
+                                match recipe.variables.get(&v).and_then(|m| m.description.as_deref()) {
+                                    Some(desc) => arg.with_description(desc),
+                                    None => arg,
+                                }
+                            })
+                            .collect(),
+                    )
                 };
                 Prompt::new(name.clone(), Some(format!("woollama recipe '{name}' — its system prompt")), args)
             })
@@ -176,9 +188,12 @@ impl ServerHandler for WoollamaMcp {
             return Err(McpError::invalid_params(format!("unknown recipe '{}'", req.name), None));
         };
         // Substitute the supplied arguments into `{{var}}` (the same `Recipe::render` the
-        // `/w1/` surface uses). Unsupplied tokens stay verbatim. MCP prompt roles are only
-        // User/Assistant — there is no System role — so the system prompt is returned as User.
-        let args = req.arguments.unwrap_or_default();
+        // `/w1/` surface uses), filling author-configured defaults for omitted variables via
+        // the SAME `apply_defaults` the HTTP render/run sites use — so an MCP client and an
+        // HTTP client see identical output for the same recipe. A variable with no default and
+        // no supplied value stays verbatim. MCP prompt roles are only User/Assistant — there
+        // is no System role — so the system prompt is returned as User.
+        let args = recipe.apply_defaults(&req.arguments.unwrap_or_default());
         let rendered = recipe.render(&args, None);
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(
             PromptMessageRole::User,

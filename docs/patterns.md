@@ -44,14 +44,29 @@ addressable there — see below).
 ```jsonc
 → { "data": [
      { "name": "scribe-summarize",
-       "variables": ["depth", "language"],   // {{...}} tokens scanned from the system prompt
-       "source": "recipe" }                   // or "fabric"
+       "variables": [                          // one object per {{...}} token, in prompt order
+         { "name": "depth",
+           "default": "normal",                // optional — applied at render/run when unset
+           "choices": ["normal", "ultra"],     // optional — surfaced for UIs; NOT enforced
+           "description": "How deep to go" },  // optional
+         { "name": "language" }                // a token with no overlay is just its name
+       ],
+       "source": "recipe" }                     // or "fabric"
    ] }
 ```
 
-Variable *names* are scanned from `{{...}}` in the system prompt. (fabric-library
-patterns are listed by name with `variables: []` — scanning the whole library on
-every call is too costly; their variables resolve on render/run.)
+Each `{{...}}` token in the system prompt becomes a `variables` entry, in
+first-seen order. The `name` is always present; `default`/`choices`/`description`
+appear only when a recipe declares them (see the `[recipes.<name>.variables.<var>]`
+overlay in [configuration.md](configuration.md#recipestoml)). Absent fields are
+omitted — no `null` noise. (fabric-library patterns are listed by name with
+`variables: []` — scanning the whole library on every call is too costly, and
+fabric patterns carry no overlay; their variables resolve on render/run.)
+
+The overlay is metadata, not enforcement: `choices` is advisory (a caller may pass
+a value outside it), but a `default` **is** applied — if the caller omits a
+variable that has one, `render` and `run` substitute the default before dispatch
+(a caller-supplied value always wins; a variable with no default is left verbatim).
 
 ### `POST /w1/patterns/{name}/render` — render without running
 
@@ -93,10 +108,12 @@ parsers work unchanged — only the URL differs.
 ## MCP prompts get the same templating
 
 Recipes are also exposed as **MCP prompts** on the `/mcp` surface. Their `{{var}}`
-tokens are advertised as prompt **arguments**, and `prompts/get` renders the
-pattern with the arguments you supply. So an MCP client (Claude Desktop, etc.)
-gets the same parameterized templating as `/w1` — MCP covers *render*; *run* is
-the `chat` verb.
+tokens are advertised as prompt **arguments** (carrying the variable
+`description` from the metadata overlay), and `prompts/get` renders the pattern
+with the arguments you supply — applying the same variable `default`s as the HTTP
+surface for any argument you omit. So an MCP client (Claude Desktop, etc.) gets the
+same parameterized templating as `/w1` — MCP covers *render*; *run* is the `chat`
+verb.
 
 ## The fabric backend
 

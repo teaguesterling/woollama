@@ -168,6 +168,36 @@ tools = ["hello.count_to"]
 > tokens that the [pattern surface](patterns.md) substitutes per call (and that
 > MCP clients see as prompt arguments). Plain recipes simply have no `{{var}}`.
 
+#### `[recipes.<name>.variables.<var>]` — variable metadata (optional)
+
+Annotate a recipe's `{{var}}` tokens with a default, an allowed-value list, and a
+description. Each field is optional, and the whole overlay is optional — a recipe
+with no `[variables]` table behaves exactly as before (bare names).
+
+```toml
+[recipes.streamer]
+inferencer = "ollama/qwen3:14b-iq4xs"
+system = "Write a {{tone}} summary in {{language}}."
+
+[recipes.streamer.variables.tone]
+default = "neutral"                      # used when the caller omits {{tone}}
+choices = ["neutral", "terse", "wry"]    # surfaced for UIs; NOT enforced
+description = "Writing tone"
+# {{language}} needs no annotation — it stays a name-only variable.
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `default` | — | Value substituted when the caller doesn't supply this variable on `render`/`run`. A caller-supplied value always wins; a variable with no default is left verbatim. |
+| `choices` | — | The allowed values, surfaced in `/w1/patterns` discovery (e.g. for a UI picker). **Advisory only** — not server-enforced, so a caller may still pass a value outside the list. |
+| `description` | — | Human-readable docs; shown in `/w1/patterns` and carried across to the MCP prompt argument. |
+
+The overlay is keyed by variable name; the `{{var}}` tokens in `system` stay
+authoritative for *which* variables exist and their order. An entry whose name
+isn't actually in `system` is simply unused. Metadata applies to **native recipes
+only** — fabric-library patterns carry none. See the
+[`GET /w1/patterns`](patterns.md#get-w1patterns--discovery) shape for how it surfaces.
+
 ### `[patterns]` — a fabric-style pattern directory (optional)
 
 Discover patterns from a directory of `<name>/system.md` files (e.g. fabric's
