@@ -611,16 +611,45 @@ fn fnmatch(pattern: &str, name: &str) -> bool {
 // render substitutes `{{var}}`, then the EXISTING orchestration path runs. Patterns also
 // stay in `/v1/models` as `woollama/<name>` for OpenAI-client addressability.
 
-/// `GET /w1/patterns` — discovery. Native recipes (with scanned `{{var}}` names) + fabric's
-/// library (source `"fabric"`). On a name collision the native recipe WINS (recipes.toml/dir
-/// scan override an auto-sourced fabric pattern), so it is the one listed.
+/// The `variables` array a native recipe surfaces in `/w1/patterns`: one object per scanned
+/// `{{var}}` (in [`config::scan_vars`] order), enriched with the recipe's
+/// [`config::Recipe::variables`] overlay (`default`/`choices`/`description`). Absent metadata
+/// fields are omitted, so a plain `{{var}}` with no overlay is just `{"name": "x"}`. The list
+/// is driven by `scan_vars` (what the template actually uses); an overlay entry whose name
+/// isn't in the system is dropped (we never advertise a variable that substitutes nothing).
+fn w1_variable_infos(recipe: &config::Recipe) -> Vec<Value> {
+    config::scan_vars(&recipe.system)
+        .into_iter()
+        .map(|name| {
+            let mut obj = serde_json::Map::new();
+            if let Some(meta) = recipe.variables.get(&name) {
+                if let Some(default) = &meta.default {
+                    obj.insert("default".into(), default.clone());
+                }
+                if let Some(choices) = &meta.choices {
+                    obj.insert("choices".into(), Value::Array(choices.clone()));
+                }
+                if let Some(description) = &meta.description {
+                    obj.insert("description".into(), json!(description));
+                }
+            }
+            obj.insert("name".into(), json!(name));
+            Value::Object(obj)
+        })
+        .collect()
+}
+
+/// `GET /w1/patterns` — discovery. Native recipes (with scanned `{{var}}` names + any
+/// metadata overlay) + fabric's library (source `"fabric"`, names only). On a name collision
+/// the native recipe WINS (recipes.toml/dir scan override an auto-sourced fabric pattern), so
+/// it is the one listed.
 async fn w1_patterns(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut entries: Vec<(&String, &config::Recipe)> = state.recipes.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut data: Vec<Value> = entries
         .iter()
         .map(|(name, r)| {
-            json!({"name": name, "variables": config::scan_vars(&r.system), "source": r.source.as_str()})
+            json!({"name": name, "variables": w1_variable_infos(r), "source": r.source.as_str()})
         })
         .collect();
     // Pluggable backends, after native (native recipes win on a name collision, then
@@ -649,6 +678,8 @@ async fn w1_render(
     let input = body.get("input").and_then(Value::as_str).unwrap_or("");
     // Native recipe WINS on a name collision; else the first backend that has it.
     let system = if let Some(recipe) = state.recipes.get(&name) {
+        // Fill author-configured defaults for any variable the caller didn't supply.
+        let variables = recipe.apply_defaults(&variables);
         Some(config::render_system(&recipe.system, &variables))
     } else {
         let mut rendered = None;
@@ -691,6 +722,9 @@ async fn w1_run(
 /// options overrides, then the existing orchestration/streaming dispatch).
 async fn w1_run_native(state: &Arc<AppState>, recipe: &config::Recipe, name: &str, body: &Value) -> Response {
     let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
+    // Fill author-configured defaults for any variable the caller didn't supply (the same
+    // overlay `/w1/patterns/{name}/render` applies — both route through `apply_defaults`).
+    let variables = recipe.apply_defaults(&variables);
     let model_override = body.get("model").and_then(Value::as_str);
     let mut rendered = recipe.render(&variables, model_override);
     // Per-call `options` (e.g. temperature) override the recipe's bound params.

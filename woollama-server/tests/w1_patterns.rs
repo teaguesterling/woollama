@@ -35,11 +35,25 @@ async fn w1_patterns_discover_render_and_run() {
     );
     let upstream_url = spawn(upstream).await;
 
-    // A recipe whose system carries a {{tone}} token → it doubles as a /w1 pattern.
+    // `summarize` carries a {{tone}} token with a metadata overlay (default/choices/
+    // description); `plain` carries a {{x}} token with NO overlay (the name-only case).
     let cfg = tempfile::tempdir().unwrap();
     std::fs::write(
         cfg.path().join("recipes.toml"),
-        "[recipes.summarize]\ninferencer=\"ollama/m\"\nsystem=\"You are a {{tone}} summarizer.\"\n",
+        r#"
+[recipes.summarize]
+inferencer = "ollama/m"
+system = "You are a {{tone}} summarizer."
+
+[recipes.summarize.variables.tone]
+default = "neutral"
+choices = ["neutral", "terse", "wry"]
+description = "Writing tone"
+
+[recipes.plain]
+inferencer = "ollama/m"
+system = "Plain {{x}}."
+"#,
     )
     .unwrap();
     std::fs::write(cfg.path().join("mcp.json"), json!({"mcpServers": {}}).to_string()).unwrap();
@@ -50,18 +64,34 @@ async fn w1_patterns_discover_render_and_run() {
     let base = spawn(woollama_server::router(state)).await;
     let c = reqwest::Client::new();
 
-    // 1) discovery — name, scanned variables, source.
+    // 1) discovery — name, variables (enriched objects, metadata overlaid by name), source.
     let r = c.get(format!("{base}/w1/patterns")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let body: Value = r.json().await.unwrap();
-    let entry = body["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["name"] == "summarize")
-        .expect("summarize pattern listed");
-    assert_eq!(entry["variables"], json!(["tone"]));
+    let find = |name: &str| {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} pattern listed"))
+            .clone()
+    };
+    let entry = find("summarize");
+    // A variable WITH an overlay carries default/choices/description; object field order is
+    // irrelevant (Value equality is content-based).
+    assert_eq!(
+        entry["variables"],
+        json!([{
+            "name": "tone",
+            "default": "neutral",
+            "choices": ["neutral", "terse", "wry"],
+            "description": "Writing tone"
+        }])
+    );
     assert_eq!(entry["source"], "recipe");
+    // A variable with NO overlay is just `{"name": ...}` — no null default/choices noise.
+    assert_eq!(find("plain")["variables"], json!([{"name": "x"}]));
 
     // 2) render-without-run — substitute {{tone}} + append input, no model run.
     let r = c
@@ -74,6 +104,17 @@ async fn w1_patterns_discover_render_and_run() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["prompt"], "You are a terse summarizer.\n\nthe news");
 
+    // 2b) render with the variable OMITTED — the author's `default` ("neutral") is applied.
+    let r = c
+        .post(format!("{base}/w1/patterns/summarize/render"))
+        .json(&json!({"input": "the news"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["prompt"], "You are a neutral summarizer.\n\nthe news", "default applied when unset");
+
     // 3) templated run — substitution reaches the inferencer (echoed system proves it).
     let r = c
         .post(format!("{base}/w1/patterns/summarize/run"))
@@ -85,6 +126,19 @@ async fn w1_patterns_discover_render_and_run() {
     let body: Value = r.json().await.unwrap();
     let content = body["choices"][0]["message"]["content"].as_str().unwrap();
     assert_eq!(content, "You are a terse summarizer.|model=m|temp=null", "got: {content}");
+
+    // 3b) run with the variable OMITTED — default reaches the inferencer too (the run site
+    // applies the SAME overlay as render; they must not diverge).
+    let r = c
+        .post(format!("{base}/w1/patterns/summarize/run"))
+        .json(&json!({"input": "x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: Value = r.json().await.unwrap();
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(content, "You are a neutral summarizer.|model=m|temp=null", "default reaches run");
 
     // 4) per-call model + options overrides — model replaces the bound inferencer; options
     // (temperature) merge into the upstream request body.

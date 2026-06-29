@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.7.0 — 2026-06-29
+
+**Breaking:** `GET /w1/patterns` `variables` changes shape — bare name strings
+become objects (`{name, default?, choices?, description?}`). Clients that read only
+the variable `name` (e.g. cosmic-fabric's `WoollamaClient`) are unaffected; any
+client that consumed `variables` as a `string[]` must update.
+
+- **Variable-metadata overlay for `/w1/` patterns.** Native recipes can annotate
+  their `{{var}}` tokens with a `default`, `choices`, and `description` via an
+  optional `[recipes.<name>.variables.<var>]` table in `recipes.toml`. `GET
+  /w1/patterns` now surfaces `variables` as objects (`{name, default?, choices?,
+  description?}`, absent fields omitted) instead of bare name strings; `default`s
+  are applied wherever a recipe renders — `/w1/.../render`, `/w1/.../run`, and the
+  MCP `prompts/get` surface — when the caller omits a variable (caller-supplied
+  wins; `choices` is advisory, not enforced); `description` carries across to the
+  MCP prompt argument. fabric-library patterns are unaffected (still `[]`).
+
 ## v0.6.0 — 2026-06-22
 
 **Pattern templating (`/w1/`) + the fabric backend.** woollama can now own prompt
