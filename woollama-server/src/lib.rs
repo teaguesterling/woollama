@@ -213,7 +213,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("/{id}/"), any(backend_proxy))
             .route(&format!("/{id}/{{*rest}}"), any(backend_proxy));
     }
-    router.nest_service("/mcp", mcp_svc).with_state(state)
+    // Raise the request-body cap from axum's 2 MiB default: base64-encoded vision images
+    // (`image_url` data-URLs on `/w1/.../run` and `/v1/chat/completions`) routinely exceed it, so
+    // a real photo would 413 before reaching the model. 32 MiB comfortably holds a max-size image
+    // (`fabric::MAX_IMAGE_BYTES` = 20 MiB decoded ≈ 27 MiB base64) plus the JSON envelope.
+    router
+        .nest_service("/mcp", mcp_svc)
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+        .with_state(state)
 }
 
 /// Serve woollama's MCP surface over stdio — the `woollamad mcp` subcommand (what
