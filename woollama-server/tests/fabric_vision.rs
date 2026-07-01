@@ -133,5 +133,22 @@ async fn fabric_vision_routes_image_input_through_the_cli() {
     let body: Value = r.json().await.unwrap();
     assert!(body["error"]["message"].as_str().unwrap_or("").contains("image_url"), "clear error");
 
+    // 5) A >2 MiB image body must NOT 413 — the router raises axum's 2 MiB default so real vision
+    // photos fit. ~3 MiB of valid base64 ('A'*N, N a multiple of 4 → no padding needed).
+    let big_b64 = "A".repeat(3 * 1024 * 1024);
+    let r = c
+        .post(format!("{base}/w1/patterns/vision-pat/run"))
+        .json(&json!({
+            "input": [{"role": "user", "content": [
+                {"type": "text", "text": "big"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{big_b64}")}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "a >2MiB image body is accepted (body limit raised), not 413");
+    assert!(content(&r.json().await.unwrap()).contains("att=") , "large image reached the CLI path");
+
     std::env::remove_var("WOOLLAMA_CONFIG_DIR");
 }

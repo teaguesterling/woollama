@@ -492,10 +492,16 @@ impl FabricBackend {
                 return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI spawn failed (`{}`): {e}", self.command), "server_error")
             }
         };
+        // Write stdin on a SEPARATE task and drain stdout via `wait_with_output` CONCURRENTLY.
+        // Doing them in sequence (write-all-then-wait) deadlocks if the child emits enough stdout
+        // to fill the pipe buffer before it finishes reading stdin: the child blocks on write while
+        // we block on write. Concurrent write + drain is the only safe shape.
         if let Some(mut sin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let _ = sin.write_all(user_text.as_bytes()).await;
-            let _ = sin.shutdown().await; // close stdin so fabric stops reading and proceeds
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = sin.write_all(user_text.as_bytes()).await;
+                let _ = sin.shutdown().await; // close stdin so fabric stops reading and proceeds
+            });
         }
         let out = match child.wait_with_output().await {
             Ok(o) => o,
@@ -561,6 +567,11 @@ fn parse_fabric_line(line: &str) -> Option<(Option<String>, bool, Option<String>
 // stdin, plain-text answer on stdout (ground-truthed against llama3.2-vision: stdin in, text out,
 // exit 0). Non-streaming; a `stream:true` request still gets the OpenAI SSE *shape* back.
 
+/// Cap on a decoded `data:` image (20 MiB) — defense against a giant base64 payload OOM-ing the
+/// process or filling the temp dir. Larger than any real photo; http(s) images have no local
+/// decode so they're not bound by this.
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 /// An image referenced by an OpenAI `image_url` content part.
 enum ImageRef {
     /// `http(s)://…` — passed to fabric's `-a` directly (fabric fetches it).
@@ -596,12 +607,20 @@ fn parse_image_url(url: &str) -> Option<ImageRef> {
     let (meta, payload) = rest.split_once(',')?;
     let meta = meta.strip_suffix(";base64")?; // require base64 encoding
     let mime = meta.split(';').next().unwrap_or(""); // drop any extra params
-    // Accept both padded (STANDARD) and unpadded payloads — clients vary.
     let payload = payload.trim();
+    // Reject an over-cap payload BEFORE decoding (base64 decodes to ~3/4 its length), so we never
+    // allocate the huge buffer just to throw it away.
+    if payload.len() / 4 * 3 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    // Accept both padded (STANDARD) and unpadded payloads — clients vary.
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
         .ok()?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
     Some(ImageRef::Data { bytes, ext: mime_to_ext(mime).to_string() })
 }
 
@@ -954,6 +973,18 @@ mod tests {
         assert!(parse_image_url("file:///etc/passwd").is_none());
         // Non-base64 data-URL (no `;base64`) is rejected.
         assert!(parse_image_url("data:image/png,notbase64").is_none());
+    }
+
+    #[test]
+    fn parse_image_url_rejects_over_cap_data_url() {
+        // A base64 payload whose decoded size would exceed MAX_IMAGE_BYTES is rejected up front
+        // (no giant allocation). 'A' is a valid base64 char; length a multiple of 4 needs no pad.
+        let over = MAX_IMAGE_BYTES / 3 * 4 + 8;
+        let big = format!("data:image/png;base64,{}", "A".repeat(over));
+        assert!(parse_image_url(&big).is_none(), "over-cap image rejected");
+        // Just under the cap still parses.
+        let under = format!("data:image/png;base64,{}", "A".repeat(1024));
+        assert!(matches!(parse_image_url(&under), Some(ImageRef::Data { .. })));
     }
 
     #[test]

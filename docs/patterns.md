@@ -137,6 +137,16 @@ won't see the image):
     (removed after the run). Any other `image_url` (a bare filesystem path, or an
     undecodable data-URL) is **rejected with a `400`** — the run fails loudly rather
     than silently answering text-only as if there were no image.
+  - **⚠️ An `http(s)` image URL is fetched server-side by fabric** (woollama passes
+    it straight to `-a`), so it carries the usual SSRF consideration — a caller can
+    make fabric request an arbitrary URL. woollama binds loopback/UDS by default,
+    which contains this to local callers; if you expose woollama beyond localhost,
+    prefer `data:` images (self-contained, no server-side fetch).
+
+Image size: `data:` images are capped at **20 MiB** decoded (a `400` past that), and
+the request-body limit is raised to **32 MiB** (from axum's 2 MiB default) so real
+photos aren't rejected as too large before the model sees them — this applies to
+both the fabric and native paths.
   - **One image per run** — fabric's `-a` is single-attachment; extras are ignored
     (logged).
   - **Non-streaming** upstream: the CLI returns the whole answer at once. A
