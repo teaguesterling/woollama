@@ -479,9 +479,12 @@ impl FabricBackend {
         let argv = build_fabric_argv(name, bare, &vendor, &attachment, &variables);
 
         // One-shot CLI, env-inherited (needs PATH→~/.local/bin + provider keys, like spawn_fabric).
+        // `kill_on_drop(true)`: on timeout OR client disconnect the handler future is dropped, which
+        // drops this Child — kill it, don't orphan a model-loading process (mirrors claude_code.rs).
         let mut child = match tokio::process::Command::new(&self.command)
             .args(&argv)
             .env("PATH", fabric_path_env())
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -503,9 +506,18 @@ impl FabricBackend {
                 let _ = sin.shutdown().await; // close stdin so fabric stops reading and proceeds
             });
         }
-        let out = match child.wait_with_output().await {
-            Ok(o) => o,
-            Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI wait failed: {e}"), "server_error"),
+        // Bound the wait: a hung/slow provider must not pin the request forever. On elapse the
+        // `wait_with_output` future is dropped → the Child is dropped → `kill_on_drop` reaps it.
+        let out = match tokio::time::timeout(vision_timeout(), child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI wait failed: {e}"), "server_error"),
+            Err(_) => {
+                return err_resp(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("fabric vision timed out after {}s (set WOOLLAMA_FABRIC_VISION_TIMEOUT_SECS to change)", vision_timeout().as_secs()),
+                    "server_error",
+                )
+            }
         };
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -704,6 +716,17 @@ fn build_fabric_argv(
         argv.push(format!("--variable=#{k}:{val}"));
     }
     argv
+}
+
+/// How long to wait for a one-shot `fabric -a` vision run before killing it (default 300s;
+/// vision models can be slow). Tunable via `WOOLLAMA_FABRIC_VISION_TIMEOUT_SECS`.
+fn vision_timeout() -> Duration {
+    let secs = std::env::var("WOOLLAMA_FABRIC_VISION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(300);
+    Duration::from_secs(secs)
 }
 
 /// PATH with `~/.local/bin` prepended — fabric's common install location, needed by both the

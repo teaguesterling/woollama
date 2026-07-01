@@ -150,5 +150,26 @@ async fn fabric_vision_routes_image_input_through_the_cli() {
     assert_eq!(r.status(), 200, "a >2MiB image body is accepted (body limit raised), not 413");
     assert!(content(&r.json().await.unwrap()).contains("att=") , "large image reached the CLI path");
 
+    // 6) A hung fabric CLI must time out (504) and be reaped, not pin the request forever.
+    // fake_fabric sleeps when FAKE_FABRIC_HANG is set (inherited by the spawned child); the child
+    // is killed via kill_on_drop when the timeout fires. Keep this LAST — it sets process env.
+    std::env::set_var("FAKE_FABRIC_HANG", "1");
+    std::env::set_var("WOOLLAMA_FABRIC_VISION_TIMEOUT_SECS", "1");
+    let started = std::time::Instant::now();
+    let r = c
+        .post(format!("{base}/w1/patterns/vision-pat/run"))
+        .json(&json!({
+            "input": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 504, "hung vision run times out with Gateway Timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "returned promptly after the 1s timeout, not pinned");
+    std::env::remove_var("FAKE_FABRIC_HANG");
+    std::env::remove_var("WOOLLAMA_FABRIC_VISION_TIMEOUT_SECS");
+
     std::env::remove_var("WOOLLAMA_CONFIG_DIR");
 }

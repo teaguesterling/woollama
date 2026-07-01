@@ -12,6 +12,12 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn main() {
+    // Hang mode (for the vision-timeout test): sleep effectively forever so woollama's timeout +
+    // kill_on_drop must reap us. Real fabric can hang on a slow/unreachable provider.
+    if std::env::var("FAKE_FABRIC_HANG").is_ok() {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+        return;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut stdin = String::new();
     let _ = std::io::stdin().read_to_string(&mut stdin);
