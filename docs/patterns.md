@@ -133,8 +133,10 @@ won't see the image):
   routes image input to fabric's one-shot **CLI** (`fabric --pattern=… --attachment=…`,
   user text on stdin). Specifics of that path:
   - **Image source:** an `http(s)://` URL is passed to fabric as-is; a
-    `data:<mime>;base64,…` URL is decoded to a temp file (removed after the run). A
-    bare filesystem path is rejected.
+    `data:<mime>;base64,…` URL (padded or unpadded) is decoded to a temp file
+    (removed after the run). Any other `image_url` (a bare filesystem path, or an
+    undecodable data-URL) is **rejected with a `400`** — the run fails loudly rather
+    than silently answering text-only as if there were no image.
   - **One image per run** — fabric's `-a` is single-attachment; extras are ignored
     (logged).
   - **Non-streaming** upstream: the CLI returns the whole answer at once. A
