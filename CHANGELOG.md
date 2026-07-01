@@ -2,13 +2,23 @@
 
 ## Unreleased
 
-## v0.7.0 — 2026-06-29
+## v0.7.0 — 2026-06-30
 
 **Breaking:** `GET /w1/patterns` `variables` changes shape — bare name strings
 become objects (`{name, default?, choices?, description?}`). Clients that read only
 the variable `name` (e.g. cosmic-fabric's `WoollamaClient`) are unaffected; any
 client that consumed `variables` as a `string[]` must update.
 
+- **Vision (image input) for fabric patterns.** A `/w1/patterns/{name}/run` whose
+  `input` carries an OpenAI `image_url` content part is dispatched to fabric's
+  one-shot CLI (`fabric --attachment=…`, user text on stdin) — fabric's REST
+  `/chat` has no attachment field. `http(s)://` image URLs pass through; `data:`
+  URLs are decoded to a temp file (cleaned up after). Needs a vision-capable
+  `model` (e.g. `ollama/llama3.2-vision`); one image per run (fabric `-a` is
+  single-attachment); non-streaming (a `stream:true` request still gets the OpenAI
+  SSE shape). As a byproduct, array-`content` messages no longer drop their text on
+  the fabric REST path (previously `content` arrays were ignored entirely). Native
+  (engine) `image_url` multimodal is not yet wired — vision is fabric-only for now.
 - **Variable-metadata overlay for `/w1/` patterns.** Native recipes can annotate
   their `{{var}}` tokens with a `default`, `choices`, and `description` via an
   optional `[recipes.<name>.variables.<var>]` table in `recipes.toml`. `GET

@@ -105,6 +105,38 @@ parsers work unchanged — only the URL differs.
   [`/fabric/*`](#the-fabric-backend). (Native recipes run through the engine and
   keep the messages array intact.)
 
+### Vision (image input) for fabric patterns
+
+A `user` message whose `content` is an array can include an `image_url` part:
+
+```jsonc
+{ "input": [{ "role": "user", "content": [
+    { "type": "text", "text": "What's in this image?" },
+    { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBOR..." } }
+  ]}],
+  "model": "ollama/llama3.2-vision:latest"   // MUST be a vision-capable model
+}
+```
+
+fabric's REST `/chat` has no attachment field, so woollama routes image input to
+fabric's one-shot **CLI** instead (`fabric --pattern=… --attachment=…`, the user
+text on stdin). Notes:
+
+- **Needs a vision-capable `model`** (e.g. `ollama/llama3.2-vision`). A text-only
+  model — including a text `fabric.default_model` — will not see the image. Pass
+  `model` explicitly for vision runs.
+- **Image source:** an `http(s)://` URL is passed to fabric as-is; a
+  `data:<mime>;base64,…` URL is decoded to a temp file (removed after the run). A
+  bare filesystem path is rejected.
+- **One image per run** — fabric's `-a` is single-attachment; extra images are
+  ignored (logged).
+- **Non-streaming** upstream: the CLI returns the whole answer at once. A
+  `stream:true` request still gets back the OpenAI SSE *shape* (one content chunk +
+  `[DONE]`), so streaming clients don't break.
+- Native (engine) recipes don't take this path — `image_url` → ollama for native
+  patterns is not yet wired. For now, vision is a fabric-pattern feature. Full
+  fabric-native vision is also always available verbatim via [`/fabric/*`](#the-fabric-backend).
+
 ## MCP prompts get the same templating
 
 Recipes are also exposed as **MCP prompts** on the `/mcp` surface. Their `{{var}}`
