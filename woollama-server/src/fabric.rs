@@ -384,7 +384,7 @@ impl FabricBackend {
         // and role scaffolding would change what the pattern sees. Multi-turn assistant context is
         // lost on this path by design; a client needing it should use `/fabric/*` directly. Any
         // images are ignored here — the REST path has no attachment field (vision takes the CLI).
-        let (user_input, _images) = extract_user_input(body.get("input"));
+        let (user_input, _images, _bad) = extract_user_input(body.get("input"));
         let mut prompt = serde_json::json!({
             "userInput": user_input,
             "patternName": name,
@@ -596,13 +596,21 @@ fn parse_image_url(url: &str) -> Option<ImageRef> {
     let (meta, payload) = rest.split_once(',')?;
     let meta = meta.strip_suffix(";base64")?; // require base64 encoding
     let mime = meta.split(';').next().unwrap_or(""); // drop any extra params
-    let bytes = base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?;
+    // Accept both padded (STANDARD) and unpadded payloads — clients vary.
+    let payload = payload.trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
+        .ok()?;
     Some(ImageRef::Data { bytes, ext: mime_to_ext(mime).to_string() })
 }
 
 /// Append one OpenAI message `content` (a string, or an array of `{type:text|image_url}` parts)
-/// to the running text + image lists.
-fn collect_content(content: &Value, texts: &mut Vec<String>, images: &mut Vec<ImageRef>) {
+/// to the running text + image lists. `bad_images` counts `image_url` parts that were PRESENT but
+/// couldn't be turned into an [`ImageRef`] (undecodable data-URL, or a rejected non-URL) — so the
+/// caller can tell "no image" apart from "image we couldn't use" and fail loudly instead of
+/// silently answering text-only.
+fn collect_content(content: &Value, texts: &mut Vec<String>, images: &mut Vec<ImageRef>, bad_images: &mut usize) {
     match content {
         Value::String(s) => texts.push(s.clone()),
         Value::Array(parts) => {
@@ -615,8 +623,9 @@ fn collect_content(content: &Value, texts: &mut Vec<String>, images: &mut Vec<Im
                     }
                     Some("image_url") => {
                         let url = part.get("image_url").and_then(|i| i.get("url")).and_then(Value::as_str);
-                        if let Some(img) = url.and_then(parse_image_url) {
-                            images.push(img);
+                        match url.and_then(parse_image_url) {
+                            Some(img) => images.push(img),
+                            None => *bad_images += 1,
                         }
                     }
                     _ => {}
@@ -632,23 +641,24 @@ fn collect_content(content: &Value, texts: &mut Vec<String>, images: &mut Vec<Im
 /// across user turns/parts; images keep request order. Used by BOTH the REST and vision paths, so
 /// array-content TEXT is no longer silently dropped (it was — when `content` was an array,
 /// `as_str()` returned `None`, losing both text and images).
-fn extract_user_input(input: Option<&Value>) -> (String, Vec<ImageRef>) {
+fn extract_user_input(input: Option<&Value>) -> (String, Vec<ImageRef>, usize) {
     let mut texts: Vec<String> = Vec::new();
     let mut images: Vec<ImageRef> = Vec::new();
+    let mut bad_images = 0usize;
     match input {
         Some(Value::String(s)) => texts.push(s.clone()),
         Some(Value::Array(msgs)) => {
             for m in msgs {
                 if m.get("role").and_then(Value::as_str) == Some("user") {
                     if let Some(c) = m.get("content") {
-                        collect_content(c, &mut texts, &mut images);
+                        collect_content(c, &mut texts, &mut images, &mut bad_images);
                     }
                 }
             }
         }
         _ => {}
     }
-    (texts.join("\n\n"), images)
+    (texts.join("\n\n"), images, bad_images)
 }
 
 /// Assemble the fabric CLI argv for a vision run. Every value uses the `--flag=value` form (NOT
@@ -743,9 +753,18 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
 
         // Image input can't ride fabric's REST `/chat` (no attachment field) — route it to the
         // one-shot `fabric -a` CLI. Text-only requests stay on the REST path below.
-        let (user_text, images) = extract_user_input(body.get("input"));
+        let (user_text, images, bad_images) = extract_user_input(body.get("input"));
         if !images.is_empty() {
             return self.run_fabric_vision(name, body, user_text, images).await;
+        }
+        // The request DID carry image_url part(s) but none were usable — fail loudly rather than
+        // silently answering text-only (which would look like the image was seen and ignored).
+        if bad_images > 0 {
+            return err_resp(
+                axum::http::StatusCode::BAD_REQUEST,
+                "image_url could not be used — expected an http(s) URL or a `data:<mime>;base64,…` URL".to_string(),
+                "invalid_request_error",
+            );
         }
 
         let fbody = match self.build_chat_body(name, body) {
@@ -938,10 +957,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_image_url_accepts_unpadded_base64() {
+        // Same 3 bytes, padded vs unpadded — both must decode.
+        assert!(matches!(parse_image_url("data:image/png;base64,YWJj"), Some(ImageRef::Data { .. })));
+        match parse_image_url("data:image/png;base64,YWJj") {
+            Some(ImageRef::Data { bytes, .. }) => assert_eq!(bytes, b"abc"),
+            _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
     fn extract_user_input_bare_string() {
-        let (text, imgs) = extract_user_input(Some(&json!("hello world")));
+        let (text, imgs, bad) = extract_user_input(Some(&json!("hello world")));
         assert_eq!(text, "hello world");
         assert!(imgs.is_empty());
+        assert_eq!(bad, 0);
+    }
+
+    #[test]
+    fn extract_user_input_counts_unusable_images() {
+        // An `image_url` part that can't be parsed (bare path, undecodable data-URL) is counted,
+        // so `run()` can 400 instead of silently answering text-only.
+        let input = json!([{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "/etc/passwd"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%notb64%%%"}}
+        ]}]);
+        let (text, imgs, bad) = extract_user_input(Some(&input));
+        assert_eq!(text, "hi");
+        assert!(imgs.is_empty(), "neither image is usable");
+        assert_eq!(bad, 2, "both unusable image_url parts counted");
     }
 
     #[test]
@@ -956,7 +1001,7 @@ mod tests {
             ]},
             {"role": "user", "content": "and this?"}
         ]);
-        let (text, imgs) = extract_user_input(Some(&input));
+        let (text, imgs, _bad) = extract_user_input(Some(&input));
         assert_eq!(text, "what is this?\n\nand this?", "text joined across parts/turns, system dropped");
         assert_eq!(imgs.len(), 1);
         match &imgs[0] {
@@ -974,7 +1019,7 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "https://a/1.png"}},
             {"type": "image_url", "image_url": {"url": "https://b/2.png"}}
         ]}]);
-        let (_t, imgs) = extract_user_input(Some(&input));
+        let (_t, imgs, _bad) = extract_user_input(Some(&input));
         assert_eq!(imgs.len(), 2);
         match (&imgs[0], &imgs[1]) {
             (ImageRef::Url(a), ImageRef::Url(b)) => {

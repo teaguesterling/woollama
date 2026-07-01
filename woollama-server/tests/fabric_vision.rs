@@ -117,5 +117,21 @@ async fn fabric_vision_routes_image_input_through_the_cli() {
     assert!(sse.contains("pattern=vision-pat"), "content carried in the stream");
     assert!(sse.trim_end().ends_with("[DONE]"), "terminated with [DONE]");
 
+    // 4) An image_url that can't be used (undecodable data-URL) → 400, NOT a silent text answer.
+    let r = c
+        .post(format!("{base}/w1/patterns/vision-pat/run"))
+        .json(&json!({
+            "input": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,%%%notb64%%%"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "undecodable image fails loudly instead of falling through to text");
+    let body: Value = r.json().await.unwrap();
+    assert!(body["error"]["message"].as_str().unwrap_or("").contains("image_url"), "clear error");
+
     std::env::remove_var("WOOLLAMA_CONFIG_DIR");
 }
