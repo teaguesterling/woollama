@@ -17,8 +17,13 @@ client that consumed `variables` as a `string[]` must update.
   `model` (e.g. `ollama/llama3.2-vision`); one image per run (fabric `-a` is
   single-attachment); non-streaming (a `stream:true` request still gets the OpenAI
   SSE shape). As a byproduct, array-`content` messages no longer drop their text on
-  the fabric REST path (previously `content` arrays were ignored entirely). Native
-  (engine) `image_url` multimodal is not yet wired — vision is fabric-only for now.
+  the fabric REST path (previously `content` arrays were ignored entirely).
+- **Native multimodal (`image_url`) confirmed.** A NATIVE recipe bound to (or
+  `model`-overridden with) a vision model accepts `image_url` content with no
+  special handling — the engine already forwards the messages array verbatim to
+  ollama's OpenAI-compatible endpoint. Works on `/w1/…/run` and via
+  `/v1/chat/completions` as `woollama/<recipe>`. Locked with a regression test; no
+  engine change (it stays parity-locked).
 - **Variable-metadata overlay for `/w1/` patterns.** Native recipes can annotate
   their `{{var}}` tokens with a `default`, `choices`, and `description` via an
   optional `[recipes.<name>.variables.<var>]` table in `recipes.toml`. `GET
