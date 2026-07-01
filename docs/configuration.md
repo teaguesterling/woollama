@@ -118,7 +118,7 @@ transparently proxied at `/fabric/*`. woollama either spawns + supervises
 |---|---|---|
 | `managed` | — | `true` ⇒ woollama spawns + supervises `fabric --serve` (loopback). Reuse + graceful-kill: the address is persisted, so a restart reuses the live fabric; killed only on clean shutdown. |
 | `url` | — | Route to an externally-run fabric at this base URL instead of spawning. Takes precedence over `managed`. |
-| `command` | — | The fabric binary for managed mode (default `"fabric"`, resolved on `PATH`). |
+| `command` | — | The fabric binary (default `"fabric"`, resolved on `PATH`). Used for managed `--serve` **and** for the one-shot `fabric -a` CLI on the [vision path](patterns.md#vision-image-input-for-fabric-patterns). |
 | `address` | — | Fixed `host:port` to bind in managed mode (default: a persisted free loopback port). |
 | `default_model` | — | Fallback `<provider>/<model>` for fabric patterns when a run omits `model`. Required for a fabric pattern to be addressable as `woollama/<name>` via `/v1/chat/completions` (which has no per-call model slot). |
 
@@ -126,6 +126,11 @@ transparently proxied at `/fabric/*`. woollama either spawns + supervises
 > engine's `inferencers.toml` loader requires every entry to have a `base_url` —
 > a fabric entry there would break config load. The fabric backend is a
 > server-layer plugin, not an engine inferencer.
+
+> **Vision needs a vision-capable model.** Image input (`image_url`) on a fabric
+> pattern is dispatched via `fabric -a` (see [patterns.md](patterns.md#vision-image-input-for-fabric-patterns)).
+> Pass a vision `model` (e.g. `ollama/llama3.2-vision`) on the request; a text-only
+> `default_model` won't see the image.
 
 **Resilience.** The fabric pattern list is cached and kept fresh two ways: it is
 **re-sourced on a TTL** as requests arrive (fabric hot-reloads its pattern dir, so

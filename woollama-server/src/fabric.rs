@@ -167,14 +167,10 @@ impl FabricBackend {
     /// prepended — fabric's common install location). Unlike the untrusted MCP children, which
     /// are env-scrubbed. NO `kill_on_drop`: detached so a woollamad restart can reuse it.
     fn spawn_fabric(command: &str, addr: &str) -> Option<tokio::process::Child> {
-        let mut path = std::env::var("PATH").unwrap_or_default();
-        if let Ok(home) = std::env::var("HOME") {
-            path = format!("{home}/.local/bin:{path}");
-        }
         eprintln!("woollamad: spawning `{command} --serve --address {addr}`");
         tokio::process::Command::new(command)
             .args(["--serve", "--address", addr])
-            .env("PATH", path)
+            .env("PATH", fabric_path_env())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -379,30 +375,16 @@ impl FabricBackend {
     /// (`prompts[].userInput`/`patternName`/`vendor`, `contextName`/`strategyName`,
     /// top-level `language`/`search`) are confined here. `Err` is a client-facing 400 message.
     fn build_chat_body(&self, name: &str, body: &Value) -> Result<Value, String> {
-        // Per-call `model` wins; else the configured `default_model`; else error.
-        let model = match body.get("model").and_then(Value::as_str) {
-            Some(m) => m,
-            None => self.default_model.as_deref().ok_or_else(|| {
-                format!("fabric pattern '{name}' run requires a 'model' (e.g. ollama/qwen3) — fabric patterns have no bound inferencer (set fabric.default_model in mcp.json to make it optional)")
-            })?,
-        };
+        let model = self.resolve_model(body, name)?;
         let (provider, bare) = model.split_once('/').unwrap_or(("", model));
         // fabric is pattern + single-input oriented: `/chat` takes ONE `userInput` string, not a
-        // turn list. For an OpenAI-style messages array we concatenate every USER message's text
-        // (older code kept only the LAST, silently dropping the rest). Non-user turns
-        // (assistant/system) are NOT sent — fabric patterns operate on raw content, and role
-        // scaffolding would change what the pattern sees. Multi-turn assistant context is lost on
-        // this path by design; a client needing it should use `/fabric/*` (native fabric) directly.
-        let user_input = match body.get("input") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .filter_map(|m| m.get("content").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            _ => String::new(),
-        };
+        // turn list. `extract_user_input` concatenates every USER message's text (older code kept
+        // only the LAST, silently dropping the rest, and dropped array-`content` text entirely).
+        // Non-user turns (assistant/system) are NOT sent — fabric patterns operate on raw content,
+        // and role scaffolding would change what the pattern sees. Multi-turn assistant context is
+        // lost on this path by design; a client needing it should use `/fabric/*` directly. Any
+        // images are ignored here — the REST path has no attachment field (vision takes the CLI).
+        let (user_input, _images) = extract_user_input(body.get("input"));
         let mut prompt = serde_json::json!({
             "userInput": user_input,
             "patternName": name,
@@ -430,6 +412,125 @@ impl FabricBackend {
         }
         Ok(fbody)
     }
+
+    /// Resolve the inferencer for a fabric run: per-call `model` wins; else the configured
+    /// `default_model`; else a 400-worthy error (fabric patterns have no bound inferencer).
+    fn resolve_model<'a>(&'a self, body: &'a Value, name: &str) -> Result<&'a str, String> {
+        match body.get("model").and_then(Value::as_str) {
+            Some(m) => Ok(m),
+            None => self.default_model.as_deref().ok_or_else(|| {
+                format!("fabric pattern '{name}' run requires a 'model' (e.g. ollama/qwen3) — fabric patterns have no bound inferencer (set fabric.default_model in mcp.json to make it optional)")
+            }),
+        }
+    }
+
+    /// Run a fabric pattern with image input via the one-shot CLI (`fabric -a`), since fabric's
+    /// REST `/chat` has no attachment field. `user_text`/`images` are pre-extracted from the body;
+    /// `images` is guaranteed non-empty by the caller. The text is piped on stdin; the first image
+    /// becomes `--attachment=` (URL passed through, data-URL written to a temp file cleaned up on
+    /// every exit path). Plain-text stdout → an OpenAI completion (or the SSE *shape* if the caller
+    /// asked to stream). NOTE: needs a VISION-capable `model` — a text model (e.g. the usual
+    /// `default_model`) will see no image. Returns an OpenAI-shaped error response on any failure.
+    async fn run_fabric_vision(
+        &self,
+        name: &str,
+        body: &Value,
+        user_text: String,
+        mut images: Vec<ImageRef>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use axum::http::StatusCode;
+
+        let model = match self.resolve_model(body, name) {
+            Ok(m) => m.to_string(),
+            Err(msg) => return err_resp(StatusCode::BAD_REQUEST, msg, "invalid_request_error"),
+        };
+        let (provider, bare) = model.split_once('/').unwrap_or(("", model.as_str()));
+        let vendor = self.vendor_for(provider);
+
+        // fabric's `-a` is single-attachment: use the first image, note any dropped extras.
+        let extra = images.len().saturating_sub(1);
+        let first = images.remove(0); // caller guarantees non-empty
+        if extra > 0 {
+            eprintln!("woollamad: fabric vision: {extra} extra image(s) ignored (`-a` is single-attachment)");
+        }
+
+        // Materialize the attachment. Keep the temp file alive (binding `_tmp`) until after the
+        // subprocess exits — dropping the `NamedTempFile` unlinks it, so cleanup is automatic on
+        // EVERY return below it (success, non-zero exit, or wait error).
+        let (attachment, _tmp) = match first {
+            ImageRef::Url(u) => (u, None),
+            ImageRef::Data { bytes, ext } => {
+                let tmp = tempfile::Builder::new().prefix("woollama-vision-").suffix(&format!(".{ext}")).tempfile();
+                match tmp {
+                    Ok(mut f) => {
+                        use std::io::Write;
+                        if let Err(e) = f.as_file_mut().write_all(&bytes) {
+                            return err_resp(StatusCode::BAD_GATEWAY, format!("vision temp write failed: {e}"), "server_error");
+                        }
+                        (f.path().to_string_lossy().into_owned(), Some(f))
+                    }
+                    Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("vision temp file failed: {e}"), "server_error"),
+                }
+            }
+        };
+
+        let variables = body.get("variables").and_then(Value::as_object).cloned().unwrap_or_default();
+        let argv = build_fabric_argv(name, bare, &vendor, &attachment, &variables);
+
+        // One-shot CLI, env-inherited (needs PATH→~/.local/bin + provider keys, like spawn_fabric).
+        let mut child = match tokio::process::Command::new(&self.command)
+            .args(&argv)
+            .env("PATH", fabric_path_env())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI spawn failed (`{}`): {e}", self.command), "server_error")
+            }
+        };
+        if let Some(mut sin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = sin.write_all(user_text.as_bytes()).await;
+            let _ = sin.shutdown().await; // close stdin so fabric stops reading and proceeds
+        }
+        let out = match child.wait_with_output().await {
+            Ok(o) => o,
+            Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI wait failed: {e}"), "server_error"),
+        };
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return err_resp(StatusCode::BAD_GATEWAY, format!("fabric CLI exited {}: {}", out.status, stderr.trim()), "server_error");
+        }
+        let content = String::from_utf8_lossy(&out.stdout).into_owned();
+
+        if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+            // The CLI is one-shot, so there's nothing to stream incrementally — but a client that
+            // asked for `stream:true` still gets the OpenAI SSE SHAPE (role, one content chunk,
+            // stop, [DONE]) rather than a surprise JSON body.
+            let cid = crate::chatcmpl_id();
+            let created = crate::now_secs();
+            let model_s = model.clone();
+            let out_stream = axum::body::Body::from_stream(async_stream::stream! {
+                yield Ok::<bytes::Bytes, std::io::Error>(crate::chat_chunk(&cid, created, &model_s, serde_json::json!({"role": "assistant"}), None));
+                yield Ok(crate::chat_chunk(&cid, created, &model_s, serde_json::json!({"content": content}), None));
+                yield Ok(crate::chat_chunk(&cid, created, &model_s, serde_json::json!({}), Some("stop")));
+                yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
+            });
+            return crate::sse_response(out_stream);
+        }
+        axum::Json(serde_json::json!({
+            "id": crate::chatcmpl_id(),
+            "object": "chat.completion",
+            "created": crate::now_secs(),
+            "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+        }))
+        .into_response()
+    }
 }
 
 /// Parse one fabric SSE line → `(content_piece, done, error)`. fabric frames are
@@ -451,6 +552,145 @@ fn parse_fabric_line(line: &str) -> Option<(Option<String>, bool, Option<String>
         Some("complete") => Some((None, true, None)),
         _ => Some((ev.get("content").and_then(Value::as_str).map(String::from), false, None)),
     }
+}
+
+// --- Vision via the fabric CLI (`fabric -a`) --------------------------------------------------
+// fabric's REST `/chat` has NO attachment field, so image input (OpenAI `image_url` content
+// parts) can't ride the REST path — it takes fabric's one-shot CLI instead:
+// `fabric --pattern=<name> --attachment=<path|url> --model=<m> --vendor=<V>`, userInput piped on
+// stdin, plain-text answer on stdout (ground-truthed against llama3.2-vision: stdin in, text out,
+// exit 0). Non-streaming; a `stream:true` request still gets the OpenAI SSE *shape* back.
+
+/// An image referenced by an OpenAI `image_url` content part.
+enum ImageRef {
+    /// `http(s)://…` — passed to fabric's `-a` directly (fabric fetches it).
+    Url(String),
+    /// A decoded `data:<mime>;base64,…` payload — written to a temp file for `-a`.
+    Data { bytes: Vec<u8>, ext: String },
+}
+
+/// Map an image MIME type to a temp-file extension (fabric infers attachment type from the path).
+/// Unknown types fall back to `img` — the vendor still sniffs the bytes.
+fn mime_to_ext(mime: &str) -> &'static str {
+    match mime.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "img",
+    }
+}
+
+/// Parse one OpenAI `image_url.url` into an [`ImageRef`]. Accepts `http(s)://` URLs (passed
+/// through) and `data:<mime>;base64,<payload>` data-URLs (decoded). Returns `None` for anything
+/// else — notably a bare filesystem path, which a request must NOT be able to hand to the CLI.
+fn parse_image_url(url: &str) -> Option<ImageRef> {
+    use base64::Engine;
+    let u = url.trim();
+    if u.starts_with("http://") || u.starts_with("https://") {
+        return Some(ImageRef::Url(u.to_string()));
+    }
+    // `data:<mime>;base64,<payload>` — only base64 data-URLs are supported.
+    let rest = u.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let meta = meta.strip_suffix(";base64")?; // require base64 encoding
+    let mime = meta.split(';').next().unwrap_or(""); // drop any extra params
+    let bytes = base64::engine::general_purpose::STANDARD.decode(payload.trim()).ok()?;
+    Some(ImageRef::Data { bytes, ext: mime_to_ext(mime).to_string() })
+}
+
+/// Append one OpenAI message `content` (a string, or an array of `{type:text|image_url}` parts)
+/// to the running text + image lists.
+fn collect_content(content: &Value, texts: &mut Vec<String>, images: &mut Vec<ImageRef>) {
+    match content {
+        Value::String(s) => texts.push(s.clone()),
+        Value::Array(parts) => {
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            texts.push(t.to_string());
+                        }
+                    }
+                    Some("image_url") => {
+                        let url = part.get("image_url").and_then(|i| i.get("url")).and_then(Value::as_str);
+                        if let Some(img) = url.and_then(parse_image_url) {
+                            images.push(img);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pull the user text and any image attachments out of a `/w1/run` `input` (a bare string, or an
+/// OpenAI messages array whose `content` is a string or an array of parts). Text is `\n\n`-joined
+/// across user turns/parts; images keep request order. Used by BOTH the REST and vision paths, so
+/// array-content TEXT is no longer silently dropped (it was — when `content` was an array,
+/// `as_str()` returned `None`, losing both text and images).
+fn extract_user_input(input: Option<&Value>) -> (String, Vec<ImageRef>) {
+    let mut texts: Vec<String> = Vec::new();
+    let mut images: Vec<ImageRef> = Vec::new();
+    match input {
+        Some(Value::String(s)) => texts.push(s.clone()),
+        Some(Value::Array(msgs)) => {
+            for m in msgs {
+                if m.get("role").and_then(Value::as_str) == Some("user") {
+                    if let Some(c) = m.get("content") {
+                        collect_content(c, &mut texts, &mut images);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    (texts.join("\n\n"), images)
+}
+
+/// Assemble the fabric CLI argv for a vision run. Every value uses the `--flag=value` form (NOT
+/// `--flag value`), so a value beginning with `-` can't be reparsed as a flag; the userInput is
+/// piped on stdin, never an argv. Variables use fabric's `-v=#key:value` syntax.
+fn build_fabric_argv(
+    pattern: &str,
+    model_bare: &str,
+    vendor: &str,
+    attachment: &str,
+    variables: &serde_json::Map<String, Value>,
+) -> Vec<String> {
+    let mut argv = vec![
+        format!("--pattern={pattern}"),
+        format!("--model={model_bare}"),
+        format!("--vendor={vendor}"),
+        format!("--attachment={attachment}"),
+    ];
+    for (k, v) in variables {
+        let val = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        argv.push(format!("--variable=#{k}:{val}"));
+    }
+    argv
+}
+
+/// PATH with `~/.local/bin` prepended — fabric's common install location, needed by both the
+/// `--serve` spawn and the one-shot vision CLI.
+fn fabric_path_env() -> String {
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if let Ok(home) = std::env::var("HOME") {
+        path = format!("{home}/.local/bin:{path}");
+    }
+    path
+}
+
+/// An OpenAI-shaped error response (matches the inline errors the REST `run` path returns).
+fn err_resp(status: axum::http::StatusCode, msg: String, typ: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (status, axum::Json(serde_json::json!({"error": {"message": msg, "type": typ}}))).into_response()
 }
 
 #[async_trait::async_trait]
@@ -500,6 +740,13 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
     async fn run(&self, name: &str, body: &Value) -> axum::response::Response {
         use axum::response::IntoResponse;
         use futures::StreamExt;
+
+        // Image input can't ride fabric's REST `/chat` (no attachment field) — route it to the
+        // one-shot `fabric -a` CLI. Text-only requests stay on the REST path below.
+        let (user_text, images) = extract_user_input(body.get("input"));
+        if !images.is_empty() {
+            return self.run_fabric_vision(name, body, user_text, images).await;
+        }
 
         let fbody = match self.build_chat_body(name, body) {
             Ok(b) => b,
@@ -647,5 +894,111 @@ impl crate::pattern_backend::PatternBackend for FabricBackend {
 
     async fn shutdown(&self) {
         FabricBackend::shutdown(self).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use serde_json::json;
+
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    #[test]
+    fn mime_to_ext_maps_known_and_falls_back() {
+        assert_eq!(mime_to_ext("image/png"), "png");
+        assert_eq!(mime_to_ext("image/jpeg"), "jpg");
+        assert_eq!(mime_to_ext("IMAGE/WEBP"), "webp"); // case-insensitive
+        assert_eq!(mime_to_ext("application/octet-stream"), "img"); // unknown → fallback
+    }
+
+    #[test]
+    fn parse_image_url_handles_http_data_and_rejects_paths() {
+        // http(s) → passed through verbatim.
+        match parse_image_url("https://example.com/cat.png") {
+            Some(ImageRef::Url(u)) => assert_eq!(u, "https://example.com/cat.png"),
+            _ => panic!("expected Url"),
+        }
+        // data-URL → decoded bytes + extension from the MIME type.
+        match parse_image_url(&data_url("image/png", b"\x89PNG\r\n")) {
+            Some(ImageRef::Data { bytes, ext }) => {
+                assert_eq!(bytes, b"\x89PNG\r\n");
+                assert_eq!(ext, "png");
+            }
+            _ => panic!("expected Data"),
+        }
+        // A bare filesystem path must NOT be accepted (a request can't hand the CLI a local file).
+        assert!(parse_image_url("/etc/passwd").is_none());
+        assert!(parse_image_url("file:///etc/passwd").is_none());
+        // Non-base64 data-URL (no `;base64`) is rejected.
+        assert!(parse_image_url("data:image/png,notbase64").is_none());
+    }
+
+    #[test]
+    fn extract_user_input_bare_string() {
+        let (text, imgs) = extract_user_input(Some(&json!("hello world")));
+        assert_eq!(text, "hello world");
+        assert!(imgs.is_empty());
+    }
+
+    #[test]
+    fn extract_user_input_array_content_keeps_text_and_images() {
+        // The latent-bug case: `content` is an ARRAY of parts. Old code dropped it entirely
+        // (`as_str()` → None); now text is kept AND the image is extracted.
+        let input = json!([
+            {"role": "system", "content": "ignored"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": data_url("image/jpeg", b"JPGDATA")}}
+            ]},
+            {"role": "user", "content": "and this?"}
+        ]);
+        let (text, imgs) = extract_user_input(Some(&input));
+        assert_eq!(text, "what is this?\n\nand this?", "text joined across parts/turns, system dropped");
+        assert_eq!(imgs.len(), 1);
+        match &imgs[0] {
+            ImageRef::Data { bytes, ext } => {
+                assert_eq!(bytes, b"JPGDATA");
+                assert_eq!(ext, "jpg");
+            }
+            _ => panic!("expected decoded Data image"),
+        }
+    }
+
+    #[test]
+    fn extract_user_input_preserves_multiple_image_order() {
+        let input = json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://a/1.png"}},
+            {"type": "image_url", "image_url": {"url": "https://b/2.png"}}
+        ]}]);
+        let (_t, imgs) = extract_user_input(Some(&input));
+        assert_eq!(imgs.len(), 2);
+        match (&imgs[0], &imgs[1]) {
+            (ImageRef::Url(a), ImageRef::Url(b)) => {
+                assert_eq!(a, "https://a/1.png");
+                assert_eq!(b, "https://b/2.png");
+            }
+            _ => panic!("expected two Url images in order"),
+        }
+    }
+
+    #[test]
+    fn build_fabric_argv_uses_equals_form_and_fabric_var_syntax() {
+        let mut vars = serde_json::Map::new();
+        vars.insert("role".into(), json!("expert"));
+        let argv = build_fabric_argv("summarize", "llama3.2-vision:latest", "Ollama", "/tmp/x.png", &vars);
+        assert!(argv.contains(&"--pattern=summarize".to_string()));
+        assert!(argv.contains(&"--model=llama3.2-vision:latest".to_string()));
+        assert!(argv.contains(&"--vendor=Ollama".to_string()));
+        assert!(argv.contains(&"--attachment=/tmp/x.png".to_string()));
+        assert!(argv.contains(&"--variable=#role:expert".to_string()));
+        // Every value is bound with `=` (never a separate argv token), so a value beginning with
+        // `-` can't be reparsed as a flag.
+        let dashy = build_fabric_argv("p", "m", "V", "--evil=1", &serde_json::Map::new());
+        assert!(dashy.iter().all(|a| a.starts_with("--")));
+        assert!(dashy.contains(&"--attachment=--evil=1".to_string()));
     }
 }

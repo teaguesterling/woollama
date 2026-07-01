@@ -47,6 +47,8 @@ async-stream = "0.3"
 bytes = "1"
 # claude-code executor: temp cwd + delegate-mcp.json (run_completion/run_delegated).
 tempfile = "3"
+# Decode `data:image/...;base64,...` URLs to bytes for the fabric `-a` vision path.
+base64 = "0.22"
 
 # Test fixtures — only built with `--features test-fixtures` (kept out of `cargo install`).
 [[bin]]
@@ -58,6 +60,13 @@ required-features = ["test-fixtures"]
 [[bin]]
 name = "fake_claude"
 path = "src/bin/fake_claude.rs"
+required-features = ["test-fixtures"]
+
+# A fake `fabric` CLI for hermetic vision-path tests (`fabric -a`): echoes the pattern,
+# attachment, and stdin so a test can assert the argv + stdin reached the subprocess.
+[[bin]]
+name = "fake_fabric"
+path = "src/bin/fake_fabric.rs"
 required-features = ["test-fixtures"]
 
 [dev-dependencies]
