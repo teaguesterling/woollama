@@ -42,8 +42,12 @@ pub async fn register_all() -> Vec<Arc<dyn PatternBackend>> {
 /// A discovery entry for `GET /w1/patterns`.
 pub struct PatternInfo {
     pub name: String,
-    /// Scanned `{{var}}` names, when the backend can supply them cheaply (else empty).
-    pub variables: Vec<String>,
+    /// Variable descriptors, as emitted on the wire: one object per variable
+    /// (`{"name", "default"?, "choices"?, "description"?}`, absent fields omitted) — the SAME
+    /// shape native recipes use (see `w1_variable_infos`), so the `/w1/patterns` `variables`
+    /// contract is uniform across backends. Empty when a backend can't supply them cheaply
+    /// (fabric scans ~250 patterns lazily, so it returns `[]` and resolves on render/run).
+    pub variables: Vec<serde_json::Value>,
     /// Provenance label surfaced to clients (e.g. `"fabric"`).
     pub source: String,
 }
