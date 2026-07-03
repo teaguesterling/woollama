@@ -11,7 +11,9 @@ surfaces (docs/architecture.md §"Binding"):
 
 We *never* bind to `0.0.0.0` without an explicit opt-in via `WOOLLAMA_ADDRESS`:
 the router holds API keys and routes to local resources — it must not be
-LAN-reachable by default.
+LAN-reachable by default. Even with the opt-in, a non-loopback bind is refused
+unless `WOOLLAMA_TOKEN` is configured (see `auth.check_bind_allowed`) — the
+opt-in widens *reach*, never *access*.
 
 The router holds API keys, so each surface is access-controlled the same way:
 loopback for TCP, and **mode 0600** for the Unix socket (a connectable socket is
@@ -26,6 +28,8 @@ import logging
 import os
 import socket
 from dataclasses import dataclass
+
+from . import auth
 
 log = logging.getLogger("woollama.binding")
 
@@ -85,8 +89,14 @@ def open_sockets() -> Listeners:
     the Unix socket best-effort: if it can't (e.g. an unwritable runtime dir, or
     a path over the ~108-char `sun_path` limit), we log and serve TCP-only
     rather than failing to start. Callers serve `listeners.sockets` and must
-    `cleanup()` on shutdown to remove the socket file."""
+    `cleanup()` on shutdown to remove the socket file.
+
+    Fail-closed exposure gate: a NON-loopback bind target (only reachable via
+    the `$WOOLLAMA_ADDRESS` opt-in) requires `WOOLLAMA_TOKEN` to be configured
+    — `auth.check_bind_allowed` raises `auth.ExposureError` otherwise, so the
+    surface can never be served beyond loopback without authentication."""
     host, port = resolve_tcp_target()
+    auth.check_bind_allowed(host)
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp.bind((host, port))

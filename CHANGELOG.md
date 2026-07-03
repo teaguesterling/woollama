@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**Surface authentication + fail-closed binding.** The HTTP surfaces (`/v1/*` and
+the mounted `/mcp`) are now access-controlled: with no token configured, only
+*local* peers (loopback TCP, the 0600 Unix socket) are served; a non-loopback
+`WOOLLAMA_ADDRESS` refuses to start unless `WOOLLAMA_TOKEN` is set; with a token
+set, every TCP request must send `Authorization: Bearer <token>` (the Unix
+socket stays exempt — its file mode is the credential). The default loopback,
+no-token workflow is unchanged.
+
+- **Recipe allow-list enforced at dispatch time (Python).** `Registry.dispatch`
+  now takes the active allow-list and refuses a tool outside it; the recipe
+  loop's `RegistryToolProvider` carries the recipe's `tools` list, so the
+  boundary holds in Python independent of the core's offer-time filtering. The
+  MCP aggregator surface (which re-exports every configured tool by design) is
+  unchanged and gated by surface auth.
+- **`mcp.json` `env` now reaches the spawned server** (via
+  `StdioServerParameters.env`, merged over the SDK's safe default environment)
+  instead of being parsed and dropped — no more `${VAR}`-into-argv workaround
+  that leaked values into `ps`.
+- **Downstream MCP tool calls are time-bounded** (`WOOLLAMA_TOOL_TIMEOUT`,
+  default 180s): a hung server bounds the turn and no longer wedges the
+  connection's worker for subsequent calls.
+- **Managed-agents environments default to `limited` networking** (least
+  privilege for the tool-less agent); `WOOLLAMA_AGENT_NETWORKING=unrestricted`
+  restores the previous behavior.
+- The durable conversation handle table (`conversations.json`) is written
+  owner-only (0600).
+
 ## v0.7.0 — 2026-06-30
 
 **Breaking:** `GET /w1/patterns` `variables` changes shape — bare name strings

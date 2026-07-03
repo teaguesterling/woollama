@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import (
+    auth,
     claude_code,
     config,
     conversations,
@@ -118,7 +119,8 @@ async def lifespan(app: FastAPI):
     conversation_store.enable_persistence(config.state_dir() / "conversations.json")
     # Server bundle from mcp.json (user config or bundled defaults).
     for name, cfg in config.load_mcp_servers().items():
-        registry.add(ServerManager(name, cfg["command"], cfg["args"]))
+        registry.add(ServerManager(name, cfg["command"], cfg["args"],
+                                   env=cfg.get("env") or None))
     await registry.start_all()
     log.info("registry ready: %s", registry.all_tool_names())
     # Downstream tools are known now → re-export them onto the MCP surface
@@ -164,6 +166,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="woollama", version=__version__, lifespan=lifespan)
 app.mount("/mcp", _mcp_app)
+# Surface auth wraps the WHOLE app (the /mcp mount included): local peers
+# (loopback TCP / the 0600 unix socket) or the configured WOOLLAMA_TOKEN —
+# see auth.py for the policy. Registered after the mount so nothing routes
+# around it; pure-ASGI so SSE streams pass through unbuffered.
+app.add_middleware(auth.SurfaceAuthMiddleware)
 
 
 async def _discover_models(inf: inferencers.Inferencer) -> list[str]:
@@ -845,8 +852,12 @@ async def orchestrate_events(recipe: recipes.Recipe, user_msgs: list[dict],
     # is the one woollama-specific executor that stays here.) The inferencer
     # registry is resolved from config and passed explicitly — the Rust core
     # defaults to built-ins only, so omitting it would drop inferencers.toml.
+    # The provider carries the RECIPE's allow-list so the boundary is enforced
+    # at dispatch time in Python (manager.Registry.dispatch), independent of
+    # the core loop only dispatching offered tools.
     async for ev in core.orchestrate_events(
-            recipe, user_msgs, tools=RegistryToolProvider(reg),
+            recipe, user_msgs,
+            tools=RegistryToolProvider(reg, allow=recipe["tools"]),
             registry=core.ModelRegistry.from_config(), stream=stream):
         yield ev
 
