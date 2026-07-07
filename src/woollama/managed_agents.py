@@ -34,8 +34,11 @@ deferred.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
+
+log = logging.getLogger("woollama.managed_agents")
 
 # Short aliases for the `claude-agent/<alias>` namespace; anything else passes
 # through unchanged (so a full id like `claude-agent/claude-opus-4-8` works too).
@@ -97,10 +100,26 @@ def _wrap(fn):
 
 # --- environment + agent (control plane: created once, reused) ----------------
 
+ENV_NETWORKING = "WOOLLAMA_AGENT_NETWORKING"
+
+
+def _networking_config() -> dict:
+    """Least-privilege default for the hosted environment: `limited` networking
+    (no outbound hosts, no package registries — the agent woollama provisions is
+    tool-less, so it needs none). `WOOLLAMA_AGENT_NETWORKING=unrestricted` is
+    the explicit opt-out for setups that add network-using capabilities."""
+    mode = (os.environ.get(ENV_NETWORKING) or "limited").strip().lower()
+    if mode == "unrestricted":
+        return {"type": "unrestricted"}
+    if mode != "limited":
+        log.warning("unknown %s=%r; using 'limited'", ENV_NETWORKING, mode)
+    return {"type": "limited"}
+
+
 def _create_environment_sync(name: str) -> str:
     env = _client().beta.environments.create(
         name=name,
-        config={"type": "cloud", "networking": {"type": "unrestricted"}},
+        config={"type": "cloud", "networking": _networking_config()},
     )
     return env.id
 

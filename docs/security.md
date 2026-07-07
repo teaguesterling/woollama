@@ -16,9 +16,25 @@ multi-tenant exposure.
 - The loopback port is random and written to `$XDG_RUNTIME_DIR/woollama.addr`
   for clients to discover.
 
-**Implication:** anything that can reach the socket or the loopback port can use
-your configured providers (and your keys). Keep it local; don't reverse-proxy it
-to the internet without your own auth in front.
+## Surface authentication
+
+The HTTP surfaces (`/v1/*` and the mounted `/mcp`) are access-controlled, not
+open:
+
+- **Default (no token):** only *local* peers are served — loopback TCP and the
+  0600 Unix socket. Requests from any other peer are refused with 401 (a guard
+  that also covers a reverse proxy or port forward re-exposing a loopback bind).
+- **Off-loopback requires auth, fail closed:** a non-loopback `WOOLLAMA_ADDRESS`
+  refuses to start unless [`WOOLLAMA_TOKEN`](environment.md) is set — the opt-in
+  widens *reach*, never *access*.
+- **With `WOOLLAMA_TOKEN` set:** every TCP request (loopback included) must send
+  `Authorization: Bearer <token>` (constant-time compared). The Unix socket
+  stays exempt: its mode-0600 permissions are the credential.
+
+**Implication:** a local process that can reach the socket or the loopback port
+can still use your configured providers (and your keys) — same-user local access
+is the trust boundary. For anything beyond the machine, set `WOOLLAMA_TOKEN` and
+prefer your own TLS/auth in front for internet exposure.
 
 ## API key custody
 
@@ -35,6 +51,14 @@ A recipe declares an explicit `tools = [...]` allow-list. woollama enforces it a
 a **security boundary**, not a hint: a recipe can only dispatch the tools it
 lists — both in the in-process orchestration loop **and** in claude-code tool
 delegation. A recipe cannot reach a tool (or an MCP server) it didn't allow-list.
+
+In-loop, the boundary is enforced at **dispatch time** in Python
+(`Registry.dispatch`), not only when tools are offered to the model: a
+tool_call naming a configured-but-not-listed tool raises `PermissionError` and
+is surfaced back to the model as a tool error. This holds independently of the
+orchestration core's own offer-time filtering (defense in depth). The MCP
+aggregator surface (`/mcp`, which re-exports every configured tool by design)
+is instead gated by the surface authentication above.
 
 ## Claude Code executor containment
 

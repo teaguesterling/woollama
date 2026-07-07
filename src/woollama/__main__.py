@@ -14,7 +14,7 @@ import sys
 
 import uvicorn
 
-from . import binding
+from . import auth, binding
 from ._version import __version__
 from .router import app
 
@@ -46,7 +46,11 @@ def main() -> int:
         format="%(asctime)s %(name)s %(levelname)s  %(message)s",
         datefmt="%H:%M:%S",
     )
-    listeners = binding.open_sockets()
+    try:
+        listeners = binding.open_sockets()
+    except auth.ExposureError as e:
+        print(f"woollama: {e}", file=sys.stderr, flush=True)
+        return 2
     host, port = listeners.tcp_host, listeners.tcp_port
     print(f"woollama {__version__} — listening", flush=True)
     if listeners.sock_path:
@@ -58,6 +62,13 @@ def main() -> int:
     print("  models:               GET /v1/models", flush=True)
     print("  chat:                 POST /v1/chat/completions", flush=True)
     print(f"  MCP (Streamable HTTP): http://{host}:{port}/mcp", flush=True)
+    if auth.configured_token() is not None:
+        print("  auth:                 bearer token required on TCP "
+              f"(${auth.ENV_TOKEN})", flush=True)
+    else:
+        print("  auth:                 local clients only (loopback / unix "
+              f"socket); set ${auth.ENV_TOKEN} to serve beyond loopback",
+              flush=True)
 
     # One uvicorn Server bound to BOTH sockets (UDS + TCP) — same app, same
     # event loop. `Server.run(sockets=[...])` serves pre-bound sockets; we own

@@ -192,9 +192,10 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
    discovery and execution; OpenAI chat-completions for the inference
    primitive. woollama is a router between them.
 2. **Local-only, ephemeral by default.** Random loopback port, persisted
-   address file for discovery, never `0.0.0.0` without explicit opt-in. The
-   router holds API keys and routes to local resources — it should not be
-   LAN-reachable.
+   address file for discovery, never `0.0.0.0` without explicit opt-in — and
+   the opt-in requires an auth token (`WOOLLAMA_TOKEN`; woollama refuses to
+   start off-loopback without one). The router holds API keys and routes to
+   local resources — it should not be LAN-reachable unauthenticated.
 3. **The model namespace is the universal addressing scheme.** Raw inferencers
    (`<provider>/<model>`, e.g. `ollama/X`, `anthropic/X`, `claude-code/X`) and
    full recipes (`woollama/<recipe>`) are all addressable through OpenAI's

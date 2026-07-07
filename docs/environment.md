@@ -23,7 +23,8 @@ Required only to *use* (or live-`discover`) the matching cloud provider.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `WOOLLAMA_ADDRESS` | *(unset)* | Override the bind address (`host[:port]`). **The only way to bind off-loopback** (e.g. `0.0.0.0:8000`) — opt-in, since the router holds API keys. |
+| `WOOLLAMA_ADDRESS` | *(unset)* | Override the bind address (`host[:port]`). **The only way to bind off-loopback** (e.g. `0.0.0.0:8000`) — opt-in, since the router holds API keys. A non-loopback bind additionally **requires `WOOLLAMA_TOKEN`**; woollama refuses to start otherwise (fail closed). |
+| `WOOLLAMA_TOKEN` | *(unset)* | Surface auth token for `/v1/*` and `/mcp`. When set, **every TCP request** must send `Authorization: Bearer <token>` — loopback included; the Unix socket stays exempt (its mode-0600 permissions are the credential). When unset, only local peers (loopback TCP / the Unix socket) are served. Required to bind off-loopback. |
 | `XDG_RUNTIME_DIR` | `/tmp` fallback | Where the Unix socket (`woollama.sock`, mode 0600) and the address file (`woollama.addr`) are written. |
 
 ## Backends & config
@@ -36,6 +37,8 @@ Required only to *use* (or live-`discover`) the matching cloud provider.
 | `XDG_STATE_HOME` | `~/.local/state` | Base for the default state dir (above). |
 | `WOOLLAMA_OLLAMA_URL` | `http://localhost:11434` | The local Ollama endpoint (the `ollama/` provider's base + its `/v1/models` discovery). |
 | `WOOLLAMA_CLAUDE_BIN` | `claude` (on `PATH`) | Path to the Claude Code CLI for `claude-code/<model>` (inference, delegation, and the `claude-resume` conversation backend). |
+| `WOOLLAMA_TOOL_TIMEOUT` | `180` (seconds) | Wall-clock bound on one downstream MCP tool call, so a hung server bounds the turn instead of wedging the connection. `<= 0` disables. |
+| `WOOLLAMA_AGENT_NETWORKING` | `limited` | Networking policy for the hosted managed-agents environment. The default is least-privilege (`limited`); set `unrestricted` to restore open egress for setups that add network-using capabilities. |
 
 > The **conversation store** (issue #2) that makes non-claude models stateful is
 > selected in config, not by an env var — the top-level `conversationStore` key

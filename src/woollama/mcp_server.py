@@ -59,7 +59,8 @@ def build_registry() -> Registry:
     started — the FastMCP lifespan starts them on the serving loop)."""
     reg = Registry()
     for name, cfg in config.load_mcp_servers().items():
-        reg.add(ServerManager(name, cfg["command"], cfg["args"]))
+        reg.add(ServerManager(name, cfg["command"], cfg["args"],
+                              env=cfg.get("env") or None))
     return reg
 
 

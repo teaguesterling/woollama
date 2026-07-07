@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -194,7 +195,12 @@ class ConversationStore:
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data))
+        # Owner-only from creation (no chmod-after-write window): the table
+        # carries caller-supplied metadata/titles — keep it 0600 like the
+        # runtime socket, not umask-default world-readable.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data))
         tmp.replace(self._path)             # atomic swap
 
     def _load(self) -> None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from mcp.client.session import ClientSession
@@ -23,15 +24,42 @@ from .tooling import ToolResult, ToolSpec
 
 log = logging.getLogger("woollama.manager")
 
+# Default wall-clock bound for one downstream tool call, overridable with
+# $WOOLLAMA_TOOL_TIMEOUT (float seconds; <= 0 disables). Matches the HTTP
+# passthrough's generous 180s rather than a tight interactive budget — the
+# point is that a hung downstream server bounds the TURN instead of wedging
+# the connection's worker task forever.
+DEFAULT_TOOL_TIMEOUT = 180.0
+ENV_TOOL_TIMEOUT = "WOOLLAMA_TOOL_TIMEOUT"
+
+
+def _tool_timeout() -> float | None:
+    raw = os.environ.get(ENV_TOOL_TIMEOUT)
+    if raw is None or not raw.strip():
+        return DEFAULT_TOOL_TIMEOUT
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning("ignoring non-numeric %s=%r; using default %ss",
+                    ENV_TOOL_TIMEOUT, raw, DEFAULT_TOOL_TIMEOUT)
+        return DEFAULT_TOOL_TIMEOUT
+    return val if val > 0 else None
+
 
 class ServerManager:
     """Owns one MCP stdio connection. Tool calls marshal through a queue."""
 
-    def __init__(self, name: str, command: str, args: list[str]):
+    def __init__(self, name: str, command: str, args: list[str],
+                 env: dict[str, str] | None = None):
         self.name = name           # namespace prefix used in `<name>.<tool>`
         self.command = command
         self.args = args
+        # mcp.json's per-server `env` block. Forwarded to the spawned server via
+        # `StdioServerParameters.env` (the SDK merges it over its safe default
+        # environment) — never via argv, where a secret would show up in `ps`.
+        self.env = dict(env) if env else None
         self.tools: list[Any] = []  # populated on start via list_tools
+        self.tool_timeout = _tool_timeout()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._task: asyncio.Task | None = None
         self._ready = asyncio.Event()
@@ -57,7 +85,8 @@ class ServerManager:
 
     async def _run(self) -> None:
         try:
-            params = StdioServerParameters(command=self.command, args=self.args)
+            params = StdioServerParameters(command=self.command, args=self.args,
+                                           env=self.env)
             async with stdio_client(params) as (read, write):
                 async with ClientSession(read, write) as sess:
                     await sess.initialize()
@@ -71,9 +100,20 @@ class ServerManager:
                             break
                         op, args, future = item
                         try:
-                            result = await op(sess, *args)
+                            # The timeout lives HERE (around the op, inside the
+                            # worker), not around the caller's future: timing
+                            # out the future would leave the worker stuck on
+                            # the hung call, wedging every queued call behind it.
+                            result = await asyncio.wait_for(
+                                op(sess, *args), timeout=self.tool_timeout)
                             if not future.done():
                                 future.set_result(result)
+                        except asyncio.TimeoutError:
+                            if not future.done():
+                                future.set_exception(TimeoutError(
+                                    f"call on MCP server '{self.name}' timed "
+                                    f"out after {self.tool_timeout}s "
+                                    f"(${ENV_TOOL_TIMEOUT} to adjust)"))
                         except Exception as e:
                             if not future.done():
                                 future.set_exception(e)
@@ -158,8 +198,21 @@ class Registry:
             })
         return out
 
-    async def dispatch(self, namespaced: str, args: dict) -> Any:
-        """Route a model-emitted tool_call to the owning manager."""
+    async def dispatch(self, namespaced: str, args: dict, *,
+                       allow: list[str] | None = None) -> Any:
+        """Route a model-emitted tool_call to the owning manager.
+
+        `allow` (when not None) is enforced HERE, at dispatch time — a name
+        outside it raises `PermissionError` before anything reaches a server.
+        Offer-time filtering alone is not a boundary: a model can emit any
+        configured tool name, not just the ones it was offered. `allow=None`
+        keeps full dispatch for the MCP aggregator surface, which re-exports
+        every configured tool by design (its access control is the surface
+        auth, not a recipe allow-list)."""
+        if allow is not None and namespaced not in allow:
+            raise PermissionError(
+                f"tool '{namespaced}' is not in the active allow-list "
+                f"({sorted(allow)}); refusing to dispatch")
         mgr, bare, _ = self.lookup_tool(namespaced)
         return await mgr.call_tool(bare, args)
 
@@ -171,10 +224,18 @@ class RegistryToolProvider:
     output_schema + annotations, and the call result's structuredContent + isError
     + meta) — `core.render_tool_result` is the one place that narrows them. Keeps
     `Registry.dispatch` itself unchanged (the MCP proxy path still gets the raw
-    `CallToolResult`)."""
+    `CallToolResult`).
 
-    def __init__(self, registry: "Registry") -> None:
+    `allow` is the recipe's tool allow-list, enforced at DISPATCH time (via
+    `Registry.dispatch`) in Python — defense-in-depth that holds regardless of
+    whether the loop driving this provider (the compiled core) only dispatches
+    offered tools. A blocked dispatch raises `PermissionError`, which the core
+    renders back to the model as a tool error."""
+
+    def __init__(self, registry: "Registry",
+                 allow: list[str] | None = None) -> None:
         self._reg = registry
+        self._allow = list(allow) if allow is not None else None
 
     def tools_for(self, allow):
         out = []
@@ -203,7 +264,8 @@ class RegistryToolProvider:
         return out
 
     async def dispatch(self, name: str, args: dict) -> ToolResult:
-        r = await self._reg.dispatch(name, args)        # raw CallToolResult
+        r = await self._reg.dispatch(name, args,        # raw CallToolResult
+                                     allow=self._allow)
         return ToolResult(
             blocks=list(getattr(r, "content", None) or []),
             structured=getattr(r, "structuredContent", None),
