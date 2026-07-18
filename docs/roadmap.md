@@ -285,9 +285,16 @@ the v1.0 feature set") was met before the port:
 - [x] streaming on both sides (OpenAI SSE out — passthrough + orchestration; MCP
       progress events on the `chat` tool)
 - [x] Unix socket alongside HTTP loopback
-- [ ] the panel-confirm round-trip equivalent — the conversations surface IS
-      shipped; the open half is **cosmic-fabric consuming it**.
+- [x] the panel-confirm round-trip equivalent — the conversations surface is
+      shipped AND consumed: cosmic-fabric drives turns by attach-by-key on
+      `/v1/responses` (both claude and ollama session branches) and, as of
+      2026-07-18 (`cosmic-fabric` branch `woollama-conversations`), consumes the
+      discovery/read/teardown half — `GET /v1/conversations` (filtered by the
+      echoed `key` under its `cosmic-fabric:` namespace), `/items` for
+      resume-on-open transcripts, and `DELETE` — with gated live integration
+      tests (real woollamad + rest-convstore; two-turn server-side recall).
 
-The one remaining follow-on is criterion #3 (a real consumer — cosmic-fabric
-actively driving woollama through its OpenAI/MCP surfaces). It doesn't block the
-cutover, which already happened; it's the next integration milestone.
+Criterion #3 (a real consumer actively driving woollama through its OpenAI/MCP
+surfaces) is thereby met: cosmic-fabric consumes `/v1` (models, chat, responses,
+conversations) and `/w1` (patterns, render, run) end-to-end. Remaining follow-on
+is UI-side only (the panel session picker in cosmic-fabric).
