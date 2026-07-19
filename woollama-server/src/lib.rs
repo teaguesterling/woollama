@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use woollama_engine as engine;
 use engine::EngineError;
 
+pub mod auth;
 pub mod binding;
 mod claude_code;
 mod config;

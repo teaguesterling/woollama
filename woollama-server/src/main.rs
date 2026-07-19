@@ -3,6 +3,7 @@
 //! — a TCP loopback (OpenAI-compatible HTTP) and a unix socket (the default for local MCP
 //! clients) — serving the same axum app on both. See docs/rust-router-port.md.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use woollama_server::binding;
@@ -23,6 +24,13 @@ async fn main() {
 
     // TCP loopback (or the WOOLLAMA_ADDRESS override). Persist the real host:port for discovery.
     let (host, port) = woollama_server::resolve_tcp_target();
+    // Fail closed: refuse to bind a non-loopback address without an auth token, rather than
+    // silently exposing an unauthenticated surface to the network. No-op for the default
+    // (loopback) bind and for any token-bearing deployment.
+    if let Err(e) = woollama_server::auth::check_bind_allowed(&host) {
+        eprintln!("woollamad: {e}");
+        std::process::exit(1);
+    }
     let tcp = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .unwrap_or_else(|e| panic!("bind {host}:{port}: {e}"));
@@ -45,8 +53,14 @@ async fn main() {
     // UnixListener). Two serve tasks; exit on either dying or on Ctrl-C, then clean up the socket.
     let backends = state.pattern_backends.clone(); // for graceful shutdown (e.g. kill managed fabric)
     let app = woollama_server::router(state);
-    let app_tcp = app.clone();
-    let tcp_task = tokio::spawn(async move { axum::serve(tcp, app_tcp).await });
+    // TCP surface is access-controlled: apply the auth layer and serve with peer ConnectInfo so
+    // the layer can see the client IP. The UDS app carries NO auth layer — the mode-0600 socket is
+    // the credential — so local MCP clients (panel/CLI/cosmic-fabric) stay exempt.
+    let app_tcp =
+        app.clone().layer(axum::middleware::from_fn(woollama_server::auth::require_surface_auth));
+    let tcp_task = tokio::spawn(async move {
+        axum::serve(tcp, app_tcp.into_make_service_with_connect_info::<SocketAddr>()).await
+    });
     let unix_task = unix.map(|u| {
         let app_unix = app.clone();
         tokio::spawn(async move { axum::serve(u, app_unix).await })

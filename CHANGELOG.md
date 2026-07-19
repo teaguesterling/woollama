@@ -10,6 +10,15 @@ set, every TCP request must send `Authorization: Bearer <token>` (the Unix
 socket stays exempt — its file mode is the credential). The default loopback,
 no-token workflow is unchanged.
 
+- **Enforced by the shipping Rust daemon (`woollamad`), not just the Python
+  oracle.** The surface auth + fail-closed bind land in `woollama-server`
+  (`auth.rs`: bearer/loopback middleware applied to the TCP app; `check_bind_allowed`
+  before the bind; the 0600 Unix-socket app carries no auth layer). The recipe
+  allow-list was already enforced at dispatch in `woollama-engine`.
+- **Unix socket no longer clobbered by a second daemon.** `binding.rs::bind_unix`
+  now probes for a live peer before reclaiming the socket: a transient second
+  `woollamad` serves TCP-only instead of stealing the primary's live socket (and
+  its discovery files) — the discovery-clobber failure mode.
 - **Recipe allow-list enforced at dispatch time (Python).** `Registry.dispatch`
   now takes the active allow-list and refuses a tool outside it; the recipe
   loop's `RegistryToolProvider` carries the recipe's `tools` list, so the
