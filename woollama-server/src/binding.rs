@@ -37,12 +37,23 @@ pub fn addr_path() -> PathBuf {
     runtime_dir().join("woollama.addr")
 }
 
-/// Bind a stream Unix socket at `path`, mode 0600. Unlinks a stale socket file first (a
-/// leftover from a dead run, or our own previous run — single-instance local daemon), then
-/// binds and tightens the mode. Returns `None` (and logs) if any step fails, so the caller
-/// degrades to TCP-only. Mirrors `_open_unix_socket` + the best-effort wrapper in `open_sockets`.
+/// Bind a stream Unix socket at `path`, mode 0600. **Probes for a live peer before reclaiming**:
+/// if another process is already accepting on this socket, we do NOT unlink it (a transient second
+/// `woollamad` must not steal the primary's live socket — that breaks the running daemon's UDS
+/// clients and clobbers discovery). Only a *dead*/stale socket is reclaimed. Returns `None` (and
+/// logs) if a live peer holds it or any step fails, so the caller degrades to TCP-only. Mirrors the
+/// probe-before-reclaim pattern the fabric backend uses (`fabric.rs::ready`).
 pub fn bind_unix(path: &Path) -> Option<UnixListener> {
-    // Clear a stale socket from a prior run (FileNotFound is fine).
+    // A successful connect means a live peer is accepting here (a listening socket completes the
+    // connect into its backlog even without an active accept()). Refuse to clobber it.
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        eprintln!(
+            "woollamad: {} is already served by a live peer; serving TCP-only (not stealing the socket)",
+            path.display()
+        );
+        return None;
+    }
+    // No live peer — clear the stale socket file, if any (FileNotFound is fine), then bind.
     if let Err(e) = std::fs::remove_file(path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             eprintln!("woollamad: unix socket unavailable (stale unlink: {e}); serving TCP-only");
@@ -79,4 +90,30 @@ pub fn persist_addr(host: &str, port: u16) {
 /// Remove the Unix socket file on shutdown (FileNotFound is fine). Mirrors `cleanup`.
 pub fn cleanup_unix(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test] // bind_unix binds a tokio UnixListener → needs a reactor
+    async fn bind_unix_does_not_steal_a_live_socket_but_reclaims_a_dead_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("woollama.sock");
+
+        // A LIVE peer owns the socket (a real std listening socket — the kernel completes a
+        // connect() into its backlog, so the liveness probe sees it even with no active
+        // accept()). A second bind_unix must refuse (serve TCP-only), NOT unlink it.
+        let primary = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(bind_unix(&path).is_none(), "must NOT clobber a live peer's socket");
+        assert!(path.exists(), "the live socket file survives");
+        drop(primary); // the primary goes away, leaving a STALE socket file behind (std doesn't unlink)
+
+        // A DEAD/stale socket (file present, nothing listening) IS reclaimed.
+        assert!(path.exists(), "stale socket file still on disk");
+        let reclaimed = bind_unix(&path);
+        assert!(reclaimed.is_some(), "a dead socket is reclaimed");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "reclaimed socket is 0600");
+    }
 }
