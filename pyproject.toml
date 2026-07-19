@@ -1,6 +1,6 @@
 [project]
 name = "woollama"
-version = "0.7.0"
+version = "0.8.0"
 description = "Web Over Ollama (and Llamas) — an MCP + OpenAI router for AI desktops."
 readme = "README.md"
 license = { file = "LICENSE" }

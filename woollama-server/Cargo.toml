@@ -1,6 +1,6 @@
 [package]
 name = "woollama-server"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "woollamad — the woollama router daemon (Rust): an OpenAI-compatible + MCP router over Ollama, cloud models, and Claude Code, built on axum + woollama-engine."
 license = "MIT"
@@ -28,7 +28,7 @@ path = "src/main.rs"
 test-fixtures = []
 
 [dependencies]
-woollama-engine = { path = "../woollama-engine", version = "0.7.0" }
+woollama-engine = { path = "../woollama-engine", version = "0.8.0" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 # 0.13 to match rmcp's reqwest (so reqwest::Client unifies with rmcp's HTTP client impl).

@@ -105,6 +105,14 @@ impl ConversationStore {
         }
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, data.to_string()).is_ok() {
+            // Owner-only (0600): the handle table maps conversation ids to backends + native
+            // session ids; not transcripts, but not world-readable either. Set the mode on the
+            // tmp file so the atomic rename lands an already-0600 file (no world-readable window).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            }
             let _ = std::fs::rename(&tmp, path); // atomic swap
         }
     }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.8.0 — 2026-07-19
+
 **Surface authentication + fail-closed binding.** The HTTP surfaces (`/v1/*` and
 the mounted `/mcp`) are now access-controlled: with no token configured, only
 *local* peers (loopback TCP, the 0600 Unix socket) are served; a non-loopback
