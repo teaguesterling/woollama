@@ -162,14 +162,37 @@ pub async fn build_state() -> AppState {
 /// The TCP host/port to bind — `$WOOLLAMA_ADDRESS=host[:port]`, else `127.0.0.1:0`.
 pub fn resolve_tcp_target() -> (String, u16) {
     match std::env::var("WOOLLAMA_ADDRESS") {
-        Ok(addr) if !addr.is_empty() => match addr.split_once(':') {
-            Some((host, port)) => (
-                if host.is_empty() { "127.0.0.1".to_string() } else { host.to_string() },
-                port.parse().unwrap_or(0),
-            ),
-            None => (addr, 0),
-        },
+        Ok(addr) if !addr.is_empty() => parse_tcp_address(&addr),
         _ => ("127.0.0.1".to_string(), 0),
+    }
+}
+
+/// Parse a `WOOLLAMA_ADDRESS` value into `(host, port)`. Handles IPv4/host `host:port`,
+/// bracketed IPv6 `[::1]:8080`, a bare IP with no port (`127.0.0.1`, `::1` → ephemeral port),
+/// `:port` (empty host → loopback), and a bare host. Port defaults to 0 (ephemeral) when
+/// absent/unparseable.
+///
+/// The old first-`:`-split broke every IPv6 form: a bare `::1` silently became `127.0.0.1`, and
+/// `[::]:8080`/`[::1]:8080` produced host `"["` — which then PANICS `TcpListener::bind`. (The auth
+/// bind-gate fails safe on the bad host, but a legitimate IPv6 bind was simply non-functional.)
+fn parse_tcp_address(addr: &str) -> (String, u16) {
+    // A full socket address, including bracketed IPv6 with a port (`[::1]:8080`).
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return (sa.ip().to_string(), sa.port());
+    }
+    // A bare IP with no port (IPv4 or IPv6, optionally bracketed) → ephemeral port.
+    let bare = addr.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(addr);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return (ip.to_string(), 0);
+    }
+    // Hostname forms: split on the LAST `:` so a bare hostname stays whole and `host:port` /
+    // `:port` work. (Anything bracketed or multi-colon already matched a branch above.)
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (
+            if host.is_empty() { "127.0.0.1".to_string() } else { host.to_string() },
+            port.parse().unwrap_or(0),
+        ),
+        None => (addr.to_string(), 0),
     }
 }
 
@@ -1328,5 +1351,32 @@ mod fnmatch_tests {
         assert!(fnmatch("exact", "exact"));
         assert!(!fnmatch("exact", "exacto"));
         assert!(fnmatch("a*b*c", "axxbyyc"));
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::parse_tcp_address;
+
+    #[test]
+    fn parses_ipv4_ipv6_host_and_port_forms() {
+        // IPv4 / host:port
+        assert_eq!(parse_tcp_address("127.0.0.1:8080"), ("127.0.0.1".into(), 8080));
+        assert_eq!(parse_tcp_address("0.0.0.0:9000"), ("0.0.0.0".into(), 9000));
+        assert_eq!(parse_tcp_address("localhost:1234"), ("localhost".into(), 1234));
+        // bare IP → ephemeral port
+        assert_eq!(parse_tcp_address("127.0.0.1"), ("127.0.0.1".into(), 0));
+        // :port → loopback
+        assert_eq!(parse_tcp_address(":7000"), ("127.0.0.1".into(), 7000));
+        // bare host
+        assert_eq!(parse_tcp_address("myhost"), ("myhost".into(), 0));
+
+        // IPv6 — the forms the old first-`:`-split broke:
+        assert_eq!(parse_tcp_address("[::1]:8080"), ("::1".into(), 8080));
+        assert_eq!(parse_tcp_address("[::]:8080"), ("::".into(), 8080));
+        assert_eq!(parse_tcp_address("::1"), ("::1".into(), 0)); // no longer downgraded to IPv4
+        assert_eq!(parse_tcp_address("[::1]"), ("::1".into(), 0));
+        // the exact old-panic input never yields the bogus host `"["`
+        assert_ne!(parse_tcp_address("[::]:8080").0, "[");
     }
 }

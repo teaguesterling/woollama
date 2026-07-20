@@ -84,7 +84,9 @@ pub fn persist_addr(host: &str, port: u16) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, format!("{host}:{port}\n"));
+    // Bracket an IPv6 host so the `host:port` form is unambiguous (`[::1]:8080`, not `::1:8080`).
+    let host_fmt = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+    let _ = std::fs::write(&path, format!("{host_fmt}:{port}\n"));
 }
 
 /// Remove the Unix socket file on shutdown (FileNotFound is fine). Mirrors `cleanup`.
