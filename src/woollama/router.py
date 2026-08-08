@@ -264,6 +264,23 @@ async def images_generations(request: Request) -> Response:
     return await _passthrough_images(body)
 
 
+@app.post("/v1/embeddings")
+async def embeddings(request: Request) -> Response:
+    """Text-embedding pass-through: `<provider>/<model>` -> that inferencer's
+    OpenAI-compat /v1/embeddings (e.g. the Tiiny device's Qwen3-Embedding). For
+    local vectorization/RAG through woollama."""
+    body = await request.json()
+    model = body.get("model", "")
+    provider = model.split("/", 1)[0]
+    if inferencers.get(provider) is None:
+        return _error(
+            f"unknown model namespace: '{model}'. Use '<provider>/<model>' for a "
+            f"known inferencer ({', '.join(inferencers.names())}).",
+            "invalid_request_error", 400,
+        )
+    return await _passthrough_embeddings(body)
+
+
 @app.post("/v1/responses")
 async def responses_create(request: Request) -> Response:
     """Stateful surface — OpenAI *Responses* shape (docs/conversations-api-design).
@@ -680,6 +697,26 @@ async def _passthrough_images(body: dict) -> Response:
             return JSONResponse(r.json(), status_code=r.status_code)
         except (ValueError, TypeError):
             return _error(r.text or "image generation error", "server_error", r.status_code)
+
+
+async def _passthrough_embeddings(body: dict) -> Response:
+    """Forward an embeddings request to the inferencer's /v1/embeddings, stripping
+    the namespace prefix and adding auth. Embeddings are quick, so the chat path's
+    180s timeout is plenty."""
+    body = dict(body)
+    provider, _, bare = body["model"].partition("/")
+    inf = inferencers.get(provider)        # caller verified it's known
+    body["model"] = bare
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        return _error(str(e), "invalid_request_error", 400)
+    async with httpx.AsyncClient(timeout=180) as c:
+        r = await c.post(inf.embeddings_url(), json=body, headers=headers)
+        try:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        except (ValueError, TypeError):
+            return _error(r.text or "embeddings error", "server_error", r.status_code)
 
 
 # Large num_ctx means a long prompt-eval before the first byte (and that's

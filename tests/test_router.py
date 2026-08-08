@@ -278,6 +278,36 @@ async def test_images_generations_unknown_provider_is_400(monkeypatch):
     assert resp.status_code == 400
 
 
+async def test_embeddings_passthrough_strips_prefix_and_forwards(monkeypatch):
+    """POST /v1/embeddings forwards <provider>/<model> to the inferencer's
+    /v1/embeddings, stripping the namespace prefix."""
+    captured: dict = {}
+
+    class _SpyClient:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["url"] = url
+            captured["body"] = json
+            return HttpxResponseStub(200, {"data": [{"embedding": [0.1, 0.2]}]})
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+
+    resp = await router.embeddings(FakeRequest({
+        "model": "ollama/nomic-embed-text",
+        "input": "hello",
+    }))
+    assert "/v1/embeddings" in captured["url"]
+    assert captured["body"]["model"] == "nomic-embed-text"
+    assert resp.status_code == 200
+
+
+async def test_embeddings_unknown_provider_is_400(monkeypatch):
+    resp = await router.embeddings(FakeRequest({"model": "nope/x", "input": "hi"}))
+    assert resp.status_code == 400
+
+
 async def test_chat_passthrough_streams_upstream_sse_verbatim(monkeypatch):
     """stream:true on a passthrough model relays the upstream SSE byte-for-byte
     (chunk framing + `[DONE]` sentinel preserved) and keeps stream=true on the
