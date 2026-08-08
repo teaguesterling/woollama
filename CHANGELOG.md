@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.9.0 — 2026-08-08
+
+**Image + embedding pass-through endpoints.** woollama now proxies text-to-image
+and text-embedding requests to a `<provider>/<model>` inferencer's own
+OpenAI-compatible endpoints, mirroring the existing chat pass-through — so a single
+OpenAI client pointed at woollama can do chat, images, and vectors.
+
+- **`POST /v1/images/generations`** → forwards to the inferencer's
+  `/v1/images/generations` (e.g. the Tiiny device's `Z-Image-Turbo`), stripping the
+  namespace prefix and adding auth. Always non-streaming, with a generous 300s read
+  timeout for slow diffusion.
+- **`POST /v1/embeddings`** → forwards to the inferencer's `/v1/embeddings` (e.g.
+  `Qwen3-Embedding`), for local vectorization / RAG.
+- `Inferencer.images_url()` / `embeddings_url()` alongside `chat_url()`; an unknown
+  model namespace returns `400`, consistent with chat. Both verified end-to-end
+  against the device; 4 new unit tests.
+
 ## v0.8.0 — 2026-07-19
 
 **Surface authentication + fail-closed binding.** The HTTP surfaces (`/v1/*` and
