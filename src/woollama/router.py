@@ -247,6 +247,23 @@ async def chat_completions(request: Request) -> Response:
     )
 
 
+@app.post("/v1/images/generations")
+async def images_generations(request: Request) -> Response:
+    """Text-to-image pass-through: `<provider>/<model>` -> that inferencer's
+    OpenAI-compat /v1/images/generations (e.g. the Tiiny device's Z-Image-Turbo).
+    Always non-streaming."""
+    body = await request.json()
+    model = body.get("model", "")
+    provider = model.split("/", 1)[0]
+    if inferencers.get(provider) is None:
+        return _error(
+            f"unknown model namespace: '{model}'. Use '<provider>/<model>' for a "
+            f"known inferencer ({', '.join(inferencers.names())}).",
+            "invalid_request_error", 400,
+        )
+    return await _passthrough_images(body)
+
+
 @app.post("/v1/responses")
 async def responses_create(request: Request) -> Response:
     """Stateful surface — OpenAI *Responses* shape (docs/conversations-api-design).
@@ -641,6 +658,28 @@ async def _passthrough(body: dict) -> Response:
     async with httpx.AsyncClient(timeout=180) as c:
         r = await c.post(inf.chat_url(), json=body, headers=headers)
         return JSONResponse(r.json(), status_code=r.status_code)
+
+
+async def _passthrough_images(body: dict) -> Response:
+    """Forward a text-to-image request to the inferencer's /v1/images/generations
+    (e.g. the device's Z-Image-Turbo). Swaps the namespaced model for the bare
+    name and adds auth; never streams. Image generation runs for tens of seconds,
+    so it gets a generous read timeout rather than the chat path's 180s."""
+    body = dict(body)
+    provider, _, bare = body["model"].partition("/")
+    inf = inferencers.get(provider)        # caller verified it's known
+    body["model"] = bare
+    body.pop("stream", None)
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        return _error(str(e), "invalid_request_error", 400)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as c:
+        r = await c.post(inf.images_url(), json=body, headers=headers)
+        try:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        except (ValueError, TypeError):
+            return _error(r.text or "image generation error", "server_error", r.status_code)
 
 
 # Large num_ctx means a long prompt-eval before the first byte (and that's
