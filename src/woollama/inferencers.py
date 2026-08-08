@@ -53,6 +53,12 @@ class Inferencer:
     def chat_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
 
+    def images_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/images/generations"
+
+    def embeddings_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/embeddings"
+
     def headers(self) -> dict[str, str]:
         """Auth headers; raises InferencerError if the configured key env is
         unset (fail fast with a clear message rather than a 401 from upstream)."""
