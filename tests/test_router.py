@@ -377,6 +377,104 @@ async def test_chat_passthrough_stream_upstream_error_is_json_not_empty_stream(m
 
 
 # ---------------------------------------------------------------------------
+# /v1/chat/completions — pool-gated passthrough (management-capable inferencers)
+# ---------------------------------------------------------------------------
+
+class _FakeManager:
+    def __init__(self, loaded):
+        self._loaded = list(loaded)
+        self.ensured = []
+    def snapshot(self):
+        return list(self._loaded)
+    async def ensure_loaded(self, real_id, *, pool_max=None):
+        self.ensured.append(real_id)
+    def acquire(self, real_id): pass
+    def release(self, real_id): pass
+    def enqueue(self, real_id): pass
+    def dequeue(self, real_id): pass
+    def queued(self, real_id): return 0
+
+
+async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypatch, tmp_path):
+    import httpx
+
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        'management_url="http://dev:8800"\nvirtual={ default = "Cfg/Fallback" }\n')
+
+    captured = {}
+    class _SpyClient:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["url"] = url
+            captured["body"] = json
+            return HttpxResponseStub(200, {"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+
+    mgr = _FakeManager(loaded=["Qwen/Coder"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        await router.chat_completions(FakeRequest({
+            "model": "tiiny/default",
+            "messages": [{"role": "user", "content": "hi"}]}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert captured["body"]["model"] == "Qwen/Coder"       # default -> loaded id
+    assert mgr.ensured == ["Qwen/Coder"]
+
+
+async def test_pooled_passthrough_backpressure_is_503_with_retry_after(monkeypatch, tmp_path):
+    """Trigger Backpressure through a REAL pool.Gate wrapping a fake manager whose
+    ensure_loaded raises it — Gate.slot -> enter -> ensure_loaded then propagates
+    it faithfully. (A bare stand-in gate with only `enter` defined would 500 with
+    AttributeError on the non-streaming path's `async with gate.slot(real)`,
+    since that needs the asynccontextmanager `slot` method too — so the fake
+    device failure has to originate inside the real Gate, not bypass it.)"""
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
+
+    class _BusyManager(_FakeManager):
+        async def ensure_loaded(self, real_id, *, pool_max=None):
+            raise pool.Backpressure(7.0)
+
+    mgr = _BusyManager(loaded=["X"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/X", "messages": []}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert resp.status_code == 503
+    assert resp.headers.get("Retry-After") == "7"
+
+
+async def test_non_pooled_inferencer_unchanged(monkeypatch):
+    """ollama has no management_url -> stateless passthrough, prefix stripped."""
+    import httpx
+    captured = {}
+    class _SpyClient:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["body"] = json
+            return HttpxResponseStub(200, {"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+    assert "ollama" not in router._pools
+    await router.chat_completions(FakeRequest({
+        "model": "ollama/qwen3:14b", "messages": [{"role": "user", "content": "hi"}]}))
+    assert captured["body"]["model"] == "qwen3:14b"
+
+
+# ---------------------------------------------------------------------------
 # /v1/chat/completions — recipe orchestration
 # ---------------------------------------------------------------------------
 
