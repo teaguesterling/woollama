@@ -269,3 +269,43 @@ def test_config_dir_xdg_fallback(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     from woollama import config
     assert config.config_dir() == tmp_path / "xdg" / "woollama"
+
+
+def test_load_inferencers_parses_pooling_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\n'
+        'base_url = "http://dev/v1"\n'
+        'management_url = "http://dev:8800"\n'
+        'parallel = 2\n'
+        'pool_max = 3\n'
+        'queue_max = 8\n'
+        'queue_timeout = 45\n'
+        'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
+    )
+    from woollama import config
+    spec = config.load_inferencers()["tiiny"]
+    assert spec["management_url"] == "http://dev:8800"
+    assert spec["parallel"] == 2
+    assert spec["pool_max"] == 3
+    assert spec["queue_max"] == 8
+    assert spec["queue_timeout"] == 45.0
+    assert spec["virtual"] == {"default": "Qwen/Coder", "coder": "Qwen/Coder"}
+
+
+def test_load_inferencers_rejects_non_int_parallel(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.x]\nbase_url="http://h/v1"\nparallel = true\n')
+    from woollama import config
+    with pytest.raises(ValueError, match="parallel"):
+        config.load_inferencers()
+
+
+def test_load_inferencers_rejects_non_table_virtual(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.x]\nbase_url="http://h/v1"\nvirtual = ["a","b"]\n')
+    from woollama import config
+    with pytest.raises(ValueError, match="virtual"):
+        config.load_inferencers()

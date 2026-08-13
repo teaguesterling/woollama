@@ -291,3 +291,34 @@ async def test_passthrough_routes_to_anthropic(monkeypatch):
     assert seen["headers"]["Authorization"] == "Bearer sk-ant-pt"
     assert seen["json"]["model"] == "claude-haiku-4-5"
     assert seen["json"]["stream"] is False   # non-streaming request forced off
+
+
+def test_registry_threads_pooling_fields(monkeypatch, tmp_path):
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\n'
+        'base_url = "http://dev/v1"\n'
+        'management_url = "http://dev:8800"\n'
+        'parallel = 2\n'
+        'pool_max = 3\n'
+        'queue_max = 8\n'
+        'queue_timeout = 45\n'
+        'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
+    )
+    inf = inferencers.get("tiiny")
+    assert inf.management_url == "http://dev:8800"
+    assert inf.parallel == 2
+    assert inf.pool_max == 3
+    assert inf.queue_max == 8
+    assert inf.queue_timeout == 45.0
+    assert inf.virtual == {"default": "Qwen/Coder", "coder": "Qwen/Coder"}
+
+
+def test_registry_pooling_fields_default_when_absent():
+    inf = inferencers.get("anthropic")     # a built-in, no pooling config
+    assert inf.management_url is None
+    assert inf.parallel == 1
+    assert inf.pool_max is None
+    assert inf.queue_max is None
+    assert inf.queue_timeout == 30.0
+    assert inf.virtual == {}
