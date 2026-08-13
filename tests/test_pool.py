@@ -27,6 +27,21 @@ class FakeDevice:
         self.block_stop = False
         self.stop_started = threading.Event()
         self.stop_release = threading.Event()
+        # Round-3 additions (opt-in, default off so the tests above are
+        # unaffected): device-error + poll-timeout branches.
+        #   fail_running      -> GET /running returns HTTP 500.
+        #   running_bad_json  -> GET /running returns HTTP 200 with a
+        #                        non-JSON body.
+        #   start_no_register -> POST .../start returns 200 but does NOT
+        #                        add the id to `running` (so a poll loop
+        #                        never sees it -> load-timeout path).
+        #   fail_stop         -> POST .../stop returns HTTP 500 and leaves
+        #                        the id in `running` (stop failed; nothing
+        #                        was actually torn down on the device).
+        self.fail_running = False
+        self.running_bad_json = False
+        self.start_no_register = False
+        self.fail_stop = False
         dev = self
 
         class H(BaseHTTPRequestHandler):
@@ -46,6 +61,17 @@ class FakeDevice:
             def do_GET(self):
                 if self.path == "/api/v1/models/running":
                     with dev._lock:
+                        if dev.fail_running:
+                            self._json(500, {"error": "running failed"})
+                            return
+                        if dev.running_bad_json:
+                            raw = b"not json"
+                            self.send_response(200)
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(raw)))
+                            self.end_headers()
+                            self.wfile.write(raw)
+                            return
                         self._json(200, {"object": "list",
                                          "running": sorted(dev.running),
                                          "pending": []})
@@ -64,7 +90,8 @@ class FakeDevice:
                         dev.calls.append(("start", mid))
                         if dev.fail_start:
                             self._json(500, {"error": "start failed"}); return
-                        dev.running.add(mid)
+                        if not dev.start_no_register:
+                            dev.running.add(mid)
                     self._json(200, {"ok": True})
                 elif p.startswith(prefix) and p.endswith("/stop"):
                     mid = p[len(prefix):-len("/stop")]
@@ -73,6 +100,8 @@ class FakeDevice:
                         dev.stop_release.wait()
                     with dev._lock:
                         dev.calls.append(("stop", mid))
+                        if dev.fail_stop:
+                            self._json(500, {"error": "stop failed"}); return
                         dev.running.discard(mid)
                     self._json(200, {"ok": True})
                 else:
@@ -344,3 +373,98 @@ async def test_gate_protects_serving_model_from_eviction(device):
     release.set()
     await asyncio.gather(ta, tb)
     await mgr.aclose()
+
+
+# --- Round-3: device-error branches + Slot.release idempotency -------------
+
+async def test_running_query_non_2xx_raises_device_error(device):
+    """GET /running returning a non-2xx status (device-side failure, not a
+    transport error) must surface as DeviceError, not propagate a raw HTTP
+    status or silently treat it as "nothing running" (pool.py:172-173)."""
+    device.fail_running = True
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    try:
+        with pytest.raises(pool.DeviceError):
+            await mgr.ensure_loaded("Qwen/Coder")
+    finally:
+        await mgr.aclose()
+
+
+async def test_running_query_bad_json_raises_device_error(device):
+    """GET /running returning HTTP 200 with a non-JSON body must surface as
+    DeviceError, not an uncaught ValueError from `.json()` (pool.py:176-177)."""
+    device.running_bad_json = True
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    try:
+        with pytest.raises(pool.DeviceError):
+            await mgr.ensure_loaded("Qwen/Coder")
+    finally:
+        await mgr.aclose()
+
+
+async def test_start_poll_timeout_raises_device_error(device):
+    """POST /start succeeds (200) but the model never shows up in /running --
+    the post-start poll loop must give up at `load_timeout` and raise
+    DeviceError with a "not running" message (pool.py:191-192), not hang or
+    return silently."""
+    device.start_no_register = True
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01, load_timeout=0.05)
+    try:
+        with pytest.raises(pool.DeviceError, match="not running"):
+            await mgr.ensure_loaded("Qwen/Coder")
+    finally:
+        await mgr.aclose()
+
+
+async def test_stop_failure_raises_device_error(device):
+    """Evicting an idle LRU victim whose /stop call fails (non-2xx) must raise
+    DeviceError (pool.py:200-201) and must NOT drop the victim from the
+    device's running set -- the device never actually tore it down, so our
+    bookkeeping must not claim otherwise."""
+    device.running.update({"A", "B"})
+    device.fail_stop = True
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01, clock=_fake_clock())
+    try:
+        await mgr.ensure_loaded("A")            # last_used older -> LRU victim
+        await mgr.ensure_loaded("B")            # last_used newer
+        with pytest.raises(pool.DeviceError):
+            await mgr.ensure_loaded("C", pool_max=2)   # full -> evict A -> stop fails
+        assert "A" in device.running, "stop failed; device state must be unchanged"
+    finally:
+        await mgr.aclose()
+
+
+async def test_slot_release_is_idempotent(device):
+    """`Slot.release` must be safe to call twice: only the FIRST call may drop
+    the in-flight ref-count and release the semaphore permit (pool.py:218-219).
+    A double-release would over-release the semaphore, letting two holders in
+    under parallel=1 -- the invariant the streaming on_close path relies on
+    (on_close can, in principle, race a caller's own cleanup)."""
+    import asyncio
+
+    device.running.add("X")
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    gate = pool.Gate(mgr, parallel=1)
+    try:
+        slot = await gate.enter("X")
+        await slot.release()
+        await slot.release()   # must be a no-op, not a second semaphore release
+
+        order = []
+
+        async def worker(tag, hold):
+            async with gate.slot("X"):
+                order.append(f"enter-{tag}")
+                await asyncio.sleep(hold)
+                order.append(f"exit-{tag}")
+
+        await asyncio.gather(worker("1", 0.02), worker("2", 0.0))
+        # parallel=1 => still serialized. A double-release above would have
+        # bumped the semaphore to 2 permits, letting both workers hold at once
+        # (an interleaved order would appear here).
+        assert order in (
+            ["enter-1", "exit-1", "enter-2", "exit-2"],
+            ["enter-2", "exit-2", "enter-1", "exit-1"],
+        )
+    finally:
+        await mgr.aclose()
