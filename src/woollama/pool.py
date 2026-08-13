@@ -245,7 +245,14 @@ class Gate:
         """Full gating protocol for one request: reject early if the per-model
         queue is saturated; otherwise register a queue slot (which also protects
         the model from eviction), ensure it's loaded, then acquire a concurrency
-        permit within queue_timeout and bump the in-flight ref-count."""
+        permit within queue_timeout and bump the in-flight ref-count.
+
+        Note: `queue_timeout` bounds only the semaphore acquisition below, NOT
+        the preceding `ensure_loaded` await -- time spent waiting on an
+        in-progress model load (which serializes on the manager's global
+        `_load_lock` and can poll up to `load_timeout`, default 120s) is
+        unbounded by `queue_timeout` and is governed separately by
+        `load_timeout`."""
         if self._queue_max is not None and self._manager.queued(real_id) >= self._queue_max:
             raise Backpressure(self._retry_after)
         self._manager.enqueue(real_id)
@@ -253,6 +260,8 @@ class Gate:
             await self._manager.ensure_loaded(real_id, pool_max=self._pool_max)
             sem = self._sem(real_id)
             try:
+                # queue_timeout applies only to this acquire; see the docstring
+                # note above about the load wait above not being bounded by it.
                 await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout)
             except asyncio.TimeoutError:
                 raise Backpressure(self._retry_after)

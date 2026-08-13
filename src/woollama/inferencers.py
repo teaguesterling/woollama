@@ -55,7 +55,11 @@ class Inferencer:
     management_url: str | None = None   # device mgmt base (:8800); presence enables the pool
     parallel: int = 1                   # per-model concurrency slot size (device default 1)
     pool_max: int | None = None         # max concurrently-loaded models; None => no cap/eviction
-    queue_max: int | None = None        # max queued requests per model before backpressure
+    # Max queued requests per model before backpressure, checked BEFORE enqueue:
+    # None = unlimited queue; a positive N = at most N queued beyond the
+    # in-flight permit(s); 0 = reject-all backpressure (no queue at all --
+    # including the very first request, since 0 >= 0).
+    queue_max: int | None = None
     queue_timeout: float = 30.0         # seconds a request may wait before 503+Retry-After
     virtual: dict = field(default_factory=dict)  # alias -> real_id; reserved key 'default'
 

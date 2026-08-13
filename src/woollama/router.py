@@ -316,7 +316,13 @@ async def responses_create(request: Request) -> Response:
     identically. Stateful conversations (handle routing + the claude-resume
     backend) arrive in conv-1b; the server-owned `stored` backend is a later
     slice. The principle holds throughout: woollama routes conversation handles,
-    backends own the bytes — it never becomes a conversation database."""
+    backends own the bytes — it never becomes a conversation database.
+
+    Model-pooling / virtual-model resolution is wired into `_passthrough`
+    (`/v1/chat/completions`) only for this MVP -- this path dispatches through
+    `complete_stateless`/`complete_stream` straight to `core.complete`/
+    `core.complete_stream`, so a management-capable inferencer's pool/gate is
+    not consulted here yet."""
     body = await request.json()
     model = body.get("model", "")
 
@@ -753,7 +759,11 @@ async def _passthrough_images(body: dict) -> Response:
     """Forward a text-to-image request to the inferencer's /v1/images/generations
     (e.g. the device's Z-Image-Turbo). Swaps the namespaced model for the bare
     name and adds auth; never streams. Image generation runs for tens of seconds,
-    so it gets a generous read timeout rather than the chat path's 180s."""
+    so it gets a generous read timeout rather than the chat path's 180s.
+
+    Pooling / virtual-model resolution is chat-completions-only by design (see
+    the model-pooling spec's Non-goals) -- this path never consults `_pools` or
+    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
@@ -774,7 +784,11 @@ async def _passthrough_images(body: dict) -> Response:
 async def _passthrough_embeddings(body: dict) -> Response:
     """Forward an embeddings request to the inferencer's /v1/embeddings, stripping
     the namespace prefix and adding auth. Embeddings are quick, so the chat path's
-    180s timeout is plenty."""
+    180s timeout is plenty.
+
+    Pooling / virtual-model resolution is chat-completions-only by design (see
+    the model-pooling spec's Non-goals) -- this path never consults `_pools` or
+    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
