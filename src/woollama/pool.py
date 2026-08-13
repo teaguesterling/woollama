@@ -23,6 +23,12 @@ from . import resolver
 log = logging.getLogger("woollama.pool")
 
 
+def _ok(status_code: int) -> bool:
+    """True for any 2xx. The single success predicate for all three device
+    endpoints (running/start/stop) -- keep them consistent."""
+    return 200 <= status_code < 300
+
+
 class DeviceError(Exception):
     """Device management I/O failed (unreachable, or start/stop error). → HTTP 502."""
 
@@ -122,8 +128,22 @@ class DeviceModelManager:
                 ])
                 if victim is None:
                     raise Backpressure(self._retry_after)
+                # Close the fast-path race window *before* yielding on device
+                # I/O: flip loaded off synchronously (no await between the
+                # pick and this line) so a concurrent ensure_loaded(victim)
+                # can no longer take the pre-lock fast path on stale "still
+                # loaded" truth while we're mid-teardown -- it must now block
+                # on _load_lock (which we hold) and re-check after we're done.
+                self._entries[victim].loaded = False
                 await self._stop(victim)
-                self._entries.pop(victim, None)
+                # Only discard the victim's bookkeeping if nothing referenced
+                # it while the stop was in flight (a racer's enqueue()/
+                # acquire() land directly on the entry, with no lock). Never
+                # silently drop a nonzero in_flight/queued count -- leave the
+                # entry as unloaded so the next ensure_loaded reloads it.
+                ve = self._entries.get(victim)
+                if ve is not None and ve.in_flight == 0 and ve.queued == 0:
+                    self._entries.pop(victim, None)
             await self._start(real_id)
             self._mark_loaded(real_id)
 
@@ -148,7 +168,7 @@ class DeviceModelManager:
                                        headers=self._headers)
         except httpx.HTTPError as exc:
             raise DeviceError(f"device unreachable: {exc}") from exc
-        if r.status_code != 200:
+        if not _ok(r.status_code):
             raise DeviceError(f"running query failed: {r.status_code} {r.text[:200]}")
         try:
             return set(r.json().get("running") or [])
@@ -161,7 +181,7 @@ class DeviceModelManager:
                 f"{self._url}/api/v1/models/{real_id}/start", headers=self._headers)
         except httpx.HTTPError as exc:
             raise DeviceError(f"start {real_id}: unreachable: {exc}") from exc
-        if r.status_code >= 400:
+        if not _ok(r.status_code):
             raise DeviceError(f"start {real_id} failed: {r.status_code} {r.text[:200]}")
         deadline = self._clock() + self._load_timeout
         while self._clock() < deadline:
@@ -176,7 +196,7 @@ class DeviceModelManager:
                 f"{self._url}/api/v1/models/{real_id}/stop", headers=self._headers)
         except httpx.HTTPError as exc:
             raise DeviceError(f"stop {real_id}: unreachable: {exc}") from exc
-        if r.status_code >= 400:
+        if not _ok(r.status_code):
             raise DeviceError(f"stop {real_id} failed: {r.status_code} {r.text[:200]}")
 
     async def aclose(self) -> None:

@@ -19,6 +19,14 @@ class FakeDevice:
         self.fail_start = fail_start
         self.calls: list[tuple[str, str]] = []
         self._lock = threading.Lock()
+        # Round-2 addition: an opt-in stop-delay gate for race tests. When
+        # `block_stop` is True, the /stop handler signals `stop_started` and
+        # then blocks on `stop_release` before completing -- lets a test
+        # deterministically land other work while a stop is in flight. Off by
+        # default, so it never affects the original (verbatim) tests above.
+        self.block_stop = False
+        self.stop_started = threading.Event()
+        self.stop_release = threading.Event()
         dev = self
 
         class H(BaseHTTPRequestHandler):
@@ -60,6 +68,9 @@ class FakeDevice:
                     self._json(200, {"ok": True})
                 elif p.startswith(prefix) and p.endswith("/stop"):
                     mid = p[len(prefix):-len("/stop")]
+                    if dev.block_stop:
+                        dev.stop_started.set()
+                        dev.stop_release.wait()
                     with dev._lock:
                         dev.calls.append(("stop", mid))
                         dev.running.discard(mid)
@@ -157,3 +168,73 @@ def _fake_clock():
         t["v"] += 1.0
         return t["v"]
     return clock
+
+
+# --- Round-2 regression: eviction mid-decision race ------------------------
+#
+# resolver.pick_eviction() snapshots "idle" (in_flight==0, queued==0) at the
+# instant the evictor decides on a victim. But the evictor then *awaits* the
+# device's /stop call, and during that await a racer can legitimately land a
+# enqueue()/ensure_loaded()/acquire() sequence (the Gate's real call pattern)
+# against the very model being torn down. Two invariants must hold across
+# that window:
+#   1. The racer's ensure_loaded() must not take the pre-lock fast path on
+#      stale "still loaded" truth while the device is mid-teardown -- it must
+#      block until the evictor is done, then re-check/reload for real.
+#   2. The evictor's post-stop cleanup must never silently discard the
+#      racer's in_flight/queued bookkeeping just because it happened to land
+#      on the (about-to-be-popped) entry while the stop was in flight.
+async def test_eviction_race_does_not_strand_or_lose_racer(device):
+    import asyncio
+
+    device.running.update({"A", "B"})
+    device.block_stop = True
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    try:
+        await mgr.ensure_loaded("A")            # last_used older -> LRU victim
+        await mgr.ensure_loaded("B")            # last_used newer
+
+        evict_task = asyncio.create_task(mgr.ensure_loaded("C", pool_max=2))
+        # Wait until the evictor's stop("A") request has actually landed on
+        # the device and is being held there -- deterministic sync on real
+        # state, no sleep-based timing guess.
+        while not device.stop_started.is_set():
+            await asyncio.sleep(0)
+
+        # A racer arrives while A's stop() is in flight, mirroring the
+        # Gate's real call pattern (enqueue before ensure_loaded, acquire
+        # after).
+        async def racer():
+            mgr.enqueue("A")
+            await mgr.ensure_loaded("A")
+            mgr.dequeue("A")
+            mgr.acquire("A")
+
+        racer_task = asyncio.create_task(racer())
+        await asyncio.sleep(0)   # let the racer run up to its blocking point
+
+        device.stop_release.set()   # let the fake device finish stopping A
+        await evict_task
+
+        # Invariant 2: the evictor's cleanup must not have silently
+        # discarded A's entry (and the racer's bookkeeping on it) just
+        # because the stop was in flight when the pick was made.
+        assert "A" in mgr._entries, "victim entry silently discarded mid-race"
+
+        await racer_task
+
+        # Invariant 1: the racer must end up bound to a genuinely
+        # (re)loaded model, never a phantom / torn-down one.
+        assert "A" in mgr.snapshot()
+        assert "A" in device.running
+        assert mgr.queued("A") == 0        # racer's dequeue balanced its enqueue
+        assert mgr._entries["A"].in_flight == 1   # racer's acquire landed cleanly
+    finally:
+        # Always release the httpx connection pool, even on assertion
+        # failure -- otherwise a still-open HTTP/1.1 keep-alive connection
+        # leaves the single-threaded fake device blocked in
+        # handle_one_request() forever, hanging fixture teardown (device.close()
+        # -> HTTPServer.shutdown() waits for serve_forever() to notice the
+        # shutdown flag, which it can't while stuck reading that socket).
+        device.stop_release.set()   # in case we failed before releasing it
+        await mgr.aclose()
