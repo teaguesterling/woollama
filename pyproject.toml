@@ -23,7 +23,7 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "httpx>=0.27",
-    "mcp>=1.0",
+    "mcp>=1.0,<1.30",        # cap: mcp>=1.30 renamed McpError->MCPError, breaking fastmcp-slim 3.4.x (CI green)
     # The Rust engine: provides `woollama.core` (complete*/orchestrate*/ModelRegistry).
     # `woollama` is a PEP 420 namespace shared between this dist and woollama-core.
     "woollama-core",
@@ -34,7 +34,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",  # for async test functions
     "openai>=1.0",           # for client-side integration tests
-    "fastmcp>=2.0",          # for the bundled hello example server
+    "fastmcp>=2.0,<3.5",     # for the bundled hello example server; <3.5 stays on the McpError-compatible mcp line
     "pydantic-settings>=2.0",  # fastmcp imports it at import time; not always pulled in transitively (CI green fix)
     "ruff",
 ]
