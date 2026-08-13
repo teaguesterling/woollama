@@ -34,7 +34,9 @@ from . import (
     inferencers,
     managed_agents,
     ollama_native,
+    pool,
     recipes,
+    resolver,
     responses,
 )
 from ._version import __version__
@@ -55,6 +57,11 @@ OrchestrationError = core.InferenceError
 # path (below) and the mounted MCP server. Populated + started once by the
 # lifespan, so there is a single connection layer to the downstream MCP servers.
 registry = Registry()
+
+# One (manager, gate) per management-capable inferencer (those with a
+# management_url). Populated by the lifespan; empty otherwise, in which case
+# every inferencer takes the stateless passthrough below (unchanged behavior).
+_pools: dict[str, tuple[pool.DeviceModelManager, pool.Gate]] = {}
 
 # In-memory conversation handle table for the stateful /v1/responses surface
 # (conv-1b). woollama routes handles → backends; it does not store transcripts.
@@ -126,6 +133,22 @@ async def lifespan(app: FastAPI):
     # Downstream tools are known now → re-export them onto the MCP surface
     # (same dynamic registration the stdio path does in build_server's lifespan).
     register_reexported_tools(_mcp, registry)
+    # Device-aware pools: one manager+gate per inferencer that declares a
+    # management_url. Reuses the inferencer's api key for the :8800 mgmt API.
+    for _name, _inf in inferencers.all().items():
+        if not _inf.management_url:
+            continue
+        try:
+            _hdrs = _inf.headers()
+        except inferencers.InferencerError:
+            _hdrs = {}
+        _mgr = pool.DeviceModelManager(_inf.management_url, headers=_hdrs)
+        _gate = pool.Gate(_mgr, parallel=_inf.parallel, queue_max=_inf.queue_max,
+                          queue_timeout=_inf.queue_timeout, pool_max=_inf.pool_max)
+        _pools[_name] = (_mgr, _gate)
+        log.info("pool ready: inferencer '%s' -> %s (parallel=%d, pool_max=%s, "
+                 "queue_max=%s)", _name, _inf.management_url, _inf.parallel,
+                 _inf.pool_max, _inf.queue_max)
     # Optional: wire an external conversation store as the state owner for
     # NON-claude models (issue #2), from the `conversationStore` key in mcp.json
     # (an MCP server name or a typed {mcp|http} descriptor — see
@@ -161,6 +184,9 @@ async def lifespan(app: FastAPI):
         try:
             yield
         finally:
+            for _mgr, _ in _pools.values():
+                await _mgr.aclose()
+            _pools.clear()
             await registry.stop_all()
 
 
@@ -290,7 +316,13 @@ async def responses_create(request: Request) -> Response:
     identically. Stateful conversations (handle routing + the claude-resume
     backend) arrive in conv-1b; the server-owned `stored` backend is a later
     slice. The principle holds throughout: woollama routes conversation handles,
-    backends own the bytes — it never becomes a conversation database."""
+    backends own the bytes — it never becomes a conversation database.
+
+    Model-pooling / virtual-model resolution is wired into `_passthrough`
+    (`/v1/chat/completions`) only for this MVP -- this path dispatches through
+    `complete_stateless`/`complete_stream` straight to `core.complete`/
+    `core.complete_stream`, so a management-capable inferencer's pool/gate is
+    not consulted here yet."""
     body = await request.json()
     model = body.get("model", "")
 
@@ -654,12 +686,19 @@ async def _responses_stream(model: str, messages: list[dict], *,
 
 async def _passthrough(body: dict) -> Response:
     """Forward `<provider>/<model>` straight to that inferencer's OpenAI-compat
-    endpoint (no orchestration). The client owns the body; we only swap the
-    namespaced model for the bare name and add auth. `stream:true` is honoured —
-    we relay the upstream SSE verbatim (slice: streaming-1)."""
+    endpoint. For a management-capable inferencer (one with a pool) the request is
+    resolved (virtual models), the target model is loaded on demand, and access is
+    serialized/queued through the Gate; otherwise it's today's stateless relay,
+    unchanged. The client owns the body; we only swap the namespaced model for the
+    bare name and add auth. `stream:true` is honoured — we relay the upstream SSE
+    verbatim (slice: streaming-1)."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
+    pooled = _pools.get(provider)
+    if pooled is not None:
+        return await _passthrough_pooled(inf, body, bare, *pooled)
+
     body["model"] = bare
     try:
         headers = inf.headers()
@@ -677,11 +716,54 @@ async def _passthrough(body: dict) -> Response:
         return JSONResponse(r.json(), status_code=r.status_code)
 
 
+async def _passthrough_pooled(inf: inferencers.Inferencer, body: dict, bare: str,
+                              manager: pool.DeviceModelManager,
+                              gate: pool.Gate) -> Response:
+    """Resolve → load-on-demand → gate → dispatch, for a management-capable
+    inferencer. Backpressure => 503+Retry-After; device errors => 502."""
+    try:
+        real = resolver.resolve(bare, virtual=inf.virtual,
+                                loaded=manager.snapshot(),
+                                default=inf.virtual.get("default"))
+    except resolver.ResolveError as e:
+        return _error(str(e), "invalid_request_error", 400)
+    body["model"] = real
+    try:
+        headers = inf.headers()
+    except inferencers.InferencerError as e:
+        return _error(str(e), "invalid_request_error", 400)
+    try:
+        if body.get("stream"):
+            slot = await gate.enter(real)
+            try:
+                return await _passthrough_stream(inf, body, headers,
+                                                 on_close=slot.release)
+            except BaseException:
+                await slot.release()
+                raise
+        async with gate.slot(real):
+            fwd = dict(body)
+            fwd["stream"] = False
+            async with httpx.AsyncClient(timeout=180) as c:
+                r = await c.post(inf.chat_url(), json=fwd, headers=headers)
+                return JSONResponse(r.json(), status_code=r.status_code)
+    except pool.Backpressure as e:
+        resp = _error("model busy; retry shortly", "server_error", 503)
+        resp.headers["Retry-After"] = str(int(e.retry_after))
+        return resp
+    except pool.DeviceError as e:
+        return _error(f"device error: {e}", "server_error", 502)
+
+
 async def _passthrough_images(body: dict) -> Response:
     """Forward a text-to-image request to the inferencer's /v1/images/generations
     (e.g. the device's Z-Image-Turbo). Swaps the namespaced model for the bare
     name and adds auth; never streams. Image generation runs for tens of seconds,
-    so it gets a generous read timeout rather than the chat path's 180s."""
+    so it gets a generous read timeout rather than the chat path's 180s.
+
+    Pooling / virtual-model resolution is chat-completions-only by design (see
+    the model-pooling spec's Non-goals) -- this path never consults `_pools` or
+    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
@@ -702,7 +784,11 @@ async def _passthrough_images(body: dict) -> Response:
 async def _passthrough_embeddings(body: dict) -> Response:
     """Forward an embeddings request to the inferencer's /v1/embeddings, stripping
     the namespace prefix and adding auth. Embeddings are quick, so the chat path's
-    180s timeout is plenty."""
+    180s timeout is plenty.
+
+    Pooling / virtual-model resolution is chat-completions-only by design (see
+    the model-pooling spec's Non-goals) -- this path never consults `_pools` or
+    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
@@ -776,7 +862,7 @@ async def _ollama_native_stream(url: str, req: dict, headers: dict,
 
 
 async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
-                              headers: dict) -> Response:
+                              headers: dict, on_close=None) -> Response:
     """Relay the upstream OpenAI SSE stream byte-for-byte (preserves chunk
     framing and the `data: [DONE]` sentinel for free).
 
@@ -784,7 +870,12 @@ async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
     StreamingResponse: once a 200 stream begins its status can't be changed, so
     an upstream 4xx/5xx must surface as a JSON error (matching the non-streaming
     path), not an empty 200. That forces manual context management — on success
-    the generator owns closing the stream and client; on error we close here."""
+    the generator owns closing the stream and client; on error we close here.
+
+    `on_close`, when given, is awaited once teardown is otherwise complete — on
+    BOTH the early-upstream-error path and the normal stream-teardown path. The
+    pooled passthrough uses this to hold a Gate slot for the stream's whole
+    lifetime and release it exactly when the stream (or its setup) ends."""
     client = httpx.AsyncClient(timeout=180)
     cm = client.stream("POST", inf.chat_url(), json=body, headers=headers)
     r = await cm.__aenter__()
@@ -792,6 +883,8 @@ async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
         raw = await r.aread()
         await cm.__aexit__(None, None, None)
         await client.aclose()
+        if on_close is not None:
+            await on_close()
         try:
             return JSONResponse(json.loads(raw), status_code=r.status_code)
         except (ValueError, TypeError):
@@ -805,6 +898,8 @@ async def _passthrough_stream(inf: inferencers.Inferencer, body: dict,
         finally:
             await cm.__aexit__(None, None, None)
             await client.aclose()
+            if on_close is not None:
+                await on_close()
 
     return StreamingResponse(relay(), status_code=r.status_code,
                              media_type="text/event-stream")

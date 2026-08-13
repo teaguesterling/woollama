@@ -49,6 +49,19 @@ class Inferencer:
     models: tuple[str, ...] = ()
     discover: bool = False
     model_patterns: tuple[str, ...] = ()
+    # --- device-aware pooling (issue: model-pooling). All optional; absent =>
+    # today's stateless passthrough. Consumed by the Python server layer
+    # (pool.py / resolver.py), NOT by the Rust core's build_request. ---
+    management_url: str | None = None   # device mgmt base (:8800); presence enables the pool
+    parallel: int = 1                   # per-model concurrency slot size (device default 1)
+    pool_max: int | None = None         # max concurrently-loaded models; None => no cap/eviction
+    # Max queued requests per model before backpressure, checked BEFORE enqueue:
+    # None = unlimited queue; a positive N = at most N queued beyond the
+    # in-flight permit(s); 0 = reject-all backpressure (no queue at all --
+    # including the very first request, since 0 >= 0).
+    queue_max: int | None = None
+    queue_timeout: float = 30.0         # seconds a request may wait before 503+Retry-After
+    virtual: dict = field(default_factory=dict)  # alias -> real_id; reserved key 'default'
 
     def chat_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
@@ -129,6 +142,14 @@ def _registry() -> dict[str, Inferencer]:
             discover=spec.get("discover", base.discover if base else False),
             model_patterns=tuple(
                 spec.get("model_patterns") or (base.model_patterns if base else ())),
+            management_url=spec.get("management_url",
+                                    base.management_url if base else None),
+            parallel=spec.get("parallel", base.parallel if base else 1),
+            pool_max=spec.get("pool_max", base.pool_max if base else None),
+            queue_max=spec.get("queue_max", base.queue_max if base else None),
+            queue_timeout=spec.get("queue_timeout",
+                                   base.queue_timeout if base else 30.0),
+            virtual=dict(spec.get("virtual") or (base.virtual if base else {})),
         )
     return reg
 

@@ -252,6 +252,27 @@ def load_inferencers() -> dict[str, dict]:
                 raise ValueError(
                     f"inferencers.toml {path}: '{name}.discover' must be true/false")
             spec["discover"] = entry["discover"]
+        if "management_url" in entry:
+            spec["management_url"] = str(entry["management_url"])
+        for int_key in ("parallel", "pool_max", "queue_max"):
+            if int_key in entry:
+                v = entry[int_key]
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise ValueError(
+                        f"inferencers.toml {path}: '{name}.{int_key}' must be an integer")
+                spec[int_key] = v
+        if "queue_timeout" in entry:
+            v = entry["queue_timeout"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(
+                    f"inferencers.toml {path}: '{name}.queue_timeout' must be a number")
+            spec["queue_timeout"] = float(v)
+        if "virtual" in entry:
+            v = entry["virtual"]
+            if not isinstance(v, dict):
+                raise ValueError(
+                    f"inferencers.toml {path}: '{name}.virtual' must be a table")
+            spec["virtual"] = {str(k): str(val) for k, val in v.items()}
         out[name] = spec
     log.info("loaded %d user inferencer(s) from %s: %s",
              len(out), path, list(out.keys()))

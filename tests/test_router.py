@@ -21,6 +21,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
+from fastapi.responses import StreamingResponse
+
 from woollama import recipes, router
 from woollama.manager import Registry, ServerManager
 
@@ -374,6 +376,295 @@ async def test_chat_passthrough_stream_upstream_error_is_json_not_empty_stream(m
     }))
     assert resp.status_code == 401
     assert json.loads(bytes(resp.body))["error"]["message"] == "bad key"
+
+
+# ---------------------------------------------------------------------------
+# /v1/chat/completions — pool-gated passthrough (management-capable inferencers)
+# ---------------------------------------------------------------------------
+
+class _FakeManager:
+    def __init__(self, loaded):
+        self._loaded = list(loaded)
+        self.ensured = []
+    def snapshot(self):
+        return list(self._loaded)
+    async def ensure_loaded(self, real_id, *, pool_max=None):
+        self.ensured.append(real_id)
+    def acquire(self, real_id): pass
+    def release(self, real_id): pass
+    def enqueue(self, real_id): pass
+    def dequeue(self, real_id): pass
+    def queued(self, real_id): return 0
+
+
+async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypatch, tmp_path):
+    import httpx
+
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        'management_url="http://dev:8800"\nvirtual={ default = "Cfg/Fallback" }\n')
+
+    captured = {}
+    class _SpyClient:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["url"] = url
+            captured["body"] = json
+            return HttpxResponseStub(200, {"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+
+    mgr = _FakeManager(loaded=["Qwen/Coder"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        await router.chat_completions(FakeRequest({
+            "model": "tiiny/default",
+            "messages": [{"role": "user", "content": "hi"}]}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert captured["body"]["model"] == "Qwen/Coder"       # default -> loaded id
+    assert mgr.ensured == ["Qwen/Coder"]
+
+
+async def test_pooled_passthrough_backpressure_is_503_with_retry_after(monkeypatch, tmp_path):
+    """Trigger Backpressure through a REAL pool.Gate wrapping a fake manager whose
+    ensure_loaded raises it — Gate.slot -> enter -> ensure_loaded then propagates
+    it faithfully. (A bare stand-in gate with only `enter` defined would 500 with
+    AttributeError on the non-streaming path's `async with gate.slot(real)`,
+    since that needs the asynccontextmanager `slot` method too — so the fake
+    device failure has to originate inside the real Gate, not bypass it.)"""
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
+
+    class _BusyManager(_FakeManager):
+        async def ensure_loaded(self, real_id, *, pool_max=None):
+            raise pool.Backpressure(7.0)
+
+    mgr = _BusyManager(loaded=["X"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/X", "messages": []}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert resp.status_code == 503
+    assert resp.headers.get("Retry-After") == "7"
+
+
+async def test_non_pooled_inferencer_unchanged(monkeypatch):
+    """ollama has no management_url -> stateless passthrough, prefix stripped."""
+    import httpx
+    captured = {}
+    class _SpyClient:
+        def __init__(self, *_a, **_kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def post(self, url, json=None, **_kw):
+            captured["body"] = json
+            return HttpxResponseStub(200, {"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(httpx, "AsyncClient", _SpyClient)
+    assert "ollama" not in router._pools
+    await router.chat_completions(FakeRequest({
+        "model": "ollama/qwen3:14b", "messages": [{"role": "user", "content": "hi"}]}))
+    assert captured["body"]["model"] == "qwen3:14b"
+
+
+class _RecordingManager(_FakeManager):
+    """`_FakeManager` with acquire/release call recording, for asserting the
+    Gate's real slot-lifetime protocol was actually exercised (not bypassed)."""
+    def __init__(self, loaded):
+        super().__init__(loaded)
+        self.acquired: list[str] = []
+        self.released: list[str] = []
+    def acquire(self, real_id):
+        self.acquired.append(real_id)
+    def release(self, real_id):
+        self.released.append(real_id)
+
+
+def _tiiny_inferencer_toml(tmp_path):
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        'management_url="http://dev:8800"\n')
+
+
+async def test_pooled_passthrough_stream_holds_and_releases_slot(monkeypatch, tmp_path):
+    """A pooled `stream:true` request must hold the Gate slot for the whole
+    stream lifetime and release it exactly once when the stream drains
+    (router.py:736-740, the streaming success `on_close` at 894-902) — the
+    single most important pooled-streaming gap: without this, a pooled model
+    could be evicted or over-subscribed mid-stream."""
+    import httpx
+
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    _tiiny_inferencer_toml(tmp_path)
+
+    chunks = [b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+              b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+              b"data: [DONE]\n\n"]
+
+    class _StreamCM:
+        def __init__(self, body):
+            self.status_code = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def aiter_bytes(self):
+            for c in chunks:
+                yield c
+
+    class _StreamClient:
+        def __init__(self, *_a, **_kw): pass
+        async def aclose(self): pass
+        def stream(self, _method, url, json=None, **_kw):
+            return _StreamCM(json)
+    monkeypatch.setattr(httpx, "AsyncClient", _StreamClient)
+
+    mgr = _RecordingManager(loaded=["Qwen/X"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/Qwen/X", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}))
+        assert isinstance(resp, StreamingResponse)
+        # Slot must still be held while the stream is open (not yet drained).
+        assert mgr.released == []
+        body = b"".join([c async for c in resp.body_iterator])
+    finally:
+        router._pools.pop("tiiny", None)
+    assert body == b"".join(chunks)
+    assert mgr.acquired == ["Qwen/X"]
+    assert mgr.released == ["Qwen/X"]      # released exactly once, on drain
+
+
+async def test_pooled_passthrough_stream_early_error_releases_slot(monkeypatch, tmp_path):
+    """A pooled `stream:true` request whose upstream connection fails BEFORE
+    any bytes stream (a 4xx on `.stream().__aenter__()`) must still surface as
+    a JSON error (not an empty 200 stream) AND release the Gate slot it
+    acquired -- the early-error on_close path (router.py:882-887)."""
+    import httpx
+
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    _tiiny_inferencer_toml(tmp_path)
+
+    class _StreamCM:
+        def __init__(self): self.status_code = 401
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_a): return None
+        async def aread(self):
+            return b'{"error":{"message":"bad key","type":"auth"}}'
+
+    class _StreamClient:
+        def __init__(self, *_a, **_kw): pass
+        async def aclose(self): pass
+        def stream(self, *_a, **_kw): return _StreamCM()
+    monkeypatch.setattr(httpx, "AsyncClient", _StreamClient)
+
+    mgr = _RecordingManager(loaded=["Qwen/X"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/Qwen/X", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert resp.status_code == 401
+    assert json.loads(bytes(resp.body))["error"]["message"] == "bad key"
+    assert mgr.acquired == ["Qwen/X"]
+    assert mgr.released == ["Qwen/X"]      # slot released even on early failure
+
+
+async def test_pooled_passthrough_device_error_is_502(monkeypatch, tmp_path):
+    """A `pool.DeviceError` raised inside the Gate (device unreachable / start
+    or stop failed) must map to HTTP 502, mirroring the Backpressure->503 test
+    above but for the device-error branch."""
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    _tiiny_inferencer_toml(tmp_path)
+
+    class _BrokenManager(_FakeManager):
+        async def ensure_loaded(self, real_id, *, pool_max=None):
+            raise pool.DeviceError("boom")
+
+    mgr = _BrokenManager(loaded=["X"])
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/X", "messages": []}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert resp.status_code == 502
+
+
+async def test_pooled_passthrough_resolve_error_is_400(monkeypatch, tmp_path):
+    """`tiiny/default` with nothing loaded and no configured `virtual.default`
+    fallback must resolve-error to a clean 400 (router.py:728-729), not a
+    500 -- the resolver's ResolveError has to be caught before any device I/O."""
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    _tiiny_inferencer_toml(tmp_path)   # no `virtual` table -> no 'default' key
+
+    from woollama import pool
+    mgr = _FakeManager(loaded=[])      # snapshot() == [] -> nothing loaded
+    gate = pool.Gate(mgr, parallel=1)
+    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    try:
+        resp = await router.chat_completions(FakeRequest({
+            "model": "tiiny/default", "messages": []}))
+    finally:
+        router._pools.pop("tiiny", None)
+    assert resp.status_code == 400
+
+
+async def test_lifespan_builds_and_tears_down_pools(monkeypatch, tmp_path):
+    """`router.lifespan(app)` builds one (manager, gate) pair per management-
+    capable inferencer at startup (router.py:136-151) and clears `_pools` at
+    shutdown (router.py:186-189).
+
+    Approach: this exercises `router.lifespan(router.app)` as an async context
+    manager DIRECTLY, rather than driving a full `fastapi.testclient.TestClient`
+    through ASGI startup/shutdown. router.app also mounts the MCP app's own
+    Streamable-HTTP session-manager lifespan and the surface-auth middleware --
+    neither is what this test is about -- and a real TestClient run would, by
+    default, load the BUNDLED default mcp.json and spawn its example MCP server
+    subprocesses (config.load_mcp_servers falls back to packaged defaults when
+    no user mcp.json exists), which is slow and non-deterministic for a test
+    that only cares about `_pools`. Pointing WOOLLAMA_CONFIG_DIR at a temp dir
+    with an explicit EMPTY `{"mcpServers": {}}` avoids that either way, but
+    calling `router.lifespan(router.app)` directly is the simpler, faster,
+    more isolated exercise of the exact coroutine FastAPI would invoke for
+    startup/shutdown -- so that's what's used here."""
+    from woollama import pool
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("WOOLLAMA_STATE_DIR", str(tmp_path / "state"))
+    (tmp_path / "mcp.json").write_text('{"mcpServers": {}}')
+    _tiiny_inferencer_toml(tmp_path)
+
+    saved_path = router.conversation_store._path
+    assert "tiiny" not in router._pools
+    try:
+        async with router.lifespan(router.app):
+            assert "tiiny" in router._pools
+            mgr, gate = router._pools["tiiny"]
+            assert isinstance(mgr, pool.DeviceModelManager)
+            assert isinstance(gate, pool.Gate)
+        assert router._pools == {}
+    finally:
+        router._pools.clear()
+        # `enable_persistence` mutates the module-level `conversation_store`
+        # singleton in place -- restore it so later tests (which rely on the
+        # default in-memory-only store) aren't left pointed at a temp path.
+        router.conversation_store._path = saved_path
 
 
 # ---------------------------------------------------------------------------
