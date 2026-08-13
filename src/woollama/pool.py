@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -202,3 +203,68 @@ class DeviceModelManager:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+
+class Slot:
+    """A held per-model concurrency slot. `release` is idempotent and drops both
+    the in-flight ref-count and the semaphore permit."""
+
+    def __init__(self, gate: "Gate", real_id: str):
+        self._gate = gate
+        self._real_id = real_id
+        self._released = False
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._gate._manager.release(self._real_id)
+        self._gate._sem(self._real_id).release()
+
+
+class Gate:
+    def __init__(self, manager: DeviceModelManager, *, parallel: int = 1,
+                 queue_max: int | None = None, queue_timeout: float = 30.0,
+                 pool_max: int | None = None, retry_after: float = 5.0):
+        self._manager = manager
+        self._parallel = max(1, int(parallel))
+        self._queue_max = queue_max
+        self._queue_timeout = queue_timeout
+        self._pool_max = pool_max
+        self._retry_after = retry_after
+        self._sems: dict[str, asyncio.Semaphore] = {}
+
+    def _sem(self, real_id: str) -> asyncio.Semaphore:
+        s = self._sems.get(real_id)
+        if s is None:
+            s = asyncio.Semaphore(self._parallel)
+            self._sems[real_id] = s
+        return s
+
+    async def enter(self, real_id: str) -> Slot:
+        """Full gating protocol for one request: reject early if the per-model
+        queue is saturated; otherwise register a queue slot (which also protects
+        the model from eviction), ensure it's loaded, then acquire a concurrency
+        permit within queue_timeout and bump the in-flight ref-count."""
+        if self._queue_max is not None and self._manager.queued(real_id) >= self._queue_max:
+            raise Backpressure(self._retry_after)
+        self._manager.enqueue(real_id)
+        try:
+            await self._manager.ensure_loaded(real_id, pool_max=self._pool_max)
+            sem = self._sem(real_id)
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout)
+            except asyncio.TimeoutError:
+                raise Backpressure(self._retry_after)
+        finally:
+            self._manager.dequeue(real_id)
+        self._manager.acquire(real_id)
+        return Slot(self, real_id)
+
+    @asynccontextmanager
+    async def slot(self, real_id: str):
+        s = await self.enter(real_id)
+        try:
+            yield s
+        finally:
+            await s.release()

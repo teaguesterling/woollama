@@ -238,3 +238,109 @@ async def test_eviction_race_does_not_strand_or_lose_racer(device):
         # shutdown flag, which it can't while stuck reading that socket).
         device.stop_release.set()   # in case we failed before releasing it
         await mgr.aclose()
+
+
+async def test_gate_serializes_per_model(device):
+    import asyncio
+    device.running.add("A")
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    gate = pool.Gate(mgr, parallel=1)
+    order = []
+
+    async def worker(tag, hold):
+        async with gate.slot("A"):
+            order.append(f"enter-{tag}")
+            await asyncio.sleep(hold)
+            order.append(f"exit-{tag}")
+
+    await asyncio.gather(worker("1", 0.05), worker("2", 0.0))
+    # parallel=1 => the two critical sections do not interleave
+    assert order in (
+        ["enter-1", "exit-1", "enter-2", "exit-2"],
+        ["enter-2", "exit-2", "enter-1", "exit-1"],
+    )
+    await mgr.aclose()
+
+
+async def test_gate_queue_max_saturated_is_backpressure(device):
+    import asyncio
+    device.running.add("A")
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    gate = pool.Gate(mgr, parallel=1, queue_max=1, queue_timeout=5.0)
+
+    holder_ready = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def holder():
+        async with gate.slot("A"):
+            holder_ready.set()
+            await release_holder.wait()
+
+    async def waiter():          # fills the single queue slot
+        async with gate.slot("A"):
+            pass
+
+    h = asyncio.create_task(holder())
+    await holder_ready.wait()
+    w = asyncio.create_task(waiter())
+    await asyncio.sleep(0.02)    # let waiter enqueue (queued == 1 == queue_max)
+    with pytest.raises(pool.Backpressure):
+        await gate.enter("A")    # third request: rejected immediately
+    release_holder.set()
+    await asyncio.gather(h, w)
+    await mgr.aclose()
+
+
+async def test_gate_queue_timeout_is_backpressure(device):
+    import asyncio
+    device.running.add("A")
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    gate = pool.Gate(mgr, parallel=1, queue_timeout=0.05)
+
+    release_holder = asyncio.Event()
+    holder_ready = asyncio.Event()
+
+    async def holder():
+        async with gate.slot("A"):
+            holder_ready.set()
+            await release_holder.wait()
+
+    h = asyncio.create_task(holder())
+    await holder_ready.wait()
+    with pytest.raises(pool.Backpressure):
+        await gate.enter("A")    # waits past queue_timeout -> 503
+    release_holder.set()
+    await h
+    await mgr.aclose()
+
+
+async def test_gate_protects_serving_model_from_eviction(device):
+    import asyncio
+    device.running.update({"A", "B"})
+    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    await mgr.ensure_loaded("A")
+    await mgr.ensure_loaded("B")
+    gate = pool.Gate(mgr, parallel=1, pool_max=2)
+
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_A():
+        async with gate.slot("A"):
+            ready.set()
+            await release.wait()
+
+    async def hold_B():
+        async with gate.slot("B"):
+            await release.wait()
+
+    ta = asyncio.create_task(hold_A())
+    tb = asyncio.create_task(hold_B())
+    await ready.wait()
+    # both A and B are in-flight; loading C at capacity 2 must fail (nothing idle)
+    with pytest.raises(pool.Backpressure):
+        await gate.enter("C")
+    assert ("stop", "A") not in device.calls and ("stop", "B") not in device.calls
+    release.set()
+    await asyncio.gather(ta, tb)
+    await mgr.aclose()
