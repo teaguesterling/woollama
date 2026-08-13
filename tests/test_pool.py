@@ -89,7 +89,8 @@ class FakeDevice:
                     with dev._lock:
                         dev.calls.append(("start", mid))
                         if dev.fail_start:
-                            self._json(500, {"error": "start failed"}); return
+                            self._json(500, {"error": "start failed"})
+                            return
                         if not dev.start_no_register:
                             dev.running.add(mid)
                     self._json(200, {"ok": True})
@@ -101,7 +102,8 @@ class FakeDevice:
                     with dev._lock:
                         dev.calls.append(("stop", mid))
                         if dev.fail_stop:
-                            self._json(500, {"error": "stop failed"}); return
+                            self._json(500, {"error": "stop failed"})
+                            return
                         dev.running.discard(mid)
                     self._json(200, {"ok": True})
                 else:
@@ -185,7 +187,8 @@ async def test_no_evict_when_all_busy_raises_backpressure(device):
     mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
     await mgr.ensure_loaded("A")
     await mgr.ensure_loaded("B")
-    mgr.acquire("A"); mgr.acquire("B")     # both serving -> not evictable
+    mgr.acquire("A")
+    mgr.acquire("B")     # both serving -> not evictable
     with pytest.raises(pool.Backpressure):
         await mgr.ensure_loaded("C", pool_max=2)
     await mgr.aclose()

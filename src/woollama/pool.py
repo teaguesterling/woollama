@@ -264,7 +264,7 @@ class Gate:
                 # note above about the load wait above not being bounded by it.
                 await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout)
             except asyncio.TimeoutError:
-                raise Backpressure(self._retry_after)
+                raise Backpressure(self._retry_after) from None
         finally:
             self._manager.dequeue(real_id)
         self._manager.acquire(real_id)
