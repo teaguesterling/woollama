@@ -274,7 +274,7 @@ def test_config_dir_xdg_fallback(monkeypatch, tmp_path):
 def test_load_inferencers_parses_pooling_keys(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\n'
+        '[inferencers.device]\n'
         'base_url = "http://dev/v1"\n'
         'management_url = "http://dev:8800"\n'
         'parallel = 2\n'
@@ -284,7 +284,7 @@ def test_load_inferencers_parses_pooling_keys(monkeypatch, tmp_path):
         'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
     )
     from woollama import config
-    spec = config.load_inferencers()["tiiny"]
+    spec = config.load_inferencers()["device"]
     assert spec["management_url"] == "http://dev:8800"
     assert spec["parallel"] == 2
     assert spec["pool_max"] == 3

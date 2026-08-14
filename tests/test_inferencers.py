@@ -296,7 +296,7 @@ async def test_passthrough_routes_to_anthropic(monkeypatch):
 def test_registry_threads_pooling_fields(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\n'
+        '[inferencers.device]\n'
         'base_url = "http://dev/v1"\n'
         'management_url = "http://dev:8800"\n'
         'parallel = 2\n'
@@ -305,7 +305,7 @@ def test_registry_threads_pooling_fields(monkeypatch, tmp_path):
         'queue_timeout = 45\n'
         'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
     )
-    inf = inferencers.get("tiiny")
+    inf = inferencers.get("device")
     assert inf.management_url == "http://dev:8800"
     assert inf.parallel == 2
     assert inf.pool_max == 3

@@ -403,7 +403,7 @@ async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypa
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        '[inferencers.device]\nbase_url="http://dev/v1"\n'
         'management_url="http://dev:8800"\nvirtual={ default = "Cfg/Fallback" }\n')
 
     captured = {}
@@ -419,13 +419,13 @@ async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypa
 
     mgr = _FakeManager(loaded=["Qwen/Coder"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         await router.chat_completions(FakeRequest({
-            "model": "tiiny/default",
+            "model": "device/default",
             "messages": [{"role": "user", "content": "hi"}]}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert captured["body"]["model"] == "Qwen/Coder"       # default -> loaded id
     assert mgr.ensured == ["Qwen/Coder"]
 
@@ -440,7 +440,7 @@ async def test_pooled_passthrough_backpressure_is_503_with_retry_after(monkeypat
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
+        '[inferencers.device]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
 
     class _BusyManager(_FakeManager):
         async def ensure_loaded(self, real_id, *, pool_max=None):
@@ -448,12 +448,12 @@ async def test_pooled_passthrough_backpressure_is_503_with_retry_after(monkeypat
 
     mgr = _BusyManager(loaded=["X"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/X", "messages": []}))
+            "model": "device/X", "messages": []}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert resp.status_code == 503
     assert resp.headers.get("Retry-After") == "7"
 
@@ -489,9 +489,9 @@ class _RecordingManager(_FakeManager):
         self.released.append(real_id)
 
 
-def _tiiny_inferencer_toml(tmp_path):
+def _device_inferencer_toml(tmp_path):
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        '[inferencers.device]\nbase_url="http://dev/v1"\n'
         'management_url="http://dev:8800"\n')
 
 
@@ -505,7 +505,7 @@ async def test_pooled_passthrough_stream_holds_and_releases_slot(monkeypatch, tm
 
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    _tiiny_inferencer_toml(tmp_path)
+    _device_inferencer_toml(tmp_path)
 
     chunks = [b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
               b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
@@ -529,17 +529,17 @@ async def test_pooled_passthrough_stream_holds_and_releases_slot(monkeypatch, tm
 
     mgr = _RecordingManager(loaded=["Qwen/X"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/Qwen/X", "stream": True,
+            "model": "device/Qwen/X", "stream": True,
             "messages": [{"role": "user", "content": "hi"}]}))
         assert isinstance(resp, StreamingResponse)
         # Slot must still be held while the stream is open (not yet drained).
         assert mgr.released == []
         body = b"".join([c async for c in resp.body_iterator])
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert body == b"".join(chunks)
     assert mgr.acquired == ["Qwen/X"]
     assert mgr.released == ["Qwen/X"]      # released exactly once, on drain
@@ -554,7 +554,7 @@ async def test_pooled_passthrough_stream_early_error_releases_slot(monkeypatch, 
 
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    _tiiny_inferencer_toml(tmp_path)
+    _device_inferencer_toml(tmp_path)
 
     class _StreamCM:
         def __init__(self): self.status_code = 401
@@ -571,13 +571,13 @@ async def test_pooled_passthrough_stream_early_error_releases_slot(monkeypatch, 
 
     mgr = _RecordingManager(loaded=["Qwen/X"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/Qwen/X", "stream": True,
+            "model": "device/Qwen/X", "stream": True,
             "messages": [{"role": "user", "content": "hi"}]}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert resp.status_code == 401
     assert json.loads(bytes(resp.body))["error"]["message"] == "bad key"
     assert mgr.acquired == ["Qwen/X"]
@@ -590,7 +590,7 @@ async def test_pooled_passthrough_device_error_is_502(monkeypatch, tmp_path):
     above but for the device-error branch."""
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    _tiiny_inferencer_toml(tmp_path)
+    _device_inferencer_toml(tmp_path)
 
     class _BrokenManager(_FakeManager):
         async def ensure_loaded(self, real_id, *, pool_max=None):
@@ -598,31 +598,31 @@ async def test_pooled_passthrough_device_error_is_502(monkeypatch, tmp_path):
 
     mgr = _BrokenManager(loaded=["X"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/X", "messages": []}))
+            "model": "device/X", "messages": []}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert resp.status_code == 502
 
 
 async def test_pooled_passthrough_resolve_error_is_400(monkeypatch, tmp_path):
-    """`tiiny/default` with nothing loaded and no configured `virtual.default`
+    """`device/default` with nothing loaded and no configured `virtual.default`
     fallback must resolve-error to a clean 400 (router.py:728-729), not a
     500 -- the resolver's ResolveError has to be caught before any device I/O."""
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
-    _tiiny_inferencer_toml(tmp_path)   # no `virtual` table -> no 'default' key
+    _device_inferencer_toml(tmp_path)   # no `virtual` table -> no 'default' key
 
     from woollama import pool
     mgr = _FakeManager(loaded=[])      # snapshot() == [] -> nothing loaded
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/default", "messages": []}))
+            "model": "device/default", "messages": []}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert resp.status_code == 400
 
 
@@ -648,14 +648,14 @@ async def test_lifespan_builds_and_tears_down_pools(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("WOOLLAMA_STATE_DIR", str(tmp_path / "state"))
     (tmp_path / "mcp.json").write_text('{"mcpServers": {}}')
-    _tiiny_inferencer_toml(tmp_path)
+    _device_inferencer_toml(tmp_path)
 
     saved_path = router.conversation_store._path
-    assert "tiiny" not in router._pools
+    assert "device" not in router._pools
     try:
         async with router.lifespan(router.app):
-            assert "tiiny" in router._pools
-            mgr, gate = router._pools["tiiny"]
+            assert "device" in router._pools
+            mgr, gate = router._pools["device"]
             assert isinstance(mgr, pool.DeviceModelManager)
             assert isinstance(gate, pool.Gate)
         assert router._pools == {}

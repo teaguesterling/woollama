@@ -12,7 +12,7 @@ ever seeing a 503-for-not-loaded or a hang.
 
 ## Motivation (the pains this removes)
 
-Observed against a Tiiny Pocket device:
+Observed against a management-capable device:
 
 - **Not-loaded → hard failure.** The device serves a model only while it's loaded
   (`:8800/api/v1/models/{id}/start|stop`); other ids return 503/hang and it does
@@ -81,10 +81,10 @@ Rust `build_request` (`woollama-engine/src/lib.rs:210,247`). Because it's pure i
 unit-testable server-free and mirrorable into the Rust oracle later.
 
 **Resolves:**
-- `tiiny/<real-id>` → `<real-id>` (today's behavior, unchanged).
-- `tiiny/default` → whichever model is currently loaded (from `pool_snapshot`); if none
+- `device/<real-id>` → `<real-id>` (today's behavior, unchanged).
+- `device/default` → whichever model is currently loaded (from `pool_snapshot`); if none
   loaded, the inferencer's configured default.
-- `tiiny/<alias>` → the real id from the inferencer's `virtual` map (e.g.
+- `device/<alias>` → the real id from the inferencer's `virtual` map (e.g.
   `coder → Qwen/Qwen3-Coder-30B-A3B-Instruct`).
 
 ## Data flow (`POST /v1/chat/completions`)
@@ -149,7 +149,7 @@ Existing configs with none of these behave exactly as today.
 
 ## Testing strategy
 
-- **Resolver (pure):** unit tests for `tiiny/<id>`, `tiiny/default` (loaded vs none),
+- **Resolver (pure):** unit tests for `device/<id>`, `device/default` (loaded vs none),
   aliases, unknown alias. Server-free; add to the Rust conformance oracle later.
 - **Eviction policy (pure):** unit tests — evict LRU idle; refuse to evict in-use/queued;
   capacity-full-no-idle path.
@@ -165,16 +165,16 @@ Existing configs with none of these behave exactly as today.
 ## Scope / phasing (YAGNI)
 
 **MVP (this branch):**
-- One management-capable inferencer (`tiiny`) via `management_url`.
+- One management-capable inferencer (`device`) via `management_url`.
 - `DeviceModelManager` with `ensure_loaded` + ref-counting + evict-LRU-idle.
 - `Gate` on the **passthrough path first**, per-model semaphore + backpressure, written
   so the `/v1/responses` path calls the same gate.
-- Resolver: `tiiny/default` + config aliases.
+- Resolver: `device/default` + config aliases.
 - Config keys above; fake-device tests + pure-logic tests.
 
 **Deferred (not now):**
 - Explicit drain-before-evict scheduling and cross-client fairness/priority.
-- Smart `tiiny/auto` that picks a model from request shape (images → vision, etc.).
+- Smart `device/auto` that picks a model from request shape (images → vision, etc.).
 - Load balancing across *multiple* backends / cloud fallback.
 - Porting the runtime into Rust (only the pure Resolver/eviction logic is a migration
   candidate; the actor/queue stay server-layer).
