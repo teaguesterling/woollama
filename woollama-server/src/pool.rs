@@ -117,51 +117,192 @@ pub trait DeviceBackend: Send + Sync {
     async fn unload(&self, id: &str) -> Result<(), PoolError>;
 }
 
-/// The built-in `DeviceBackend` for Tiiny's device-management REST API
-/// (`GET {url}/api/v1/models/running`, `POST .../{id}/start`, `POST .../{id}/stop`).
-/// A direct, behavior-preserving extraction of what used to be
-/// `DeviceModelManager`'s private `running`/`start`/`stop`/`apply_headers` methods.
+/// One HTTP call (`running`/`start`/`stop`) fully resolved against a base URL and
+/// default headers, but still carrying an `{id}` placeholder in `url`/`body`/header
+/// values — substituted per-call by `render` (there's no id yet at construction time
+/// for `start`/`stop`, and never one for `running`).
+struct CompiledEndpoint {
+    method: reqwest::Method,
+    url: String,
+    body: Option<String>,
+    headers: HashMap<String, String>,
+}
+
+impl CompiledEndpoint {
+    /// Substitute `{id}` (when `id` is given) into `url`/`body`/every header value,
+    /// and hand back everything a request needs. `running` calls this with `None`
+    /// (no id in scope); `start`/`unload` with `Some(real_id)`.
+    fn render(&self, id: Option<&str>) -> (reqwest::Method, String, Option<String>, HashMap<String, String>) {
+        let sub = |s: &str| -> String {
+            match id {
+                Some(id) => s.replace("{id}", id),
+                None => s.to_string(),
+            }
+        };
+        let url = sub(&self.url);
+        let body = self.body.as_deref().map(sub);
+        let headers = self.headers.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
+        (self.method.clone(), url, body, headers)
+    }
+}
+
+/// Method parsed case-insensitively from an optional config override, falling back to
+/// `default` when unset OR unparseable (an invalid method string in config shouldn't
+/// panic startup; it just loses the override).
+fn resolve_method(configured: &Option<String>, default: reqwest::Method) -> reqwest::Method {
+    configured
+        .as_deref()
+        .and_then(|m| reqwest::Method::from_bytes(m.to_ascii_uppercase().as_bytes()).ok())
+        .unwrap_or(default)
+}
+
+/// Build a `CompiledEndpoint` from a config `EndpointSpec`: substitute `{base}` into
+/// `url`/`body`/header values now (known at construction time), merge `spec.headers`
+/// OVER `default_headers` (an endpoint header key overrides the shared Bearer auth),
+/// and default `content-type: application/json` when a `body` is present and no
+/// `content-type` header (case-insensitive) was set either way.
+fn compile_endpoint(
+    base: &str,
+    default_headers: &HashMap<String, String>,
+    spec: &engine::EndpointSpec,
+    default_method: reqwest::Method,
+) -> CompiledEndpoint {
+    let sub_base = |s: &str| s.replace("{base}", base);
+    let method = resolve_method(&spec.method, default_method);
+    let url = sub_base(&spec.url);
+    let body = spec.body.as_deref().map(sub_base);
+    let mut headers: HashMap<String, String> = default_headers.clone();
+    for (k, v) in &spec.headers {
+        headers.insert(k.clone(), sub_base(v));
+    }
+    if body.is_some() && !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+        headers.insert("content-type".to_string(), "application/json".to_string());
+    }
+    CompiledEndpoint { method, url, body, headers }
+}
+
+/// Dotted-path lookup into a JSON value (`""` => the value itself; `"a.b"` =>
+/// `v["a"]["b"]`) — how `RestBackend::list_loaded` finds the running-models
+/// array/object inside an arbitrary config-defined response shape.
+fn get_dotted<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(v);
+    }
+    let mut cur = v;
+    for part in path.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
+}
+
+/// The `DeviceBackend` for config-defined (and Tiiny's built-in) REST device-management
+/// shapes: three HTTP calls (list-loaded/start/stop), each independently templated
+/// (`RestBackend::from_spec`). `RestBackend::tiiny` is the Tiiny preset, expressed as a
+/// `from_spec` call with Tiiny's built-in endpoints.
 pub struct RestBackend {
     client: reqwest::Client,
-    base_url: String,
-    headers: HashMap<String, String>,
+    running: CompiledEndpoint,
+    start: CompiledEndpoint,
+    stop: CompiledEndpoint,
+    /// Dotted path (within the `running` response) to the array of loaded models;
+    /// `None`/absent means the response body itself is that array.
+    running_path: Option<String>,
+    /// When the running array holds objects rather than bare id strings, the field
+    /// to pluck from each element.
+    running_id_field: Option<String>,
     poll_interval: f64,
     load_timeout: f64,
 }
 
 impl RestBackend {
-    /// The Tiiny device-management REST shape.
-    pub fn tiiny(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
+    /// Build a `RestBackend` from a config `ProtocolSpec::Rest`'s three endpoints.
+    /// `{base}` (→ `base_url` trimmed of a trailing `/`) is substituted into every
+    /// `url`/`body`/header value now; `{id}` is substituted per-call (see
+    /// `CompiledEndpoint::render`). Per-op method defaults: GET for `running`, POST
+    /// for `start`/`stop` (an explicit `method` on the spec overrides).
+    pub fn from_spec(
+        base_url: &str,
+        default_headers: &HashMap<String, String>,
+        running: &engine::EndpointSpec,
+        start: &engine::EndpointSpec,
+        stop: &engine::EndpointSpec,
+        poll_interval: f64,
+        load_timeout: f64,
+    ) -> RestBackend {
+        let base = base_url.trim_end_matches('/');
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs_f64(30.0))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         RestBackend {
             client,
-            base_url: management_url.trim_end_matches('/').to_string(),
-            headers,
+            running: compile_endpoint(base, default_headers, running, reqwest::Method::GET),
+            start: compile_endpoint(base, default_headers, start, reqwest::Method::POST),
+            stop: compile_endpoint(base, default_headers, stop, reqwest::Method::POST),
+            running_path: running.path.clone(),
+            running_id_field: running.id_field.clone(),
             poll_interval,
             load_timeout,
         }
     }
 
-    fn apply_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (k, v) in &self.headers {
+    /// The Tiiny device-management REST shape (`GET {base}/api/v1/models/running`,
+    /// `POST .../{id}/start`, `POST .../{id}/stop`), expressed as a `from_spec` call
+    /// with Tiiny's built-in endpoints — the preset every `management_protocol`
+    /// resolution falls back to when an inferencer names none (or names `"tiiny"`
+    /// explicitly).
+    pub fn tiiny(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
+        let no_headers = std::collections::BTreeMap::new();
+        let running = engine::EndpointSpec {
+            url: "{base}/api/v1/models/running".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers.clone(),
+            path: Some("running".to_string()),
+            id_field: None,
+        };
+        let start = engine::EndpointSpec {
+            url: "{base}/api/v1/models/{id}/start".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers.clone(),
+            path: None,
+            id_field: None,
+        };
+        let stop = engine::EndpointSpec {
+            url: "{base}/api/v1/models/{id}/stop".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers,
+            path: None,
+            id_field: None,
+        };
+        RestBackend::from_spec(&management_url, &headers, &running, &start, &stop, poll_interval, load_timeout)
+    }
+
+    /// Issue one templated call: apply `endpoint.render(id)`'s method/url/body/headers
+    /// to `self.client`, send it, and hand back the parsed status + body text/bytes.
+    async fn call(&self, endpoint: &CompiledEndpoint, id: Option<&str>) -> Result<(reqwest::StatusCode, reqwest::Response), reqwest::Error> {
+        let (method, url, body, headers) = endpoint.render(id);
+        let mut rb = self.client.request(method, url);
+        for (k, v) in &headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
-        rb
+        if let Some(b) = body {
+            rb = rb.body(b);
+        }
+        let r = rb.send().await?;
+        Ok((r.status(), r))
     }
 }
 
 #[async_trait::async_trait]
 impl DeviceBackend for RestBackend {
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
-        let rb = self.apply_headers(self.client.get(format!("{}/api/v1/models/running", self.base_url)));
-        let r = rb
-            .send()
+        let (status, r) = self
+            .call(&self.running, None)
             .await
             .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
-        let status = r.status();
         if !ok(status) {
             let text = r.text().await.unwrap_or_default();
             return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
@@ -170,22 +311,23 @@ impl DeviceBackend for RestBackend {
             .json()
             .await
             .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
-        let running = v
-            .get("running")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
+        let path = self.running_path.as_deref().unwrap_or("");
+        let arr = get_dotted(&v, path).and_then(Value::as_array).cloned().unwrap_or_default();
+        let running = arr
+            .iter()
+            .filter_map(|item| match &self.running_id_field {
+                Some(field) => item.get(field).and_then(Value::as_str).map(String::from),
+                None => item.as_str().map(String::from),
+            })
+            .collect();
         Ok(running)
     }
 
     async fn load(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/start", self.base_url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
+        let (status, r) = self
+            .call(&self.start, Some(real_id))
             .await
             .map_err(|e| PoolError::Device(format!("start {real_id}: unreachable: {e}")))?;
-        let status = r.status();
         if !ok(status) {
             let text = r.text().await.unwrap_or_default();
             return Err(PoolError::Device(format!(
@@ -204,13 +346,10 @@ impl DeviceBackend for RestBackend {
     }
 
     async fn unload(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/stop", self.base_url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
+        let (status, r) = self
+            .call(&self.stop, Some(real_id))
             .await
             .map_err(|e| PoolError::Device(format!("stop {real_id}: unreachable: {e}")))?;
-        let status = r.status();
         if !ok(status) {
             let text = r.text().await.unwrap_or_default();
             return Err(PoolError::Device(format!(
@@ -580,9 +719,24 @@ impl Gate {
 /// `from_registry`); consulted by the chat passthrough to take the pooled path.
 pub struct PoolRegistry(HashMap<String, (Arc<DeviceModelManager>, Gate)>);
 
+/// A `management_protocol` name that resolved to `ProtocolSpec::Ollama` (either the
+/// built-in `"ollama"` name, or a config name whose block has `kind = "ollama"`).
+/// Task 4 replaces this with a real `OllamaBackend`; until then it's a fail-fast
+/// startup error rather than a silent no-op pool.
+fn ollama_not_yet_implemented() -> engine::EngineError {
+    engine::EngineError::new("management_protocol 'ollama' is not yet implemented", "invalid_request_error", 500)
+}
+
 impl PoolRegistry {
     pub fn get(&self, provider: &str) -> Option<&(Arc<DeviceModelManager>, Gate)> {
         self.0.get(provider)
+    }
+
+    /// No pools — the degrade-on-error fallback `build_state` uses when
+    /// `from_registry` itself fails (mirrors the `engine::Registry::new()` fallback
+    /// used for a bad `inferencers.toml`).
+    pub fn empty() -> PoolRegistry {
+        PoolRegistry(HashMap::new())
     }
 
     /// One manager+gate per inferencer that declares a `management_url` (mirrors the
@@ -590,16 +744,46 @@ impl PoolRegistry {
     /// an inferencer with a required-but-unset API key env still gets a pool (with no
     /// auth headers against its management API), matching Python's `except
     /// InferencerError: _hdrs = {}`.
-    pub fn from_registry(registry: &engine::Registry) -> PoolRegistry {
+    ///
+    /// Each inferencer's `management_protocol` (default `"tiiny"` when unset) is
+    /// resolved to a `DeviceBackend`: the built-in `"tiiny"` REST preset, a
+    /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or —
+    /// for `"ollama"`/any config block with `kind = "ollama"` — a fail-fast error
+    /// (Task 4 lands the real adapter). An unresolvable name (not `"tiiny"`, not
+    /// `"ollama"`, and absent from `protocols`) is likewise an `Err` — a config
+    /// mistake should fail startup, not silently produce a pool that always errors on
+    /// first use.
+    pub fn from_registry(
+        registry: &engine::Registry,
+        protocols: &HashMap<String, engine::ProtocolSpec>,
+    ) -> Result<PoolRegistry, engine::EngineError> {
         let mut map = HashMap::new();
         for inf in registry.list() {
             let Some(management_url) = inf.management_url.clone() else { continue };
             let headers = inf.auth_headers().unwrap_or_default();
-            let manager = Arc::new(DeviceModelManager::new(Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0))));
+            let protocol_name = inf.management_protocol.as_deref().unwrap_or("tiiny");
+            let backend: Arc<dyn DeviceBackend> = match protocol_name {
+                "tiiny" => Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0)),
+                "ollama" => return Err(ollama_not_yet_implemented()),
+                other => match protocols.get(other) {
+                    Some(engine::ProtocolSpec::Rest { running, start, stop }) => {
+                        Arc::new(RestBackend::from_spec(&management_url, &headers, running, start, stop, 0.5, 120.0))
+                    }
+                    Some(engine::ProtocolSpec::Ollama { .. }) => return Err(ollama_not_yet_implemented()),
+                    None => {
+                        return Err(engine::EngineError::new(
+                            format!("inferencer '{}': unknown management_protocol '{other}'", inf.name),
+                            "invalid_request_error",
+                            400,
+                        ))
+                    }
+                },
+            };
+            let manager = Arc::new(DeviceModelManager::new(backend));
             let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
             map.insert(inf.name.clone(), (manager, gate));
         }
-        PoolRegistry(map)
+        Ok(PoolRegistry(map))
     }
 }
 
@@ -630,7 +814,7 @@ mod tests {
         });
         reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
 
-        let pools = PoolRegistry::from_registry(&reg);
+        let pools = PoolRegistry::from_registry(&reg, &HashMap::new()).unwrap();
         assert!(pools.get("cloud").is_none(), "no management_url => no pool");
         assert!(pools.get("device").is_some(), "management_url present => pool built");
     }
