@@ -128,3 +128,80 @@ fn from_registry_unknown_protocol_name_is_an_error() {
     let result = PoolRegistry::from_registry(&reg, &protocols);
     assert!(result.is_err(), "unresolvable management_protocol name must fail from_registry");
 }
+
+// --- Test D: endpoint header overrides default auth case-insensitively ------------
+
+/// `default_headers` (from `api_key_env` via `auth_headers()`) always keys the
+/// bearer token `Authorization` (capitalized). A config author overriding it on an
+/// endpoint may naturally reach for the lowercase HTTP-convention spelling
+/// `authorization` — that must still win, sending exactly ONE `authorization` header
+/// line (the endpoint's), never both. Uses `RecordedRequest::header_count`, which
+/// (unlike the last-value-wins `headers` map) preserves every header line as
+/// received, so a genuine wire-level duplicate is caught deterministically instead
+/// of depending on which of two same-named `HashMap` entries happens to iterate
+/// last.
+#[tokio::test]
+async fn from_registry_endpoint_header_overrides_default_auth_case_insensitively() {
+    std::env::set_var("WOOLLAMA_TEST_DEVICE_TOKEN", "default-secret");
+
+    let device = spawn_rest(RestMockConfig {
+        running_route: "/status".to_string(),
+        start_route: "/models/{id}/start".to_string(),
+        stop_route: "/models/{id}/stop".to_string(),
+        running_shape: RunningShape::Strings { field: "running".to_string() },
+        id_loc: IdLoc::Path,
+    });
+
+    let running = engine::EndpointSpec {
+        url: "{base}/status".to_string(),
+        method: None,
+        body: None,
+        headers: BTreeMap::new(),
+        path: Some("running".to_string()),
+        id_field: None,
+    };
+    let start = engine::EndpointSpec {
+        url: "{base}/models/{id}/start".to_string(),
+        method: Some("POST".to_string()),
+        body: None,
+        // Lowercase key, deliberately differing in case from the `Authorization`
+        // header `auth_headers()` produces — must still override, not coexist.
+        headers: BTreeMap::from([("authorization".to_string(), "endpoint-secret".to_string())]),
+        path: None,
+        id_field: None,
+    };
+    let stop = engine::EndpointSpec {
+        url: "{base}/models/{id}/stop".to_string(),
+        method: Some("POST".to_string()),
+        body: None,
+        headers: BTreeMap::new(),
+        path: None,
+        id_field: None,
+    };
+    let mut protocols = HashMap::new();
+    protocols.insert("custom-auth".to_string(), engine::ProtocolSpec::Rest { running, start, stop });
+
+    let mut inf = device_inferencer("device", device.base_url.clone(), Some("custom-auth".to_string()));
+    inf.api_key_env = Some("WOOLLAMA_TEST_DEVICE_TOKEN".to_string());
+    let mut reg = engine::Registry::new();
+    reg.insert(inf);
+
+    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("from_registry should resolve 'custom-auth'");
+    let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
+
+    manager.ensure_loaded("m1", None).await.expect("ensure_loaded should succeed");
+
+    let starts = device.requests_to("/start");
+    assert_eq!(starts.len(), 1, "exactly one start request");
+    assert_eq!(
+        starts[0].header_count("authorization"),
+        1,
+        "exactly one authorization header line must reach the device — not both the \
+         default Bearer and the endpoint override"
+    );
+    assert_eq!(
+        starts[0].headers.get("authorization").map(String::as_str),
+        Some("endpoint-secret"),
+        "the endpoint's own header must win over the default Bearer auth"
+    );
+}

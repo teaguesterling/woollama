@@ -148,19 +148,27 @@ impl CompiledEndpoint {
 
 /// Method parsed case-insensitively from an optional config override, falling back to
 /// `default` when unset OR unparseable (an invalid method string in config shouldn't
-/// panic startup; it just loses the override).
+/// panic startup; it just loses the override — logged so the typo isn't silently
+/// invisible).
 fn resolve_method(configured: &Option<String>, default: reqwest::Method) -> reqwest::Method {
-    configured
-        .as_deref()
-        .and_then(|m| reqwest::Method::from_bytes(m.to_ascii_uppercase().as_bytes()).ok())
-        .unwrap_or(default)
+    match configured.as_deref() {
+        None => default,
+        Some(m) => reqwest::Method::from_bytes(m.to_ascii_uppercase().as_bytes()).unwrap_or_else(|_| {
+            eprintln!("woollamad: management_protocols: invalid HTTP method '{m}', falling back to {default}");
+            default
+        }),
+    }
 }
 
 /// Build a `CompiledEndpoint` from a config `EndpointSpec`: substitute `{base}` into
 /// `url`/`body`/header values now (known at construction time), merge `spec.headers`
-/// OVER `default_headers` (an endpoint header key overrides the shared Bearer auth),
-/// and default `content-type: application/json` when a `body` is present and no
-/// `content-type` header (case-insensitive) was set either way.
+/// OVER `default_headers` (an endpoint header key overrides the shared Bearer auth —
+/// keyed CASE-INSENSITIVELY, since HTTP header names are; both maps are folded to
+/// lowercase keys so e.g. an endpoint header keyed `authorization` overrides a default
+/// `Authorization`, never sending both), and default `content-type: application/json`
+/// when a `body` is present and no `content-type` header was set either way.
+/// Lowercase keys are also what actually go out on the wire (reqwest is fine with
+/// that; header names are case-insensitive there too).
 fn compile_endpoint(
     base: &str,
     default_headers: &HashMap<String, String>,
@@ -171,11 +179,14 @@ fn compile_endpoint(
     let method = resolve_method(&spec.method, default_method);
     let url = sub_base(&spec.url);
     let body = spec.body.as_deref().map(sub_base);
-    let mut headers: HashMap<String, String> = default_headers.clone();
-    for (k, v) in &spec.headers {
-        headers.insert(k.clone(), sub_base(v));
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for (k, v) in default_headers {
+        headers.insert(k.to_ascii_lowercase(), v.clone());
     }
-    if body.is_some() && !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+    for (k, v) in &spec.headers {
+        headers.insert(k.to_ascii_lowercase(), sub_base(v));
+    }
+    if body.is_some() && !headers.contains_key("content-type") {
         headers.insert("content-type".to_string(), "application/json".to_string());
     }
     CompiledEndpoint { method, url, body, headers }

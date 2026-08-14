@@ -16,8 +16,26 @@ use serde_json::{json, Value};
 pub struct RecordedRequest {
     pub method: String,
     pub path: String,
+    /// Last-value-wins per (lowercased) header name — convenient for the common
+    /// "does this header exist / what's its value" check, but collapses a header
+    /// name sent more than once (see `headers_all`).
     pub headers: HashMap<String, String>,
+    /// Every header line as received, in receipt order, name lowercased,
+    /// duplicates preserved — unlike `headers`, this lets a test assert exactly how
+    /// many times a header name appeared (e.g. to catch a case-insensitive
+    /// header-merge bug that sends both `Authorization` and `authorization` as two
+    /// separate wire lines instead of one overriding the other).
+    pub headers_all: Vec<(String, String)>,
     pub body: String,
+}
+
+impl RecordedRequest {
+    /// How many times `name` (case-insensitive) appears as a header line on this
+    /// request.
+    pub fn header_count(&self, name: &str) -> usize {
+        let name = name.to_ascii_lowercase();
+        self.headers_all.iter().filter(|(k, _)| *k == name).count()
+    }
 }
 
 #[derive(Default)]
@@ -135,14 +153,16 @@ async fn rest_handler(
     let path = uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| uri.path().to_string());
     let path_only = uri.path().to_string();
     let body_str = String::from_utf8_lossy(&body).to_string();
-    let recorded_headers: HashMap<String, String> =
+    let headers_all: Vec<(String, String)> =
         headers.iter().map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string())).collect();
+    let recorded_headers: HashMap<String, String> = headers_all.iter().cloned().collect();
 
     let mut inner = state.inner.lock().unwrap();
     inner.requests.push(RecordedRequest {
         method: method.to_string(),
         path: path.clone(),
         headers: recorded_headers,
+        headers_all,
         body: body_str.clone(),
     });
 
@@ -260,14 +280,16 @@ async fn ollama_handler(
     let path = uri.path_and_query().map(|pq| pq.as_str().to_string()).unwrap_or_else(|| uri.path().to_string());
     let path_only = uri.path().to_string();
     let body_str = String::from_utf8_lossy(&body).to_string();
-    let recorded_headers: HashMap<String, String> =
+    let headers_all: Vec<(String, String)> =
         headers.iter().map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string())).collect();
+    let recorded_headers: HashMap<String, String> = headers_all.iter().cloned().collect();
 
     let mut inner = state.inner.lock().unwrap();
     inner.requests.push(RecordedRequest {
         method: method.to_string(),
         path: path.clone(),
         headers: recorded_headers,
+        headers_all,
         body: body_str.clone(),
     });
 
