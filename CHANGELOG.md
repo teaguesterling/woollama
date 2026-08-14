@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v0.10.0 — 2026-08-13
+
+**Model pooling, request queuing & on-demand loading.** For an inferencer that
+declares a `management_url`, woollama becomes *device-aware*: it loads models on
+demand, serializes and queues requests around the backend's real concurrency
+limit (`--parallel 1`), and resolves stable **virtual model names** — so a caller
+never sees a bare not-loaded `503` or a hang. Fully additive: an inferencer with
+no `management_url` behaves exactly as before. Wired into `/v1/chat/completions`;
+the Rust `/v1/responses` core path is intentionally not pooled yet.
+
+- **`resolver`** (pure) — `tiiny/default` → the currently-loaded model, config
+  `virtual` aliases, and real-id passthrough; plus queue-aware LRU eviction
+  selection (never a busy model).
+- **`pool.DeviceModelManager`** — async actor owning loaded-model state and device
+  I/O (`/api/v1/models/{running,start,stop}`); de-dups concurrent same-id loads and
+  evicts an idle LRU model to fit, with a re-check that never evicts a model
+  mid-request.
+- **`pool.Gate` / `Slot`** — per-model `asyncio.Semaphore` + FIFO queue. Backpressure
+  returns `503` + `Retry-After` (never a wedge); device errors surface as `502`;
+  streaming requests hold their slot for the stream's whole lifetime.
+- New optional `[inferencers.<name>]` keys: `management_url`, `parallel`, `pool_max`,
+  `queue_max`, `queue_timeout`, `virtual`. Existing configs are unaffected.
+- Coverage: resolver 100%, pool 96%, router pooled paths 90%; 40+ new tests against
+  a hermetic fake device (load-on-demand, concurrent-load de-dup, an eviction race,
+  semaphore serialization, queue backpressure, streaming slot lifetime, lifespan).
+- Build: declare `pydantic-settings`; cap `mcp<1.30` / `fastmcp<3.5` to the
+  McpError-compatible line (fixes CI collection after `mcp 2.0.0` renamed
+  `McpError` → `MCPError`).
+
 ## v0.9.0 — 2026-08-08
 
 **Image + embedding pass-through endpoints.** woollama now proxies text-to-image
