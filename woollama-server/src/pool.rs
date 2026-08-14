@@ -322,8 +322,26 @@ impl DeviceBackend for RestBackend {
             .json()
             .await
             .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
+        // `get_dotted` returning `None` (key/path absent) is normal and means "no
+        // running models" — this is the tiiny back-compat case: a device response
+        // with no "running" key at all (e.g. `{}`) must still resolve to an empty
+        // set, not an error. But a path that IS present and resolves to something
+        // other than an array is a config-typo signal (the author pointed `path`
+        // at the wrong field/shape) — that case gets a loud `PoolError::Device`
+        // naming the path and the value it actually found, instead of silently
+        // treating it as "no models" and surfacing a much more confusing
+        // `load_timeout`-expiry "not running" error downstream.
         let path = self.running_path.as_deref().unwrap_or("");
-        let arr = get_dotted(&v, path).and_then(Value::as_array).cloned().unwrap_or_default();
+        let arr = match get_dotted(&v, path) {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(other) => {
+                return Err(PoolError::Device(format!(
+                    "running query: path '{path}' is present but not an array: {}",
+                    truncate(&other.to_string(), 200)
+                )));
+            }
+        };
         let running = arr
             .iter()
             .filter_map(|item| match &self.running_id_field {
@@ -378,6 +396,17 @@ impl DeviceBackend for RestBackend {
 /// the way `RestBackend` has. `keep_alive` (when set) is forwarded on `load` so a
 /// config author can control how long Ollama keeps a model resident after use; when
 /// unset, the field is omitted entirely so Ollama's own default applies.
+///
+/// Unlike `RestBackend` (which sends `default_headers`, e.g. a Bearer token derived
+/// from `api_key_env`), `OllamaBackend` sends NO auth headers at all — stock Ollama's
+/// HTTP API is unauthenticated, so there is nothing to attach.
+///
+/// Latent accuracy note: `/api/ps` can return a name-NORMALIZED id (e.g. Ollama may
+/// report `qwen3:latest` for a model this backend posted to `/api/generate` as plain
+/// `qwen3`). `list_loaded`/`reconcile` compare ids by exact string match, so such a
+/// normalization would make `DeviceModelManager` think the model it just loaded is
+/// NOT running (and vice versa on eviction bookkeeping) — a reconcile/eviction-accuracy
+/// gap, not currently handled here.
 pub struct OllamaBackend {
     client: reqwest::Client,
     base_url: String,
@@ -449,6 +478,11 @@ impl DeviceBackend for OllamaBackend {
         Ok(running)
     }
 
+    // No poll-for-readiness loop here (unlike `RestBackend::load`, which starts the
+    // device then polls `list_loaded` until `load_timeout`): Ollama's `/api/generate`
+    // itself blocks until the model is fully resident before it returns a 2xx, so by
+    // the time `generate` below succeeds, the model is already loaded — polling would
+    // be redundant.
     async fn load(&self, real_id: &str) -> Result<(), PoolError> {
         let mut body = serde_json::json!({ "model": real_id });
         if let Some(keep_alive) = &self.keep_alive {
@@ -826,9 +860,8 @@ impl PoolRegistry {
         self.0.get(provider)
     }
 
-    /// No pools — the degrade-on-error fallback `build_state` uses when
-    /// `from_registry` itself fails (mirrors the `engine::Registry::new()` fallback
-    /// used for a bad `inferencers.toml`).
+    /// No pools — an empty registry. Used by tests, and available as a manual
+    /// fallback; `from_registry` itself no longer needs one (see below).
     pub fn empty() -> PoolRegistry {
         PoolRegistry(HashMap::new())
     }
@@ -845,12 +878,28 @@ impl PoolRegistry {
     /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or a
     /// config-defined `kind = "ollama"` block (`OllamaBackend` with its configured
     /// `keep_alive`). An unresolvable name (not `"tiiny"`, not `"ollama"`, and absent
-    /// from `protocols`) is an `Err` — a config mistake should fail startup, not
-    /// silently produce a pool that always errors on first use.
-    pub fn from_registry(
-        registry: &engine::Registry,
-        protocols: &HashMap<String, engine::ProtocolSpec>,
-    ) -> Result<PoolRegistry, engine::EngineError> {
+    /// from `protocols`) does NOT fail the whole registry — a typo in ONE
+    /// inferencer's `management_protocol` must not silently disable pooling for
+    /// every other device inferencer (that used to route them all to the plain,
+    /// no-auto-load relay via `build_state`'s `Err` => `PoolRegistry::empty()`
+    /// fallback). Instead: warn loudly (naming the inferencer and the unresolved
+    /// protocol) and skip just that inferencer, leaving it absent from the
+    /// resulting map (`get()` returns `None` for it) while every other inferencer
+    /// still gets its pool built normally.
+    ///
+    /// Also warns (once, up front) if a config `[management_protocols.<name>]`
+    /// block reuses a RESERVED built-in name (`"tiiny"`/`"ollama"`) — that block is
+    /// always shadowed by the built-in of the same name (see the `match` below),
+    /// so silently ignoring it would hide a config mistake.
+    pub fn from_registry(registry: &engine::Registry, protocols: &HashMap<String, engine::ProtocolSpec>) -> PoolRegistry {
+        for reserved in ["tiiny", "ollama"] {
+            if protocols.contains_key(reserved) {
+                eprintln!(
+                    "woollamad: management_protocols: WARNING: config block '[management_protocols.{reserved}]' \
+                     is shadowed by the built-in '{reserved}' protocol and will be ignored"
+                );
+            }
+        }
         let mut map = HashMap::new();
         for inf in registry.list() {
             let Some(management_url) = inf.management_url.clone() else { continue };
@@ -867,11 +916,13 @@ impl PoolRegistry {
                         Arc::new(OllamaBackend::new(management_url, keep_alive.clone()))
                     }
                     None => {
-                        return Err(engine::EngineError::new(
-                            format!("inferencer '{}': unknown management_protocol '{other}'", inf.name),
-                            "invalid_request_error",
-                            400,
-                        ))
+                        eprintln!(
+                            "woollamad: management_protocols: WARNING: inferencer '{}': unknown \
+                             management_protocol '{other}' — skipping this inferencer (its device pool is \
+                             disabled; other inferencers are unaffected)",
+                            inf.name
+                        );
+                        continue;
                     }
                 },
             };
@@ -879,7 +930,7 @@ impl PoolRegistry {
             let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
             map.insert(inf.name.clone(), (manager, gate));
         }
-        Ok(PoolRegistry(map))
+        PoolRegistry(map)
     }
 }
 
@@ -910,7 +961,7 @@ mod tests {
         });
         reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
 
-        let pools = PoolRegistry::from_registry(&reg, &HashMap::new()).unwrap();
+        let pools = PoolRegistry::from_registry(&reg, &HashMap::new());
         assert!(pools.get("cloud").is_none(), "no management_url => no pool");
         assert!(pools.get("device").is_some(), "management_url present => pool built");
     }

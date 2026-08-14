@@ -95,6 +95,11 @@ pub enum RunningShape {
     Strings { field: String },
     /// `{ "<field>": [ { "<id_key>": "id" }, ... ] }`; `field == ""` means a top-level array.
     Objects { field: String, id_key: String },
+    /// `{ "<field>": <value> }` where `value` is deliberately NOT an array — for
+    /// testing the present-but-wrong-shape error path (a `path` typo landing on a
+    /// scalar/object instead of the loaded-models array). `field == ""` means
+    /// `value` is the top-level body.
+    NonArray { field: String, value: Value },
 }
 
 /// Where the model id lives for `start`/`stop` requests.
@@ -207,6 +212,13 @@ fn running_response(inner: &Inner, cfg: &RestMockConfig) -> Response {
                 Value::Array(arr)
             } else {
                 json!({ field: arr })
+            }
+        }
+        RunningShape::NonArray { field, value } => {
+            if field.is_empty() {
+                value.clone()
+            } else {
+                json!({ field: value.clone() })
             }
         }
     };

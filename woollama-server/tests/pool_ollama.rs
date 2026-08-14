@@ -46,7 +46,7 @@ async fn from_registry_resolves_builtin_ollama_and_drives_ensure_loaded() {
     reg.insert(device_inferencer("device", device.base_url.clone(), Some("ollama".to_string())));
 
     let protocols: HashMap<String, engine::ProtocolSpec> = HashMap::new();
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("'ollama' is a built-in name");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("qwen3:14b", None).await.expect("ensure_loaded should succeed");
@@ -75,7 +75,7 @@ async fn ensure_loaded_evicts_victim_with_keep_alive_zero() {
     reg.insert(device_inferencer("device", device.base_url.clone(), Some("ollama".to_string())));
 
     let protocols: HashMap<String, engine::ProtocolSpec> = HashMap::new();
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("'ollama' is a built-in name");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("qwen3:14b", Some(1)).await.expect("first load should succeed");
@@ -110,7 +110,7 @@ async fn from_registry_resolves_config_ollama_and_forwards_keep_alive() {
     let mut reg = engine::Registry::new();
     reg.insert(device_inferencer("device", device.base_url.clone(), Some("ollama-custom".to_string())));
 
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("from_registry should resolve 'ollama-custom'");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("qwen3:14b", None).await.expect("ensure_loaded should succeed");

@@ -526,11 +526,11 @@ fn parse_endpoint_spec(
         .get(op)
         .and_then(Value::as_object)
         .ok_or_else(|| protocol_err(path, proto_name, &key, "required table"))?;
-    let url = eobj
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol_err(path, proto_name, &format!("{key}.url"), "required"))?
-        .to_string();
+    let url = match eobj.get("url") {
+        None => return Err(protocol_err(path, proto_name, &format!("{key}.url"), "required")),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return Err(protocol_err(path, proto_name, &format!("{key}.url"), "must be a string")),
+    };
     let method = eobj.get("method").and_then(Value::as_str).map(str::to_string);
     let body = eobj.get("body").and_then(Value::as_str).map(str::to_string);
     let mut headers = std::collections::BTreeMap::new();
@@ -586,10 +586,11 @@ pub fn load_management_protocols() -> Result<HashMap<String, ProtocolSpec>, Engi
                 400,
             )
         })?;
-        let kind = obj
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(|| protocol_err(&path, name, "kind", "required"))?;
+        let kind = match obj.get("kind") {
+            None => return Err(protocol_err(&path, name, "kind", "required")),
+            Some(Value::String(s)) => s.as_str(),
+            Some(_) => return Err(protocol_err(&path, name, "kind", "must be a string")),
+        };
         let spec = match kind {
             "rest" => {
                 let endpoints = obj

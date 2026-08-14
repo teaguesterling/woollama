@@ -5,8 +5,14 @@
 //! `ensure_loaded`, asserting the mock observed the configured start call (method,
 //! path, body, header) and that the manager's view of loaded models matches the mock.
 //! Test B is the back-compat path (no `management_protocol` => tiiny preset). Test C
-//! asserts an unresolvable `management_protocol` name fails `from_registry` fast, at
-//! startup, rather than lazily at first use.
+//! asserts an unresolvable `management_protocol` name is isolated to the offending
+//! inferencer — `from_registry` skips (and warns about) just that one inferencer,
+//! while a sibling inferencer with a valid protocol is still pooled normally (review
+//! fix: this used to fail the WHOLE registry, degrading every device inferencer to
+//! the no-auto-load relay on a single typo). Test E covers the sibling review fix for
+//! `RestBackend::list_loaded`: a `path` that resolves to a present-but-non-array value
+//! is a loud `PoolError::Device`, distinct from the back-compat "absent key => empty
+//! set" case.
 
 mod common;
 
@@ -14,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use common::{spawn_rest, IdLoc, RestMockConfig, RunningShape};
 use woollama_engine as engine;
-use woollama_server::pool::PoolRegistry;
+use woollama_server::pool::{PoolError, PoolRegistry};
 
 fn device_inferencer(name: &str, management_url: String, management_protocol: Option<String>) -> engine::Inferencer {
     engine::Inferencer {
@@ -77,7 +83,7 @@ async fn from_registry_resolves_custom_protocol_and_drives_ensure_loaded() {
     let mut reg = engine::Registry::new();
     reg.insert(device_inferencer("device", device.base_url.clone(), Some("custom".to_string())));
 
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("from_registry should resolve 'custom'");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("m1", None).await.expect("ensure_loaded should succeed");
@@ -109,7 +115,7 @@ async fn from_registry_back_compat_defaults_to_tiiny() {
     reg.insert(device_inferencer("device", device.base_url.clone(), None));
 
     let protocols: HashMap<String, engine::ProtocolSpec> = HashMap::new();
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("tiiny is a built-in default");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("m1", None).await.expect("ensure_loaded should succeed");
@@ -117,16 +123,30 @@ async fn from_registry_back_compat_defaults_to_tiiny() {
     assert_eq!(manager.snapshot(), vec!["m1".to_string()]);
 }
 
-// --- Test C: unknown protocol name fails fast --------------------------------------
+// --- Test C: unknown protocol name is isolated to the offending inferencer --------
 
+/// A typo'd `management_protocol` on one inferencer must not disable pooling for
+/// every other device inferencer. `from_registry` skips (with a warning) only the
+/// offending inferencer — its provider is absent (`get()` => `None`) from the
+/// resulting `PoolRegistry` — while a sibling inferencer with a resolvable protocol
+/// (here, the default `"tiiny"`) is still pooled normally.
 #[test]
-fn from_registry_unknown_protocol_name_is_an_error() {
+fn from_registry_isolates_unknown_protocol_name_to_its_own_inferencer() {
     let mut reg = engine::Registry::new();
-    reg.insert(device_inferencer("device", "http://device.example:8800".to_string(), Some("nope".to_string())));
+    reg.insert(device_inferencer("bad-device", "http://device.example:8800".to_string(), Some("nope".to_string())));
+    reg.insert(device_inferencer("good-device", "http://device.example:8801".to_string(), None));
 
     let protocols: HashMap<String, engine::ProtocolSpec> = HashMap::new();
-    let result = PoolRegistry::from_registry(&reg, &protocols);
-    assert!(result.is_err(), "unresolvable management_protocol name must fail from_registry");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
+
+    assert!(
+        pools.get("bad-device").is_none(),
+        "an inferencer with an unresolvable management_protocol must be skipped, not error out the whole registry"
+    );
+    assert!(
+        pools.get("good-device").is_some(),
+        "a sibling inferencer with a resolvable management_protocol must still get a pool"
+    );
 }
 
 // --- Test D: endpoint header overrides default auth case-insensitively ------------
@@ -186,7 +206,7 @@ async fn from_registry_endpoint_header_overrides_default_auth_case_insensitively
     let mut reg = engine::Registry::new();
     reg.insert(inf);
 
-    let pools = PoolRegistry::from_registry(&reg, &protocols).expect("from_registry should resolve 'custom-auth'");
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
     let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
 
     manager.ensure_loaded("m1", None).await.expect("ensure_loaded should succeed");
@@ -204,4 +224,66 @@ async fn from_registry_endpoint_header_overrides_default_auth_case_insensitively
         Some("endpoint-secret"),
         "the endpoint's own header must win over the default Bearer auth"
     );
+}
+
+// --- Test E: a present-but-non-array running path is a clear device error ---------
+
+/// A config `path` that resolves to a PRESENT-but-non-array value (e.g. a typo that
+/// lands on an object or scalar instead of the loaded-models array) must surface as a
+/// clear `PoolError::Device` naming the path — not silently fall through to "no
+/// models running" (which would otherwise surface downstream as a much more
+/// confusing `load_timeout`-expiry "not running" error on the very next load).
+#[tokio::test]
+async fn ensure_loaded_errors_clearly_when_running_path_resolves_to_non_array() {
+    let device = spawn_rest(RestMockConfig {
+        running_route: "/status".to_string(),
+        start_route: "/models/{id}/start".to_string(),
+        stop_route: "/models/{id}/stop".to_string(),
+        running_shape: RunningShape::NonArray {
+            field: "data".to_string(),
+            value: serde_json::json!({ "oops": "not an array" }),
+        },
+        id_loc: IdLoc::Path,
+    });
+
+    let running = engine::EndpointSpec {
+        url: "{base}/status".to_string(),
+        method: None,
+        body: None,
+        headers: BTreeMap::new(),
+        path: Some("data".to_string()),
+        id_field: None,
+    };
+    let start = engine::EndpointSpec {
+        url: "{base}/models/{id}/start".to_string(),
+        method: Some("POST".to_string()),
+        body: None,
+        headers: BTreeMap::new(),
+        path: None,
+        id_field: None,
+    };
+    let stop = engine::EndpointSpec {
+        url: "{base}/models/{id}/stop".to_string(),
+        method: Some("POST".to_string()),
+        body: None,
+        headers: BTreeMap::new(),
+        path: None,
+        id_field: None,
+    };
+    let mut protocols = HashMap::new();
+    protocols.insert("bad-shape".to_string(), engine::ProtocolSpec::Rest { running, start, stop });
+
+    let mut reg = engine::Registry::new();
+    reg.insert(device_inferencer("device", device.base_url.clone(), Some("bad-shape".to_string())));
+
+    let pools = PoolRegistry::from_registry(&reg, &protocols);
+    let (manager, _gate) = pools.get("device").expect("pool built for 'device'");
+
+    let err = manager.ensure_loaded("m1", None).await.expect_err("non-array running path must error");
+    match err {
+        PoolError::Device(msg) => {
+            assert!(msg.contains("data"), "error should name the offending path, got: {msg}");
+        }
+        other => panic!("expected PoolError::Device, got {other:?}"),
+    }
 }
