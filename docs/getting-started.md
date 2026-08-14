@@ -85,6 +85,33 @@ r = c.chat.completions.create(
 upstream SSE verbatim; on `woollama/<recipe>` it streams the answer as OpenAI
 SSE with the tool loop hidden.
 
+### Images and embeddings
+
+`/v1/images/generations` and `/v1/embeddings` pass through to a
+`<provider>/<model>` inferencer's own OpenAI-compatible endpoints, the same way
+chat does (non-streaming; an unknown provider namespace is a `400`):
+
+```python
+img = c.images.generate(model="ollama/some-image-model", prompt="a red bicycle")
+vec = c.embeddings.create(model="ollama/some-embedding-model", input="hello world")
+```
+
+### Device-aware inferencers (model pooling)
+
+An inferencer configured with `management_url` (see
+[Configuration](configuration.md#model-pooling-device-aware-inferencers-optional))
+loads models on demand and exposes a stable `<provider>/default` name that
+always resolves to whatever's currently loaded — no bare not-loaded error, and
+requests queue (with `503` + `Retry-After` backpressure) instead of hanging
+when the backend is busy:
+
+```python
+r = c.chat.completions.create(
+    model="device/default",
+    messages=[{"role": "user", "content": "Hi"}],
+)
+```
+
 ### Stateful conversations (`/v1/responses`)
 
 The OpenAI **Responses** surface adds multi-turn state. woollama routes the

@@ -106,6 +106,18 @@ r = c.chat.completions.create(
     model="woollama/streamer",
     messages=[{"role": "user", "content": "Please count to 4."}],
 )
+
+# A device-aware inferencer (declares `management_url`): "default" resolves to
+# whatever's currently loaded, and woollama loads/queues on demand — no
+# not-loaded error, no wedge.
+r = c.chat.completions.create(
+    model="device/default",
+    messages=[{"role": "user", "content": "Hi"}],
+)
+
+# Pass-through also covers images and embeddings:
+img = c.images.generate(model="device/Z-Turbo", prompt="a small blue teapot")
+vec = c.embeddings.create(model="device/Embedder", input="hello world")
 ```
 
 woollama serves on **two transports at once**: a Unix socket at
@@ -209,7 +221,8 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 
 - OpenAI surface: `/v1/models`, `/v1/chat/completions` (pass-through +
   recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
-  introspection
+  introspection, plus `/v1/images/generations` and `/v1/embeddings`
+  pass-through (see below)
 - **Stateful surface**: `/v1/responses` (stateless subset, incl. `stream:true` →
   OpenAI Responses SSE, + stateful) and `/v1/conversations` (create/list/get/
   delete, plus `items` where the backend exposes its transcript). woollama routes
@@ -225,6 +238,19 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 - **Tool delegation**: a `claude-code` recipe with tools runs as an *executor* —
   Claude owns the agentic loop and calls the recipe's allow-listed MCP tools
   itself (per-recipe `--mcp-config` + `--allowedTools` containment)
+- **Image + embedding pass-through**: `POST /v1/images/generations` and
+  `POST /v1/embeddings` forward a `<provider>/<model>` request to that
+  inferencer's own OpenAI-compatible endpoints, mirroring the chat pass-through
+  (non-streaming; unknown namespace → `400`)
+- **Model pooling / device-aware inferencers**: an inferencer that declares a
+  `management_url` gets on-demand model loading (no more bare not-loaded
+  errors), stable **virtual model names** (`<provider>/default`, config
+  `virtual` aliases), and per-model request queuing with `503` + `Retry-After`
+  backpressure instead of a wedge — plus queue-aware LRU eviction to fit
+  `pool_max` loaded models. Fully additive: an inferencer with no
+  `management_url` is unaffected. Ships in **both** `woollama` (Python) and
+  `woollamad` (Rust); pooling currently covers `/v1/chat/completions` only
+  (`/v1/responses` isn't pooled yet)
 - MCP server side: stdio (`woollamad mcp`) **and** Streamable HTTP at `/mcp` on
   the same port — recipes as **parameterized prompts** (their `{{var}}` tokens →
   arguments), a `chat` verb (with live tool-progress notifications), and every

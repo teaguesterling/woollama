@@ -14,7 +14,7 @@
 
 - **Two crates, one workspace.** Pure logic → `woollama-engine` (rlib, **no pyo3**, must not gain a server dep). Stateful/HTTP → `woollama-server`. `woollama-core` (the cdylib wheel) is not touched.
 - **Conformance untouched.** `engine::inferencer_to_json` (engine lib.rs:479-486) stays at its current 4 fields — do NOT surface the new inferencer fields in it, so the conformance suite (42) is unaffected.
-- **Generic naming.** The example/test inferencer name is **`device`** (never "tiiny" — the repo was scrubbed of that brand). Field for the TOML `virtual` key is `virtual_models` (`virtual` is a Rust keyword; the TOML key stays `virtual`).
+- **Generic naming.** The example/test inferencer name is **`device`** (never the old product name — the repo was scrubbed of that brand). Field for the TOML `virtual` key is `virtual_models` (`virtual` is a Rust keyword; the TOML key stays `virtual`).
 - **CI gate (Rust):** every task must leave `cargo test -p woollama-engine -p woollama-server --features test-fixtures` green and `cargo clippy -p woollama-engine -p woollama-server --all-targets --features test-fixtures -- -D warnings` clean. Clippy is a hard gate (`-D warnings`).
 - **Additive / backward-compatible.** An inferencer without `management_url` behaves exactly as today. Existing tests must stay green.
 - **Device API (verified live):** management base is `management_url`; `GET {management_url}/api/v1/models/running` → `{"running":[<real_id>,...], ...}` (parse the top-level `running` array), auth `Authorization: Bearer <key>`; load/unload `POST {management_url}/api/v1/models/{real_id}/start|stop`. Real ids contain slashes — send raw.

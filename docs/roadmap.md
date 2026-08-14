@@ -1,7 +1,7 @@
 # woollama roadmap & status
 
 Single source of truth for *what's built, what's next, and in what order.*
-Updated 2026-06-20. Detailed history: [`build-log.md`](build-log.md). Target
+Updated 2026-08-13. Detailed history: [`build-log.md`](build-log.md). Target
 design: [`architecture.md`](architecture.md).
 
 woollama is a **router** between OpenAI-/MCP-speaking clients and OpenAI-/MCP-
@@ -54,6 +54,8 @@ inference or tools.
 | **Cloud models in `/v1/models`** — per-inferencer static `models` + opt-in `discover`/`model_patterns` (field-merge over built-ins) | `inferencers.py`, `config.py`, `router.py` | #3 |
 | Pattern templating (`/w1/`): recipes/patterns with double-brace variable substitution; `GET /w1/patterns`, `/render`, `/run` (streaming); `[patterns]` dir scan; MCP prompts parameterized. Rust-only (`woollama-server`); engine untouched | `config.rs`, `lib.rs`, `mcp_surface.rs` | w1 |
 | Fabric backend: managed/routed `fabric --serve` behind woollama; its library on `/w1/`, a transparent fabric REST proxy; behind a pluggable `PatternBackend` trait (the model for new backends) | `fabric.rs`, `pattern_backend.rs` | w1-fabric |
+| **Image + embedding pass-through** — `POST /v1/images/generations` and `POST /v1/embeddings` forward a `<provider>/<model>` request to that inferencer's own OpenAI-compatible endpoints, mirroring chat pass-through (non-streaming; unknown namespace → 400) | `router.py` (Python); ported to `woollama-server` for parity | v0.9.0 |
+| **Model pooling / device-aware inferencers** — an inferencer declaring `management_url` gets on-demand model load (`/api/v1/models/{running,start,stop}`), virtual model names (`<provider>/default`, config `virtual` aliases), and per-model request queuing/backpressure (`503` + `Retry-After`) with queue-aware LRU eviction to fit `pool_max`. Fully additive; covers `/v1/chat/completions` only (`/v1/responses` not pooled yet). Shipped in **both** `woollama` (Python) and `woollamad` (Rust) | `resolver.py`, `pool.py`, `router.py`; Rust twin `resolver`/`pool` modules | v0.10.0 |
 | Lint-clean (`ruff check .`); Rust suite + `clippy -D warnings` | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
@@ -63,9 +65,13 @@ and `managed-agents` backends — OpenAI Responses shape; non-claude models are
 stateless-only, `store:false`),
 `/v1/conversations` (create/list/get/delete + `items` for managed-agents),
 `/v1/models`,
+`/v1/images/generations` and `/v1/embeddings` (pass-through, non-streaming),
 `/v1/tools`, `/mcp` (Streamable HTTP),
 and `woollama mcp` (stdio) — served on BOTH a Unix socket
-(`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port.
+(`$XDG_RUNTIME_DIR/woollama.sock`) and the loopback TCP port. Inferencers that
+declare `management_url` are additionally device-aware: on-demand model
+loading, virtual model names, and per-model request queuing (`/v1/chat/completions`
+only — see v0.10.0 above).
 
 ## Open tracks (recommended order)
 

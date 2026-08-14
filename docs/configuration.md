@@ -230,7 +230,9 @@ OpenAI-compatible backends. **Merged field-by-field over the built-ins** (`ollam
 `anthropic`, `openai`, `groq`, `together`, `openrouter`) — a same-named entry
 overlays only the keys it sets, so you can extend a built-in (e.g. add `models`
 to `anthropic`) without restating its `base_url`. A *new* provider must supply
-`base_url`.
+`base_url`. Pass-through covers chat (`/v1/chat/completions`), images
+(`/v1/images/generations`), and embeddings (`/v1/embeddings`) — all forwarded to
+the inferencer's own OpenAI-compatible endpoints under `base_url`.
 
 ```toml
 # New self-hosted provider (no auth)
@@ -261,6 +263,42 @@ model_patterns = ["anthropic/*", "openai/gpt-4*"]
 Models are still **routable by raw id** (`anthropic/claude-opus-4-8`) whether or
 not they're listed — `models`/`discover` only control *discoverability* in
 `GET /v1/models` (what a list-backed picker can offer).
+
+### Model pooling / device-aware inferencers (optional)
+
+An inferencer that declares `management_url` becomes **device-aware**: woollama
+loads models on it on demand instead of failing with a not-loaded error, resolves
+stable **virtual model names**, and serializes/queues requests around the
+backend's real concurrency limit — returning `503` + `Retry-After` under
+backpressure instead of hanging. Fully additive: an inferencer with no
+`management_url` behaves exactly as the stateless pass-through above.
+
+```toml
+[inferencers.device]
+base_url = "http://127.0.0.1:8800/v1"
+management_url = "http://127.0.0.1:8800"   # enables pooling for this inferencer
+parallel = 1                                # concurrent requests the backend serves per model
+pool_max = 2                                # max concurrently-loaded models before eviction
+queue_max = 8                               # requests queued per model before 503
+queue_timeout = 30                          # seconds a queued request waits before 503
+
+[inferencers.device.virtual]
+default = "big-model-7b"     # device/default -> whatever's currently loaded, else this
+coder = "code-model-14b"     # device/coder -> code-model-14b
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `management_url` | — | Base URL of the backend's model-management API (`GET/POST /api/v1/models/{running,start,stop}`). Its presence is what turns on pooling for this inferencer. |
+| `parallel` | — | Requests the backend actually serves concurrently per loaded model (default `1`). Sizes the per-model queue semaphore. |
+| `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). Unset ⇒ no cap and no auto-eviction. |
+| `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
+| `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
+| `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
+
+Pooling applies to `/v1/chat/completions` (in both `woollama` and `woollamad`);
+the `/v1/responses` path is not pooled yet. Raw real model ids remain routable
+alongside virtual names — `virtual` only adds aliases, it doesn't restrict.
 
 See also: [Pattern templating](patterns.md) · [Extending woollama](extending.md) ·
 [Environment variables](environment.md) · [Security model](security.md).

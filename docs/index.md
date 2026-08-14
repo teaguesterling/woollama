@@ -80,6 +80,16 @@ What works today:
 - **Multi-backend routing** — ollama, anthropic, openai, groq, together,
   openrouter, `claude-code`, and any OpenAI-compatible endpoint via
   `inferencers.toml`.
+- **Image + embedding pass-through** — `POST /v1/images/generations` and
+  `POST /v1/embeddings` forward to an inferencer's own OpenAI-compatible
+  endpoints, mirroring chat pass-through.
+- **Model pooling / device-aware inferencers** — an inferencer that declares
+  `management_url` gets on-demand model loading, stable virtual model names
+  (`<provider>/default`, config `virtual` aliases), and per-model request
+  queuing with `503`/`Retry-After` backpressure instead of a wedge. Additive;
+  an inferencer without `management_url` is unaffected. Ships in both
+  `woollama` and `woollamad`, covering `/v1/chat/completions` (see
+  [Configuration](configuration.md#model-pooling-device-aware-inferencers-optional)).
 - **Stateful conversations** route *handles*; backends own the *state* —
   woollama never stores transcripts in its own system (see the
   [Conversations API](conversations-api-design.md)).
