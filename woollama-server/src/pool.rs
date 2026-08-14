@@ -621,6 +621,7 @@ mod tests {
             discover: false,
             model_patterns: Vec::new(),
             management_url: Some("http://device.example:8800".to_string()),
+            management_protocol: None,
             parallel: 1,
             pool_max: None,
             queue_max: None,
