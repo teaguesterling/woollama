@@ -97,6 +97,10 @@ pub struct Inferencer {
     /// providers). Mirrors the Python `Inferencer` dataclass's pooling fields.
     /// The device's management API base (`:8800`); presence enables the pool.
     pub management_url: Option<String>,
+    /// Selects a named `[management_protocols.<name>]` block (see `ProtocolSpec`) that
+    /// describes how to query/start/stop models on the device. `None` means "use the
+    /// server's built-in REST shape" (unaffected by this field).
+    pub management_protocol: Option<String>,
     /// Per-model concurrency slot size.
     pub parallel: u32,
     /// Max concurrently-loaded models; `None` => no cap/eviction.
@@ -121,6 +125,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
         discover: false,
         model_patterns: Vec::new(),
         management_url: None,
+        management_protocol: None,
         parallel: 1,
         pool_max: None,
         queue_max: None,
@@ -142,6 +147,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
                 discover: true, // local catalog is small + needs no key → list it
                 model_patterns: Vec::new(),
                 management_url: None,
+                management_protocol: None,
                 parallel: 1,
                 pool_max: None,
                 queue_max: None,
@@ -158,6 +164,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
             discover: false,
             model_patterns: Vec::new(),
             management_url: None,
+            management_protocol: None,
             parallel: 1,
             pool_max: None,
             queue_max: None,
@@ -420,12 +427,14 @@ pub fn expand_env(text: &str) -> String {
     out
 }
 
-/// Parse `$config/inferencers.toml` into `{name: <spec table>}`. Missing file → `{}`.
-fn load_inferencers_toml() -> Result<HashMap<String, serde_json::Map<String, Value>>, EngineError> {
+/// Read + `${VAR}`-expand + parse `$config/inferencers.toml`. `None` if the file doesn't
+/// exist. Shared by `load_inferencers_toml` and `load_management_protocols`, which each
+/// read a different top-level table out of the same file.
+fn load_toml_document() -> Result<Option<(std::path::PathBuf, Value)>, EngineError> {
     let path = config_dir().join("inferencers.toml");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => return Ok(HashMap::new()),
+        Err(_) => return Ok(None),
     };
     let v: Value = toml::from_str(&expand_env(&text)).map_err(|e| {
         EngineError::new(
@@ -434,6 +443,12 @@ fn load_inferencers_toml() -> Result<HashMap<String, serde_json::Map<String, Val
             400,
         )
     })?;
+    Ok(Some((path, v)))
+}
+
+/// Parse `$config/inferencers.toml` into `{name: <spec table>}`. Missing file → `{}`.
+fn load_inferencers_toml() -> Result<HashMap<String, serde_json::Map<String, Value>>, EngineError> {
+    let Some((path, v)) = load_toml_document()? else { return Ok(HashMap::new()) };
     let raw = match v.get("inferencers") {
         None => return Ok(HashMap::new()),
         Some(Value::Object(o)) => o,
@@ -455,6 +470,152 @@ fn load_inferencers_toml() -> Result<HashMap<String, serde_json::Map<String, Val
             )
         })?;
         out.insert(name.clone(), obj.clone());
+    }
+    Ok(out)
+}
+
+// --- management protocols ([management_protocols.<name>]) ---------------------
+
+/// One HTTP endpoint used by a `rest` management protocol. `path`/`id_field` apply only
+/// to the `running` endpoint: `path` is a dotted lookup into the JSON response for the
+/// array/object of currently-loaded models, `id_field` the key holding each model's id
+/// when that array holds objects rather than bare strings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointSpec {
+    pub url: String,
+    pub method: Option<String>,
+    pub body: Option<String>,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub path: Option<String>,
+    pub id_field: Option<String>,
+}
+
+/// A named, config-defined device management protocol (`[management_protocols.<name>]`),
+/// selected per-inferencer via `Inferencer::management_protocol`.
+// `ProtocolSpec` values are parsed once per process (config load) and held briefly, never
+// hot-path/collection-heavy — the size delta between variants isn't worth boxing `EndpointSpec`
+// out of the public shape the server (task 3) matches on.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProtocolSpec {
+    /// Three explicit HTTP calls: list loaded models, start one, stop one.
+    Rest { running: EndpointSpec, start: EndpointSpec, stop: EndpointSpec },
+    /// ollama's native `keep_alive` knob (no explicit start/stop calls).
+    Ollama { keep_alive: Option<String> },
+}
+
+fn protocol_err(path: &std::path::Path, name: &str, key: &str, msg: &str) -> EngineError {
+    EngineError::new(
+        format!("inferencers.toml {}: management_protocols.{name}.{key}: {msg}", path.display()),
+        "invalid_request_error",
+        400,
+    )
+}
+
+/// Parse one `[management_protocols.<name>.endpoints.<op>]` table. `require_path` is set
+/// only for the `running` endpoint (`path` is meaningless for `start`/`stop`).
+fn parse_endpoint_spec(
+    path: &std::path::Path,
+    proto_name: &str,
+    op: &str,
+    endpoints: &serde_json::Map<String, Value>,
+    require_path: bool,
+) -> Result<EndpointSpec, EngineError> {
+    let key = format!("endpoints.{op}");
+    let eobj = endpoints
+        .get(op)
+        .and_then(Value::as_object)
+        .ok_or_else(|| protocol_err(path, proto_name, &key, "required table"))?;
+    let url = match eobj.get("url") {
+        None => return Err(protocol_err(path, proto_name, &format!("{key}.url"), "required")),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return Err(protocol_err(path, proto_name, &format!("{key}.url"), "must be a string")),
+    };
+    let method = eobj.get("method").and_then(Value::as_str).map(str::to_string);
+    let body = eobj.get("body").and_then(Value::as_str).map(str::to_string);
+    let mut headers = std::collections::BTreeMap::new();
+    match eobj.get("headers") {
+        None => {}
+        Some(Value::Object(h)) => {
+            for (hk, hv) in h {
+                let s = hv.as_str().ok_or_else(|| {
+                    protocol_err(path, proto_name, &format!("{key}.headers.{hk}"), "must be a string")
+                })?;
+                headers.insert(hk.clone(), s.to_string());
+            }
+        }
+        Some(_) => return Err(protocol_err(path, proto_name, &format!("{key}.headers"), "must be a table of strings")),
+    }
+    let (ep_path, id_field) = if require_path {
+        let p = eobj
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| protocol_err(path, proto_name, &format!("{key}.path"), "required"))?
+            .to_string();
+        let idf = eobj.get("id_field").and_then(Value::as_str).map(str::to_string);
+        (Some(p), idf)
+    } else {
+        (None, None)
+    };
+    Ok(EndpointSpec { url, method, body, headers, path: ep_path, id_field })
+}
+
+/// Parse `[management_protocols.<name>]` out of `$config/inferencers.toml` (same file as
+/// `[inferencers.*]`) into typed `ProtocolSpec`s. Missing file, or a file with no
+/// `[management_protocols]` section at all, both yield an empty map — this section is
+/// entirely optional.
+pub fn load_management_protocols() -> Result<HashMap<String, ProtocolSpec>, EngineError> {
+    let Some((path, v)) = load_toml_document()? else { return Ok(HashMap::new()) };
+    let raw = match v.get("management_protocols") {
+        None => return Ok(HashMap::new()),
+        Some(Value::Object(o)) => o,
+        Some(_) => {
+            return Err(EngineError::new(
+                format!("inferencers.toml {}: 'management_protocols' must be a table", path.display()),
+                "invalid_request_error",
+                400,
+            ))
+        }
+    };
+    let mut out = HashMap::new();
+    for (name, entry) in raw {
+        let obj = entry.as_object().ok_or_else(|| {
+            EngineError::new(
+                format!("inferencers.toml {}: management_protocols.'{name}' must be a table", path.display()),
+                "invalid_request_error",
+                400,
+            )
+        })?;
+        let kind = match obj.get("kind") {
+            None => return Err(protocol_err(&path, name, "kind", "required")),
+            Some(Value::String(s)) => s.as_str(),
+            Some(_) => return Err(protocol_err(&path, name, "kind", "must be a string")),
+        };
+        let spec = match kind {
+            "rest" => {
+                let endpoints = obj
+                    .get("endpoints")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| protocol_err(&path, name, "endpoints", "required table for kind = \"rest\""))?;
+                let running = parse_endpoint_spec(&path, name, "running", endpoints, true)?;
+                let start = parse_endpoint_spec(&path, name, "start", endpoints, false)?;
+                let stop = parse_endpoint_spec(&path, name, "stop", endpoints, false)?;
+                ProtocolSpec::Rest { running, start, stop }
+            }
+            "ollama" => {
+                let keep_alive = obj.get("keep_alive").and_then(Value::as_str).map(str::to_string);
+                ProtocolSpec::Ollama { keep_alive }
+            }
+            other => {
+                return Err(protocol_err(
+                    &path,
+                    name,
+                    "kind",
+                    &format!("must be 'rest' or 'ollama' (got '{other}')"),
+                ))
+            }
+        };
+        out.insert(name.clone(), spec);
     }
     Ok(out)
 }
@@ -521,6 +682,12 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| base.as_ref().and_then(|b| b.management_url.clone()));
+        let management_protocol = spec
+            .get("management_protocol")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| base.as_ref().and_then(|b| b.management_protocol.clone()));
         let parallel = spec
             .get("parallel")
             .and_then(Value::as_u64)
@@ -561,6 +728,7 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
                 discover,
                 model_patterns,
                 management_url,
+                management_protocol,
                 parallel,
                 pool_max,
                 queue_max,
@@ -608,6 +776,7 @@ impl Registry {
                 discover: false,
                 model_patterns: Vec::new(),
                 management_url: None,
+                management_protocol: None,
                 parallel: 1,
                 pool_max: None,
                 queue_max: None,

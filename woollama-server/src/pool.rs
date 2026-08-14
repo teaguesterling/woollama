@@ -106,12 +106,399 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-pub struct DeviceModelManager {
+/// A pluggable device-management transport: however a `DeviceModelManager` talks to
+/// its inferencer to discover/load/unload models. `RestBackend` is the built-in
+/// implementation for Tiiny's REST shape (`{url}/api/v1/models/...`); later tasks add
+/// config-defined REST protocols and an Ollama adapter behind this same seam.
+#[async_trait::async_trait]
+pub trait DeviceBackend: Send + Sync {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError>;
+    async fn load(&self, id: &str) -> Result<(), PoolError>;
+    async fn unload(&self, id: &str) -> Result<(), PoolError>;
+}
+
+/// One HTTP call (`running`/`start`/`stop`) fully resolved against a base URL and
+/// default headers, but still carrying an `{id}` placeholder in `url`/`body`/header
+/// values — substituted per-call by `render` (there's no id yet at construction time
+/// for `start`/`stop`, and never one for `running`).
+struct CompiledEndpoint {
+    method: reqwest::Method,
     url: String,
+    body: Option<String>,
     headers: HashMap<String, String>,
+}
+
+impl CompiledEndpoint {
+    /// Substitute `{id}` (when `id` is given) into `url`/`body`/every header value,
+    /// and hand back everything a request needs. `running` calls this with `None`
+    /// (no id in scope); `start`/`unload` with `Some(real_id)`.
+    fn render(&self, id: Option<&str>) -> (reqwest::Method, String, Option<String>, HashMap<String, String>) {
+        let sub = |s: &str| -> String {
+            match id {
+                Some(id) => s.replace("{id}", id),
+                None => s.to_string(),
+            }
+        };
+        let url = sub(&self.url);
+        let body = self.body.as_deref().map(sub);
+        let headers = self.headers.iter().map(|(k, v)| (k.clone(), sub(v))).collect();
+        (self.method.clone(), url, body, headers)
+    }
+}
+
+/// Method parsed case-insensitively from an optional config override, falling back to
+/// `default` when unset OR unparseable (an invalid method string in config shouldn't
+/// panic startup; it just loses the override — logged so the typo isn't silently
+/// invisible).
+fn resolve_method(configured: &Option<String>, default: reqwest::Method) -> reqwest::Method {
+    match configured.as_deref() {
+        None => default,
+        Some(m) => reqwest::Method::from_bytes(m.to_ascii_uppercase().as_bytes()).unwrap_or_else(|_| {
+            eprintln!("woollamad: management_protocols: invalid HTTP method '{m}', falling back to {default}");
+            default
+        }),
+    }
+}
+
+/// Build a `CompiledEndpoint` from a config `EndpointSpec`: substitute `{base}` into
+/// `url`/`body`/header values now (known at construction time), merge `spec.headers`
+/// OVER `default_headers` (an endpoint header key overrides the shared Bearer auth —
+/// keyed CASE-INSENSITIVELY, since HTTP header names are; both maps are folded to
+/// lowercase keys so e.g. an endpoint header keyed `authorization` overrides a default
+/// `Authorization`, never sending both), and default `content-type: application/json`
+/// when a `body` is present and no `content-type` header was set either way.
+/// Lowercase keys are also what actually go out on the wire (reqwest is fine with
+/// that; header names are case-insensitive there too).
+fn compile_endpoint(
+    base: &str,
+    default_headers: &HashMap<String, String>,
+    spec: &engine::EndpointSpec,
+    default_method: reqwest::Method,
+) -> CompiledEndpoint {
+    let sub_base = |s: &str| s.replace("{base}", base);
+    let method = resolve_method(&spec.method, default_method);
+    let url = sub_base(&spec.url);
+    let body = spec.body.as_deref().map(sub_base);
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for (k, v) in default_headers {
+        headers.insert(k.to_ascii_lowercase(), v.clone());
+    }
+    for (k, v) in &spec.headers {
+        headers.insert(k.to_ascii_lowercase(), sub_base(v));
+    }
+    if body.is_some() && !headers.contains_key("content-type") {
+        headers.insert("content-type".to_string(), "application/json".to_string());
+    }
+    CompiledEndpoint { method, url, body, headers }
+}
+
+/// Dotted-path lookup into a JSON value (`""` => the value itself; `"a.b"` =>
+/// `v["a"]["b"]`) — how `RestBackend::list_loaded` finds the running-models
+/// array/object inside an arbitrary config-defined response shape.
+fn get_dotted<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(v);
+    }
+    let mut cur = v;
+    for part in path.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
+}
+
+/// The `DeviceBackend` for config-defined (and Tiiny's built-in) REST device-management
+/// shapes: three HTTP calls (list-loaded/start/stop), each independently templated
+/// (`RestBackend::from_spec`). `RestBackend::tiiny` is the Tiiny preset, expressed as a
+/// `from_spec` call with Tiiny's built-in endpoints.
+pub struct RestBackend {
     client: reqwest::Client,
+    running: CompiledEndpoint,
+    start: CompiledEndpoint,
+    stop: CompiledEndpoint,
+    /// Dotted path (within the `running` response) to the array of loaded models;
+    /// `None`/absent means the response body itself is that array.
+    running_path: Option<String>,
+    /// When the running array holds objects rather than bare id strings, the field
+    /// to pluck from each element.
+    running_id_field: Option<String>,
     poll_interval: f64,
     load_timeout: f64,
+}
+
+impl RestBackend {
+    /// Build a `RestBackend` from a config `ProtocolSpec::Rest`'s three endpoints.
+    /// `{base}` (→ `base_url` trimmed of a trailing `/`) is substituted into every
+    /// `url`/`body`/header value now; `{id}` is substituted per-call (see
+    /// `CompiledEndpoint::render`). Per-op method defaults: GET for `running`, POST
+    /// for `start`/`stop` (an explicit `method` on the spec overrides).
+    pub fn from_spec(
+        base_url: &str,
+        default_headers: &HashMap<String, String>,
+        running: &engine::EndpointSpec,
+        start: &engine::EndpointSpec,
+        stop: &engine::EndpointSpec,
+        poll_interval: f64,
+        load_timeout: f64,
+    ) -> RestBackend {
+        let base = base_url.trim_end_matches('/');
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs_f64(30.0))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        RestBackend {
+            client,
+            running: compile_endpoint(base, default_headers, running, reqwest::Method::GET),
+            start: compile_endpoint(base, default_headers, start, reqwest::Method::POST),
+            stop: compile_endpoint(base, default_headers, stop, reqwest::Method::POST),
+            running_path: running.path.clone(),
+            running_id_field: running.id_field.clone(),
+            poll_interval,
+            load_timeout,
+        }
+    }
+
+    /// The Tiiny device-management REST shape (`GET {base}/api/v1/models/running`,
+    /// `POST .../{id}/start`, `POST .../{id}/stop`), expressed as a `from_spec` call
+    /// with Tiiny's built-in endpoints — the preset every `management_protocol`
+    /// resolution falls back to when an inferencer names none (or names `"tiiny"`
+    /// explicitly).
+    pub fn tiiny(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
+        let no_headers = std::collections::BTreeMap::new();
+        let running = engine::EndpointSpec {
+            url: "{base}/api/v1/models/running".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers.clone(),
+            path: Some("running".to_string()),
+            id_field: None,
+        };
+        let start = engine::EndpointSpec {
+            url: "{base}/api/v1/models/{id}/start".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers.clone(),
+            path: None,
+            id_field: None,
+        };
+        let stop = engine::EndpointSpec {
+            url: "{base}/api/v1/models/{id}/stop".to_string(),
+            method: None,
+            body: None,
+            headers: no_headers,
+            path: None,
+            id_field: None,
+        };
+        RestBackend::from_spec(&management_url, &headers, &running, &start, &stop, poll_interval, load_timeout)
+    }
+
+    /// Issue one templated call: apply `endpoint.render(id)`'s method/url/body/headers
+    /// to `self.client`, send it, and hand back the parsed status + body text/bytes.
+    async fn call(&self, endpoint: &CompiledEndpoint, id: Option<&str>) -> Result<(reqwest::StatusCode, reqwest::Response), reqwest::Error> {
+        let (method, url, body, headers) = endpoint.render(id);
+        let mut rb = self.client.request(method, url);
+        for (k, v) in &headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        if let Some(b) = body {
+            rb = rb.body(b);
+        }
+        let r = rb.send().await?;
+        Ok((r.status(), r))
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceBackend for RestBackend {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
+        let (status, r) = self
+            .call(&self.running, None)
+            .await
+            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
+        }
+        let v: Value = r
+            .json()
+            .await
+            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
+        // `get_dotted` returning `None` (key/path absent) is normal and means "no
+        // running models" — this is the tiiny back-compat case: a device response
+        // with no "running" key at all (e.g. `{}`) must still resolve to an empty
+        // set, not an error. But a path that IS present and resolves to something
+        // other than an array is a config-typo signal (the author pointed `path`
+        // at the wrong field/shape) — that case gets a loud `PoolError::Device`
+        // naming the path and the value it actually found, instead of silently
+        // treating it as "no models" and surfacing a much more confusing
+        // `load_timeout`-expiry "not running" error downstream.
+        let path = self.running_path.as_deref().unwrap_or("");
+        let arr = match get_dotted(&v, path) {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(other) => {
+                return Err(PoolError::Device(format!(
+                    "running query: path '{path}' is present but not an array: {}",
+                    truncate(&other.to_string(), 200)
+                )));
+            }
+        };
+        let running = arr
+            .iter()
+            .filter_map(|item| match &self.running_id_field {
+                Some(field) => item.get(field).and_then(Value::as_str).map(String::from),
+                None => item.as_str().map(String::from),
+            })
+            .collect();
+        Ok(running)
+    }
+
+    async fn load(&self, real_id: &str) -> Result<(), PoolError> {
+        let (status, r) = self
+            .call(&self.start, Some(real_id))
+            .await
+            .map_err(|e| PoolError::Device(format!("start {real_id}: unreachable: {e}")))?;
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "start {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs_f64(self.load_timeout);
+        while Instant::now() < deadline {
+            if self.list_loaded().await?.contains(real_id) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs_f64(self.poll_interval)).await;
+        }
+        Err(PoolError::Device(format!("start {real_id}: not running after {}s", self.load_timeout)))
+    }
+
+    async fn unload(&self, real_id: &str) -> Result<(), PoolError> {
+        let (status, r) = self
+            .call(&self.stop, Some(real_id))
+            .await
+            .map_err(|e| PoolError::Device(format!("stop {real_id}: unreachable: {e}")))?;
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "stop {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The `DeviceBackend` for Ollama's native management API: `GET {base}/api/ps` lists
+/// loaded models, `POST {base}/api/generate` both loads (empty-prompt warm-up) and
+/// unloads (`keep_alive: 0`) a model — there is no separate start/stop endpoint pair
+/// the way `RestBackend` has. `keep_alive` (when set) is forwarded on `load` so a
+/// config author can control how long Ollama keeps a model resident after use; when
+/// unset, the field is omitted entirely so Ollama's own default applies.
+///
+/// Unlike `RestBackend` (which sends `default_headers`, e.g. a Bearer token derived
+/// from `api_key_env`), `OllamaBackend` sends NO auth headers at all — stock Ollama's
+/// HTTP API is unauthenticated, so there is nothing to attach.
+///
+/// Latent accuracy note: `/api/ps` can return a name-NORMALIZED id (e.g. Ollama may
+/// report `qwen3:latest` for a model this backend posted to `/api/generate` as plain
+/// `qwen3`). `list_loaded`/`reconcile` compare ids by exact string match, so such a
+/// normalization would make `DeviceModelManager` think the model it just loaded is
+/// NOT running (and vice versa on eviction bookkeeping) — a reconcile/eviction-accuracy
+/// gap, not currently handled here.
+pub struct OllamaBackend {
+    client: reqwest::Client,
+    base_url: String,
+    keep_alive: Option<String>,
+}
+
+impl OllamaBackend {
+    /// Build an `OllamaBackend` against `base_url` (trailing `/` trimmed). `keep_alive`
+    /// is `None` for the built-in `"ollama"` name (Ollama's default applies) or
+    /// `Some(...)` when resolved from a config `ProtocolSpec::Ollama { keep_alive }`.
+    pub fn new(base_url: String, keep_alive: Option<String>) -> OllamaBackend {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs_f64(30.0))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        OllamaBackend { client, base_url: base_url.trim_end_matches('/').to_string(), keep_alive }
+    }
+
+    /// `POST {base}/api/generate` with `body`, mapped to the shared `PoolError::Device`
+    /// error shape (transport failure or non-2xx status), same message style as
+    /// `RestBackend`.
+    async fn generate(&self, real_id: &str, body: Value) -> Result<(), PoolError> {
+        let url = format!("{}/api/generate", self.base_url);
+        let r = self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("generate {real_id}: unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "generate {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceBackend for OllamaBackend {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
+        let url = format!("{}/api/ps", self.base_url);
+        let r = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
+        }
+        let v: Value = r
+            .json()
+            .await
+            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
+        let running = v
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        Ok(running)
+    }
+
+    // No poll-for-readiness loop here (unlike `RestBackend::load`, which starts the
+    // device then polls `list_loaded` until `load_timeout`): Ollama's `/api/generate`
+    // itself blocks until the model is fully resident before it returns a 2xx, so by
+    // the time `generate` below succeeds, the model is already loaded — polling would
+    // be redundant.
+    async fn load(&self, real_id: &str) -> Result<(), PoolError> {
+        let mut body = serde_json::json!({ "model": real_id });
+        if let Some(keep_alive) = &self.keep_alive {
+            body["keep_alive"] = Value::String(keep_alive.clone());
+        }
+        self.generate(real_id, body).await
+    }
+
+    async fn unload(&self, real_id: &str) -> Result<(), PoolError> {
+        let body = serde_json::json!({ "model": real_id, "keep_alive": 0 });
+        self.generate(real_id, body).await
+    }
+}
+
+pub struct DeviceModelManager {
+    backend: Arc<dyn DeviceBackend>,
     retry_after: f64,
     entries: StdMutex<HashMap<String, Entry>>,
     load_lock: AsyncMutex<()>,
@@ -119,30 +506,15 @@ pub struct DeviceModelManager {
 }
 
 impl DeviceModelManager {
-    /// Production constructor: Python defaults (`poll_interval=0.5`,
-    /// `load_timeout=120.0`, `retry_after=5.0`).
-    pub fn new(management_url: String, headers: HashMap<String, String>) -> Self {
-        Self::with_config(management_url, headers, 0.5, 120.0, 5.0)
+    /// Production constructor: Python default (`retry_after=5.0`).
+    pub fn new(backend: Arc<dyn DeviceBackend>) -> Self {
+        Self::with_retry_after(backend, 5.0)
     }
 
     /// Test/tunable constructor.
-    pub fn with_config(
-        management_url: String,
-        headers: HashMap<String, String>,
-        poll_interval: f64,
-        load_timeout: f64,
-        retry_after: f64,
-    ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(30.0))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    pub fn with_retry_after(backend: Arc<dyn DeviceBackend>, retry_after: f64) -> Self {
         DeviceModelManager {
-            url: management_url.trim_end_matches('/').to_string(),
-            headers,
-            client,
-            poll_interval,
-            load_timeout,
+            backend,
             retry_after,
             entries: StdMutex::new(HashMap::new()),
             load_lock: AsyncMutex::new(()),
@@ -254,7 +626,7 @@ impl DeviceModelManager {
             return Ok(());
         }
 
-        let running = self.running().await?;
+        let running = self.backend.list_loaded().await?;
         self.reconcile(&running);
         if running.contains(real_id) {
             self.mark_loaded(real_id);
@@ -294,7 +666,7 @@ impl DeviceModelManager {
                     e.loaded = false;
                 }
             }
-            self.stop(&victim).await?;
+            self.backend.unload(&victim).await?;
             // Only discard the victim's bookkeeping if nothing referenced it
             // while the stop was in flight (a racer's enqueue()/acquire() land
             // directly on the entry, unguarded by load_lock). Never silently
@@ -310,7 +682,7 @@ impl DeviceModelManager {
             }
         }
 
-        self.start(real_id).await?;
+        self.backend.load(real_id).await?;
         self.mark_loaded(real_id);
         Ok(())
     }
@@ -352,80 +724,6 @@ impl DeviceModelManager {
         }
     }
 
-    // --- device I/O ------------------------------------------------------------
-
-    fn apply_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (k, v) in &self.headers {
-            rb = rb.header(k.as_str(), v.as_str());
-        }
-        rb
-    }
-
-    async fn running(&self) -> Result<HashSet<String>, PoolError> {
-        let rb = self.apply_headers(self.client.get(format!("{}/api/v1/models/running", self.url)));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
-        }
-        let v: Value = r
-            .json()
-            .await
-            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
-        let running = v
-            .get("running")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
-        Ok(running)
-    }
-
-    async fn start(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/start", self.url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("start {real_id}: unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!(
-                "start {real_id} failed: {status} {}",
-                truncate(&text, 200)
-            )));
-        }
-        let deadline = Instant::now() + Duration::from_secs_f64(self.load_timeout);
-        while Instant::now() < deadline {
-            if self.running().await?.contains(real_id) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs_f64(self.poll_interval)).await;
-        }
-        Err(PoolError::Device(format!("start {real_id}: not running after {}s", self.load_timeout)))
-    }
-
-    async fn stop(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/stop", self.url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("stop {real_id}: unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!(
-                "stop {real_id} failed: {status} {}",
-                truncate(&text, 200)
-            )));
-        }
-        Ok(())
-    }
 }
 
 // --- Gate / Slot ----------------------------------------------------------------
@@ -562,17 +860,73 @@ impl PoolRegistry {
         self.0.get(provider)
     }
 
+    /// No pools — an empty registry. Used by tests, and available as a manual
+    /// fallback; `from_registry` itself no longer needs one (see below).
+    pub fn empty() -> PoolRegistry {
+        PoolRegistry(HashMap::new())
+    }
+
     /// One manager+gate per inferencer that declares a `management_url` (mirrors the
     /// Python lifespan's `_pools` construction loop). Auth headers are best-effort —
     /// an inferencer with a required-but-unset API key env still gets a pool (with no
     /// auth headers against its management API), matching Python's `except
     /// InferencerError: _hdrs = {}`.
-    pub fn from_registry(registry: &engine::Registry) -> PoolRegistry {
+    ///
+    /// Each inferencer's `management_protocol` (default `"tiiny"` when unset) is
+    /// resolved to a `DeviceBackend`: the built-in `"tiiny"` REST preset, the built-in
+    /// `"ollama"` adapter (`OllamaBackend`, no configured `keep_alive`), a
+    /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or a
+    /// config-defined `kind = "ollama"` block (`OllamaBackend` with its configured
+    /// `keep_alive`). An unresolvable name (not `"tiiny"`, not `"ollama"`, and absent
+    /// from `protocols`) does NOT fail the whole registry — a typo in ONE
+    /// inferencer's `management_protocol` must not silently disable pooling for
+    /// every other device inferencer (that used to route them all to the plain,
+    /// no-auto-load relay via `build_state`'s `Err` => `PoolRegistry::empty()`
+    /// fallback). Instead: warn loudly (naming the inferencer and the unresolved
+    /// protocol) and skip just that inferencer, leaving it absent from the
+    /// resulting map (`get()` returns `None` for it) while every other inferencer
+    /// still gets its pool built normally.
+    ///
+    /// Also warns (once, up front) if a config `[management_protocols.<name>]`
+    /// block reuses a RESERVED built-in name (`"tiiny"`/`"ollama"`) — that block is
+    /// always shadowed by the built-in of the same name (see the `match` below),
+    /// so silently ignoring it would hide a config mistake.
+    pub fn from_registry(registry: &engine::Registry, protocols: &HashMap<String, engine::ProtocolSpec>) -> PoolRegistry {
+        for reserved in ["tiiny", "ollama"] {
+            if protocols.contains_key(reserved) {
+                eprintln!(
+                    "woollamad: management_protocols: WARNING: config block '[management_protocols.{reserved}]' \
+                     is shadowed by the built-in '{reserved}' protocol and will be ignored"
+                );
+            }
+        }
         let mut map = HashMap::new();
         for inf in registry.list() {
             let Some(management_url) = inf.management_url.clone() else { continue };
             let headers = inf.auth_headers().unwrap_or_default();
-            let manager = Arc::new(DeviceModelManager::new(management_url, headers));
+            let protocol_name = inf.management_protocol.as_deref().unwrap_or("tiiny");
+            let backend: Arc<dyn DeviceBackend> = match protocol_name {
+                "tiiny" => Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0)),
+                "ollama" => Arc::new(OllamaBackend::new(management_url, None)),
+                other => match protocols.get(other) {
+                    Some(engine::ProtocolSpec::Rest { running, start, stop }) => {
+                        Arc::new(RestBackend::from_spec(&management_url, &headers, running, start, stop, 0.5, 120.0))
+                    }
+                    Some(engine::ProtocolSpec::Ollama { keep_alive }) => {
+                        Arc::new(OllamaBackend::new(management_url, keep_alive.clone()))
+                    }
+                    None => {
+                        eprintln!(
+                            "woollamad: management_protocols: WARNING: inferencer '{}': unknown \
+                             management_protocol '{other}' — skipping this inferencer (its device pool is \
+                             disabled; other inferencers are unaffected)",
+                            inf.name
+                        );
+                        continue;
+                    }
+                },
+            };
+            let manager = Arc::new(DeviceModelManager::new(backend));
             let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
             map.insert(inf.name.clone(), (manager, gate));
         }
@@ -598,6 +952,7 @@ mod tests {
             discover: false,
             model_patterns: Vec::new(),
             management_url: Some("http://device.example:8800".to_string()),
+            management_protocol: None,
             parallel: 1,
             pool_max: None,
             queue_max: None,
@@ -606,7 +961,7 @@ mod tests {
         });
         reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
 
-        let pools = PoolRegistry::from_registry(&reg);
+        let pools = PoolRegistry::from_registry(&reg, &HashMap::new());
         assert!(pools.get("cloud").is_none(), "no management_url => no pool");
         assert!(pools.get("device").is_some(), "management_url present => pool built");
     }

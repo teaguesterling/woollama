@@ -113,7 +113,14 @@ pub async fn build_state() -> AppState {
         eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
     });
-    let pools = Arc::new(pool::PoolRegistry::from_registry(&inferencers));
+    let management_protocols = engine::load_management_protocols().unwrap_or_else(|e| {
+        eprintln!("woollamad: management_protocols load error: {e}");
+        HashMap::new()
+    });
+    // `from_registry` never fails the whole registry on a bad `management_protocol`
+    // name — it warns and skips just the offending inferencer (see its doc comment) —
+    // so there's no error path here to degrade-to-empty from.
+    let pools = Arc::new(pool::PoolRegistry::from_registry(&inferencers, &management_protocols));
     // Durable handle table at $WOOLLAMA_STATE_DIR/conversations.json (in-memory if unset).
     let state_path = std::env::var("WOOLLAMA_STATE_DIR")
         .ok()

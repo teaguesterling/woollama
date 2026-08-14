@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::Notify;
 
-use woollama_server::pool::{DeviceModelManager, PoolError};
+use woollama_server::pool::{DeviceModelManager, PoolError, RestBackend};
 
 #[derive(Default)]
 struct DeviceInner {
@@ -150,8 +150,23 @@ async fn handle_post(State(st): State<DeviceState>, AxPath(rest): AxPath<String>
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
 }
 
+/// Build a manager over a `RestBackend::tiiny` for the given mock URL/config —
+/// the same shape `DeviceModelManager::with_config` used to build directly.
+fn manager_with_config(
+    url: String,
+    headers: HashMap<String, String>,
+    poll_interval: f64,
+    load_timeout: f64,
+    retry_after: f64,
+) -> DeviceModelManager {
+    DeviceModelManager::with_retry_after(
+        Arc::new(RestBackend::tiiny(url, headers, poll_interval, load_timeout)),
+        retry_after,
+    )
+}
+
 fn mgr(device: &FakeDevice) -> DeviceModelManager {
-    DeviceModelManager::with_config(device.url.clone(), HashMap::new(), 0.01, 5.0, 5.0)
+    manager_with_config(device.url.clone(), HashMap::new(), 0.01, 5.0, 5.0)
 }
 
 #[tokio::test]
@@ -202,7 +217,7 @@ async fn start_failure_raises_device_error() {
 
 #[tokio::test]
 async fn unreachable_device_raises_device_error() {
-    let m = DeviceModelManager::with_config("http://127.0.0.1:1".to_string(), HashMap::new(), 0.01, 1.0, 5.0);
+    let m = manager_with_config("http://127.0.0.1:1".to_string(), HashMap::new(), 0.01, 1.0, 5.0);
     match m.ensure_loaded("Qwen/Coder", None).await {
         Err(PoolError::Device(_)) => {}
         other => panic!("expected PoolError::Device, got {other:?}"),
@@ -261,7 +276,7 @@ async fn running_query_bad_json_raises_device_error() {
 async fn start_poll_timeout_raises_device_error() {
     let device = FakeDevice::spawn(&[]).await;
     device.inner.lock().unwrap().start_no_register = true;
-    let m = DeviceModelManager::with_config(device.url.clone(), HashMap::new(), 0.01, 0.05, 5.0);
+    let m = manager_with_config(device.url.clone(), HashMap::new(), 0.01, 0.05, 5.0);
     match m.ensure_loaded("Qwen/Coder", None).await {
         Err(PoolError::Device(msg)) => assert!(msg.contains("not running"), "unexpected message: {msg}"),
         other => panic!("expected PoolError::Device, got {other:?}"),
