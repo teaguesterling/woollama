@@ -212,6 +212,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/images/generations", post(images_generations))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/responses", post(responses_create))
         .route("/v1/conversations", post(conversations_create).get(conversations_list))
         .route("/v1/conversations/{conv_id}", get(conversations_get).delete(conversations_delete))
@@ -872,6 +874,77 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
 
     fwd["stream"] = json!(false);
     match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
+        Ok(resp) => relay_json(resp).await,
+        Err(e) => e,
+    }
+}
+
+// --- POST /v1/images/generations ----------------------------------------------
+
+/// Text-to-image passthrough: `<provider>/<model>` -> that inferencer's OpenAI-compat
+/// `/v1/images/generations` (e.g. the device's Z-Image-Turbo). Always non-streaming. Image
+/// generation runs for tens of seconds, so it gets a generous timeout rather than the chat
+/// path's 180s.
+async fn images_generations(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let provider = model.split('/').next().unwrap_or("");
+    let Some(inf) = state.inferencers.resolve(provider) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown model namespace: '{model}'. Use '<provider>/<model>' for a known \
+                 inferencer ({}).",
+                state.inferencers.names().join(", ")
+            ),
+            "invalid_request_error",
+        );
+    };
+
+    let headers = match inf.auth_headers() {
+        Ok(h) => h,
+        Err(e) => return engine_err_response(e),
+    };
+
+    let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
+    let mut fwd = body.clone();
+    fwd["model"] = json!(bare);
+
+    match forward_post(inf.images_url(), &fwd, &headers, 300).await {
+        Ok(resp) => relay_json(resp).await,
+        Err(e) => e,
+    }
+}
+
+// --- POST /v1/embeddings -------------------------------------------------------
+
+/// Text-embedding passthrough: `<provider>/<model>` -> that inferencer's OpenAI-compat
+/// `/v1/embeddings` (e.g. the device's Qwen3-Embedding). For local vectorization/RAG through
+/// woollama. Embeddings are quick, so the chat path's 180s timeout is plenty.
+async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    let provider = model.split('/').next().unwrap_or("");
+    let Some(inf) = state.inferencers.resolve(provider) else {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown model namespace: '{model}'. Use '<provider>/<model>' for a known \
+                 inferencer ({}).",
+                state.inferencers.names().join(", ")
+            ),
+            "invalid_request_error",
+        );
+    };
+
+    let headers = match inf.auth_headers() {
+        Ok(h) => h,
+        Err(e) => return engine_err_response(e),
+    };
+
+    let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
+    let mut fwd = body.clone();
+    fwd["model"] = json!(bare);
+
+    match forward_post(inf.embeddings_url(), &fwd, &headers, 180).await {
         Ok(resp) => relay_json(resp).await,
         Err(e) => e,
     }
