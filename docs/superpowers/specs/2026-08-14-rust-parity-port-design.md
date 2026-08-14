@@ -1,6 +1,6 @@
 # Rust Router Parity Port (to Python v0.10.0) — Design
 
-**Date:** 2026-08-14 · **Branch:** `rust-port` · **Status:** design, pre-implementation
+**Date:** 2026-08-14 · **Branch:** `rust-port` · **Status:** implemented
 
 ## Goal
 

@@ -189,6 +189,34 @@ impl DeviceModelManager {
         }
     }
 
+    /// Atomic queued→in-flight handoff: decrement `queued` (saturating, matching
+    /// `dequeue`) and increment `in_flight` (matching `acquire`) under ONE `entries`
+    /// lock, instead of `dequeue(...)` then `acquire(...)` as two separate critical
+    /// sections.
+    ///
+    /// This closes a real race on the multi-threaded tokio runtime: with two
+    /// separate locks, a concurrent evictor (another `ensure_loaded` running
+    /// `pick_eviction`, which also reads `entries` under its own short lock) can
+    /// observe the gap between them — `queued == 0 && in_flight == 0 && loaded ==
+    /// true` — and pick this model as the idle LRU victim, stopping it on the
+    /// device while this request is mid-handoff. Python's equivalent is safe only
+    /// because asyncio coroutines never preempt each other outside an `await`; Rust
+    /// under a real executor has no such guarantee, so the two updates must land as
+    /// one indivisible step. Used by `Gate::enter`.
+    ///
+    /// Mirrors `acquire`: does NOT stamp `last_used` for an already-existing entry
+    /// (only a freshly-inserted entry gets `last_used = tick` via `Entry::new`).
+    /// Never holds the lock across an `.await` (there isn't one here).
+    pub fn dequeue_acquire(&self, real_id: &str) {
+        let tick = self.tick();
+        let mut entries = self.entries.lock().unwrap();
+        let e = entries.entry(real_id.to_string()).or_insert_with(|| Entry::new(tick));
+        if e.queued > 0 {
+            e.queued -= 1;
+        }
+        e.in_flight += 1;
+    }
+
     pub fn queued(&self, real_id: &str) -> u32 {
         let entries = self.entries.lock().unwrap();
         entries.get(real_id).map(|e| e.queued).unwrap_or(0)
@@ -502,13 +530,23 @@ impl Gate {
         }
         .await;
 
-        // No `.await` between `dequeue` and `acquire` below (both sync) — the
-        // non-idle invariant the eviction-race fix in `ensure_loaded` relies on.
-        self.manager.dequeue(real_id);
-        let permit = outcome?;
-
-        self.manager.acquire(real_id);
-        Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
+        // Python's `finally: dequeue()` runs unconditionally; but on the success
+        // path the queued→in-flight handoff must be ATOMIC (see
+        // `DeviceModelManager::dequeue_acquire`), not `dequeue` then `acquire` as
+        // two separate critical sections — a concurrent evictor's `pick_eviction`
+        // could otherwise observe this model as idle (queued == 0, in_flight == 0)
+        // in the gap between them and stop it mid-handoff. No `.await` on either
+        // branch (both sync).
+        match outcome {
+            Ok(permit) => {
+                self.manager.dequeue_acquire(real_id);
+                Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
+            }
+            Err(e) => {
+                self.manager.dequeue(real_id);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -539,5 +577,37 @@ impl PoolRegistry {
             map.insert(inf.name.clone(), (manager, gate));
         }
         PoolRegistry(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_registry` should build a pool ONLY for inferencers that declare a
+    /// `management_url`; a plain (non-device) inferencer is skipped entirely.
+    #[test]
+    fn from_registry_skips_inferencers_without_management_url() {
+        let mut reg = engine::Registry::new();
+        reg.insert(engine::Inferencer {
+            name: "device".to_string(),
+            base_url: "http://device.example/v1".to_string(),
+            api_key_env: None,
+            extra_body: serde_json::json!({}),
+            models: Vec::new(),
+            discover: false,
+            model_patterns: Vec::new(),
+            management_url: Some("http://device.example:8800".to_string()),
+            parallel: 1,
+            pool_max: None,
+            queue_max: None,
+            queue_timeout: 30.0,
+            virtual_models: Default::default(),
+        });
+        reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
+
+        let pools = PoolRegistry::from_registry(&reg);
+        assert!(pools.get("cloud").is_none(), "no management_url => no pool");
+        assert!(pools.get("device").is_some(), "management_url present => pool built");
     }
 }

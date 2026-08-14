@@ -38,7 +38,9 @@ pub fn resolve(
         if let Some(first) = loaded.first() {
             return Ok(first.clone());
         }
-        if let Some(default) = default {
+        // Python's `if default:` is falsy on `""` — an empty configured fallback is
+        // treated as absent, same as `None`, and falls through to `ResolveError`.
+        if let Some(default) = default.filter(|d| !d.is_empty()) {
             return Ok(default.to_string());
         }
         return Err(ResolveError(
@@ -73,7 +75,7 @@ pub fn pick_eviction(entries: &[PoolEntry]) -> Option<String> {
     entries
         .iter()
         .filter(|e| e.in_flight == 0 && e.queued == 0)
-        .min_by(|a, b| a.last_used.partial_cmp(&b.last_used).unwrap())
+        .min_by(|a, b| a.last_used.total_cmp(&b.last_used))
         .map(|e| e.model_id.clone())
 }
 
@@ -126,6 +128,14 @@ mod tests {
     #[test]
     fn resolve_default_no_loaded_no_config_raises() {
         let result = resolve("default", &BTreeMap::new(), &[], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_default_empty_string_default_is_treated_as_absent() {
+        // Python's `if default:` is falsy on `""` — an empty configured fallback
+        // must raise, exactly like `default=None`, not be returned as-is.
+        let result = resolve("default", &BTreeMap::new(), &[], Some(""));
         assert!(result.is_err());
     }
 

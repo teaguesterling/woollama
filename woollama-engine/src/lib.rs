@@ -616,6 +616,14 @@ impl Registry {
             },
         );
     }
+    /// Insert an already-built `Inferencer` directly, keyed by its own `name` —
+    /// unlike `add`, gives full control over every field (e.g. `management_url`,
+    /// pooling knobs). All `Inferencer` fields are `pub`, so callers (chiefly
+    /// tests that need a pooled inferencer without touching the process-global
+    /// `WOOLLAMA_CONFIG_DIR`/`from_config` path) can build one directly.
+    pub fn insert(&mut self, inf: Inferencer) {
+        self.infs.insert(inf.name.clone(), inf);
+    }
     /// The resolved inferencer as a JSON dict, or None.
     pub fn get_json(&self, provider: &str) -> Option<Value> {
         self.infs.get(provider).map(inferencer_to_json)

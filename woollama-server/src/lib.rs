@@ -1050,7 +1050,9 @@ async fn passthrough_pooled(
         Ok(s) => s,
         Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
         Err(pool::PoolError::Device(msg)) => {
-            return engine_err_response(EngineError::new(msg, "server_error", 502));
+            // Matches Python's `_error(f"device error: {e}", "server_error", 502)`
+            // in `router.py::_passthrough_pooled`.
+            return engine_err_response(EngineError::new(format!("device error: {msg}"), "server_error", 502));
         }
     };
 
