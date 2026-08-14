@@ -21,7 +21,7 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 
-use woollama_server::pool::{DeviceModelManager, Gate, PoolError};
+use woollama_server::pool::{DeviceModelManager, Gate, PoolError, RestBackend};
 
 #[derive(Default)]
 struct DeviceInner {
@@ -99,7 +99,10 @@ async fn handle_chat(State(st): State<DeviceState>, Json(body): Json<Value>) -> 
 }
 
 fn mgr(device: &FakeDevice) -> Arc<DeviceModelManager> {
-    Arc::new(DeviceModelManager::with_config(device.url.clone(), HashMap::new(), 0.01, 5.0, 5.0))
+    Arc::new(DeviceModelManager::with_retry_after(
+        Arc::new(RestBackend::tiiny(device.url.clone(), HashMap::new(), 0.01, 5.0)),
+        5.0,
+    ))
 }
 
 async fn spawn_router(router: Router) -> String {

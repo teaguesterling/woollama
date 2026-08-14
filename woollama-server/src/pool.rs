@@ -106,12 +106,124 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-pub struct DeviceModelManager {
-    url: String,
-    headers: HashMap<String, String>,
+/// A pluggable device-management transport: however a `DeviceModelManager` talks to
+/// its inferencer to discover/load/unload models. `RestBackend` is the built-in
+/// implementation for Tiiny's REST shape (`{url}/api/v1/models/...`); later tasks add
+/// config-defined REST protocols and an Ollama adapter behind this same seam.
+#[async_trait::async_trait]
+pub trait DeviceBackend: Send + Sync {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError>;
+    async fn load(&self, id: &str) -> Result<(), PoolError>;
+    async fn unload(&self, id: &str) -> Result<(), PoolError>;
+}
+
+/// The built-in `DeviceBackend` for Tiiny's device-management REST API
+/// (`GET {url}/api/v1/models/running`, `POST .../{id}/start`, `POST .../{id}/stop`).
+/// A direct, behavior-preserving extraction of what used to be
+/// `DeviceModelManager`'s private `running`/`start`/`stop`/`apply_headers` methods.
+pub struct RestBackend {
     client: reqwest::Client,
+    base_url: String,
+    headers: HashMap<String, String>,
     poll_interval: f64,
     load_timeout: f64,
+}
+
+impl RestBackend {
+    /// The Tiiny device-management REST shape.
+    pub fn tiiny(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs_f64(30.0))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        RestBackend {
+            client,
+            base_url: management_url.trim_end_matches('/').to_string(),
+            headers,
+            poll_interval,
+            load_timeout,
+        }
+    }
+
+    fn apply_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (k, v) in &self.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        rb
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceBackend for RestBackend {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
+        let rb = self.apply_headers(self.client.get(format!("{}/api/v1/models/running", self.base_url)));
+        let r = rb
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
+        }
+        let v: Value = r
+            .json()
+            .await
+            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
+        let running = v
+            .get("running")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        Ok(running)
+    }
+
+    async fn load(&self, real_id: &str) -> Result<(), PoolError> {
+        let path = format!("{}/api/v1/models/{real_id}/start", self.base_url);
+        let rb = self.apply_headers(self.client.post(path));
+        let r = rb
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("start {real_id}: unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "start {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs_f64(self.load_timeout);
+        while Instant::now() < deadline {
+            if self.list_loaded().await?.contains(real_id) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs_f64(self.poll_interval)).await;
+        }
+        Err(PoolError::Device(format!("start {real_id}: not running after {}s", self.load_timeout)))
+    }
+
+    async fn unload(&self, real_id: &str) -> Result<(), PoolError> {
+        let path = format!("{}/api/v1/models/{real_id}/stop", self.base_url);
+        let rb = self.apply_headers(self.client.post(path));
+        let r = rb
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("stop {real_id}: unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "stop {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub struct DeviceModelManager {
+    backend: Arc<dyn DeviceBackend>,
     retry_after: f64,
     entries: StdMutex<HashMap<String, Entry>>,
     load_lock: AsyncMutex<()>,
@@ -119,30 +231,15 @@ pub struct DeviceModelManager {
 }
 
 impl DeviceModelManager {
-    /// Production constructor: Python defaults (`poll_interval=0.5`,
-    /// `load_timeout=120.0`, `retry_after=5.0`).
-    pub fn new(management_url: String, headers: HashMap<String, String>) -> Self {
-        Self::with_config(management_url, headers, 0.5, 120.0, 5.0)
+    /// Production constructor: Python default (`retry_after=5.0`).
+    pub fn new(backend: Arc<dyn DeviceBackend>) -> Self {
+        Self::with_retry_after(backend, 5.0)
     }
 
     /// Test/tunable constructor.
-    pub fn with_config(
-        management_url: String,
-        headers: HashMap<String, String>,
-        poll_interval: f64,
-        load_timeout: f64,
-        retry_after: f64,
-    ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs_f64(30.0))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+    pub fn with_retry_after(backend: Arc<dyn DeviceBackend>, retry_after: f64) -> Self {
         DeviceModelManager {
-            url: management_url.trim_end_matches('/').to_string(),
-            headers,
-            client,
-            poll_interval,
-            load_timeout,
+            backend,
             retry_after,
             entries: StdMutex::new(HashMap::new()),
             load_lock: AsyncMutex::new(()),
@@ -254,7 +351,7 @@ impl DeviceModelManager {
             return Ok(());
         }
 
-        let running = self.running().await?;
+        let running = self.backend.list_loaded().await?;
         self.reconcile(&running);
         if running.contains(real_id) {
             self.mark_loaded(real_id);
@@ -294,7 +391,7 @@ impl DeviceModelManager {
                     e.loaded = false;
                 }
             }
-            self.stop(&victim).await?;
+            self.backend.unload(&victim).await?;
             // Only discard the victim's bookkeeping if nothing referenced it
             // while the stop was in flight (a racer's enqueue()/acquire() land
             // directly on the entry, unguarded by load_lock). Never silently
@@ -310,7 +407,7 @@ impl DeviceModelManager {
             }
         }
 
-        self.start(real_id).await?;
+        self.backend.load(real_id).await?;
         self.mark_loaded(real_id);
         Ok(())
     }
@@ -352,80 +449,6 @@ impl DeviceModelManager {
         }
     }
 
-    // --- device I/O ------------------------------------------------------------
-
-    fn apply_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (k, v) in &self.headers {
-            rb = rb.header(k.as_str(), v.as_str());
-        }
-        rb
-    }
-
-    async fn running(&self) -> Result<HashSet<String>, PoolError> {
-        let rb = self.apply_headers(self.client.get(format!("{}/api/v1/models/running", self.url)));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
-        }
-        let v: Value = r
-            .json()
-            .await
-            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
-        let running = v
-            .get("running")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
-            .unwrap_or_default();
-        Ok(running)
-    }
-
-    async fn start(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/start", self.url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("start {real_id}: unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!(
-                "start {real_id} failed: {status} {}",
-                truncate(&text, 200)
-            )));
-        }
-        let deadline = Instant::now() + Duration::from_secs_f64(self.load_timeout);
-        while Instant::now() < deadline {
-            if self.running().await?.contains(real_id) {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_secs_f64(self.poll_interval)).await;
-        }
-        Err(PoolError::Device(format!("start {real_id}: not running after {}s", self.load_timeout)))
-    }
-
-    async fn stop(&self, real_id: &str) -> Result<(), PoolError> {
-        let path = format!("{}/api/v1/models/{real_id}/stop", self.url);
-        let rb = self.apply_headers(self.client.post(path));
-        let r = rb
-            .send()
-            .await
-            .map_err(|e| PoolError::Device(format!("stop {real_id}: unreachable: {e}")))?;
-        let status = r.status();
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!(
-                "stop {real_id} failed: {status} {}",
-                truncate(&text, 200)
-            )));
-        }
-        Ok(())
-    }
 }
 
 // --- Gate / Slot ----------------------------------------------------------------
@@ -572,7 +595,7 @@ impl PoolRegistry {
         for inf in registry.list() {
             let Some(management_url) = inf.management_url.clone() else { continue };
             let headers = inf.auth_headers().unwrap_or_default();
-            let manager = Arc::new(DeviceModelManager::new(management_url, headers));
+            let manager = Arc::new(DeviceModelManager::new(Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0))));
             let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
             map.insert(inf.name.clone(), (manager, gate));
         }
