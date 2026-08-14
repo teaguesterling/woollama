@@ -837,13 +837,13 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
     }
 
     let provider = model.split('/').next().unwrap_or("");
-    let Some(inf) = engine::get_inferencer(provider) else {
+    let Some(inf) = state.inferencers.resolve(provider) else {
         return err_response(
             StatusCode::BAD_REQUEST,
             format!(
                 "unknown model namespace: '{model}'. Use 'woollama/<recipe>' or \
                  '<provider>/<model>' for a known inferencer ({}).",
-                engine::provider_names().join(", ")
+                state.inferencers.names().join(", ")
             ),
             "invalid_request_error",
         );

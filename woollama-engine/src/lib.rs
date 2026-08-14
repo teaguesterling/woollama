@@ -528,7 +528,7 @@ impl Registry {
             self.infs.iter().map(|(k, inf)| (k.clone(), inferencer_to_json(inf))).collect();
         Value::Object(map)
     }
-    fn resolve(&self, provider: &str) -> Option<Inferencer> {
+    pub fn resolve(&self, provider: &str) -> Option<Inferencer> {
         self.infs.get(provider).cloned()
     }
 }
