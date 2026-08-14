@@ -43,13 +43,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+use woollama_engine as engine;
 use woollama_engine::resolver::{self, PoolEntry};
 
 /// Errors from the device-management I/O path, shared with `Gate` (Task 6).
@@ -394,5 +397,147 @@ impl DeviceModelManager {
             )));
         }
         Ok(())
+    }
+}
+
+// --- Gate / Slot ----------------------------------------------------------------
+//
+// The request-queueing layer on top of `DeviceModelManager` — a direct port of
+// `woollama.pool.Gate`/`Slot` (Python oracle). `Gate::enter` is the full gating
+// protocol for one request: reject early if the per-model queue is already
+// saturated; otherwise register a queue slot (which also protects the model from
+// eviction — `ensure_loaded`'s eviction pass reads `queued`/`in_flight` via the
+// manager's sync counters), ensure the model is loaded, then acquire a concurrency
+// permit within `queue_timeout` and bump the in-flight ref-count. `queue_timeout`
+// bounds ONLY the permit acquisition, not the preceding `ensure_loaded` await —
+// time spent waiting on an in-progress load (serialized on the manager's
+// `load_lock`, which can poll up to `load_timeout`, default 120s) is governed
+// separately by `load_timeout` (mirrors the Python docstring on `Gate.enter`).
+
+/// One per-model concurrency permit, held for the lifetime of a pooled request.
+/// `Drop` releases both halves synchronously: the manager's in-flight counter
+/// (`DeviceModelManager::release`, sync — see the Task 5 lock-model note at the
+/// top of this module) and the semaphore permit (`OwnedSemaphorePermit`'s own
+/// `Drop`). Because `Drop` runs at most once per value, release is idempotent by
+/// construction — no Python-style `_released` guard flag is needed.
+pub struct Slot {
+    manager: Arc<DeviceModelManager>,
+    real_id: String,
+    // Always `Some` until `Drop` — held as an `Option` only so `Drop::drop` (which
+    // takes `&mut self`, not `self`) can take it out; never actually `None` while
+    // the `Slot` is alive.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.manager.release(&self.real_id);
+        // Dropping the permit (if still held) releases the semaphore synchronously.
+        drop(self.permit.take());
+    }
+}
+
+/// Serializes/queues requests for one management-capable inferencer's models around
+/// a shared `DeviceModelManager`. One `Gate` per inferencer (see `PoolRegistry`).
+pub struct Gate {
+    manager: Arc<DeviceModelManager>,
+    parallel: usize,
+    queue_max: Option<u32>,
+    queue_timeout: f64,
+    pool_max: Option<u32>,
+    retry_after: f64,
+    sems: StdMutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl Gate {
+    pub fn new(
+        manager: Arc<DeviceModelManager>,
+        parallel: u32,
+        queue_max: Option<u32>,
+        queue_timeout: f64,
+        pool_max: Option<u32>,
+        retry_after: f64,
+    ) -> Self {
+        Gate {
+            manager,
+            parallel: parallel.max(1) as usize,
+            queue_max,
+            queue_timeout,
+            pool_max,
+            retry_after,
+            sems: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    /// The per-`real_id` semaphore, created lazily with `parallel` permits (mirrors
+    /// Python's `_sems` dict-of-`asyncio.Semaphore`, lazily populated the same way).
+    fn sem(&self, real_id: &str) -> Arc<Semaphore> {
+        let mut sems = self.sems.lock().unwrap();
+        sems.entry(real_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.parallel)))
+            .clone()
+    }
+
+    pub async fn enter(&self, real_id: &str) -> Result<Slot, PoolError> {
+        if let Some(queue_max) = self.queue_max {
+            if self.manager.queued(real_id) >= queue_max {
+                return Err(PoolError::Backpressure(self.retry_after));
+            }
+        }
+        self.manager.enqueue(real_id);
+
+        // Python's `try/finally`: `dequeue` must run whether `ensure_loaded`/the
+        // semaphore acquire succeeds or fails. The `async` block plays the role of
+        // the `try` body; `dequeue` below plays `finally`.
+        let outcome: Result<OwnedSemaphorePermit, PoolError> = async {
+            self.manager.ensure_loaded(real_id, self.pool_max).await?;
+            let sem = self.sem(real_id);
+            match tokio::time::timeout(Duration::from_secs_f64(self.queue_timeout), sem.acquire_owned()).await {
+                Ok(Ok(permit)) => Ok(permit),
+                // The semaphore is never `close()`d, so this arm is unreachable in
+                // practice; map it to a Device error rather than panicking/unwrapping.
+                Ok(Err(_)) => Err(PoolError::Device("semaphore closed unexpectedly".to_string())),
+                Err(_) => Err(PoolError::Backpressure(self.retry_after)),
+            }
+        }
+        .await;
+
+        // No `.await` between `dequeue` and `acquire` below (both sync) — the
+        // non-idle invariant the eviction-race fix in `ensure_loaded` relies on.
+        self.manager.dequeue(real_id);
+        let permit = outcome?;
+
+        self.manager.acquire(real_id);
+        Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
+    }
+}
+
+// --- PoolRegistry -----------------------------------------------------------------
+
+/// One `(DeviceModelManager, Gate)` pair per management-capable inferencer, keyed by
+/// inferencer name. Built once at startup from the config `Registry` (see
+/// `from_registry`); consulted by the chat passthrough to take the pooled path.
+pub struct PoolRegistry(HashMap<String, (Arc<DeviceModelManager>, Gate)>);
+
+impl PoolRegistry {
+    pub fn get(&self, provider: &str) -> Option<&(Arc<DeviceModelManager>, Gate)> {
+        self.0.get(provider)
+    }
+
+    /// One manager+gate per inferencer that declares a `management_url` (mirrors the
+    /// Python lifespan's `_pools` construction loop). Auth headers are best-effort —
+    /// an inferencer with a required-but-unset API key env still gets a pool (with no
+    /// auth headers against its management API), matching Python's `except
+    /// InferencerError: _hdrs = {}`.
+    pub fn from_registry(registry: &engine::Registry) -> PoolRegistry {
+        let mut map = HashMap::new();
+        for inf in registry.list() {
+            let Some(management_url) = inf.management_url.clone() else { continue };
+            let headers = inf.auth_headers().unwrap_or_default();
+            let manager = Arc::new(DeviceModelManager::new(management_url, headers));
+            let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
+            map.insert(inf.name.clone(), (manager, gate));
+        }
+        PoolRegistry(map)
     }
 }

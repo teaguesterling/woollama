@@ -58,6 +58,10 @@ pub struct AppState {
     pub recipes: HashMap<String, config::Recipe>,
     pub registry: Arc<mcp_registry::McpRegistry>,
     pub inferencers: engine::Registry,
+    /// One `(DeviceModelManager, Gate)` pair per management-capable inferencer
+    /// (declares a `management_url`), built from `inferencers` at startup. Consulted
+    /// by the chat passthrough to take the pooled (load-on-demand + queued) path.
+    pub pools: Arc<pool::PoolRegistry>,
     /// The mcp.json specs (for claude-code delegation, which writes a per-recipe
     /// --mcp-config from the referenced subset).
     pub mcp_specs: HashMap<String, config::McpServerSpec>,
@@ -109,6 +113,7 @@ pub async fn build_state() -> AppState {
         eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
     });
+    let pools = Arc::new(pool::PoolRegistry::from_registry(&inferencers));
     // Durable handle table at $WOOLLAMA_STATE_DIR/conversations.json (in-memory if unset).
     let state_path = std::env::var("WOOLLAMA_STATE_DIR")
         .ok()
@@ -152,6 +157,7 @@ pub async fn build_state() -> AppState {
         recipes,
         registry,
         inferencers,
+        pools,
         mcp_specs: specs,
         conversations,
         store,
@@ -262,6 +268,20 @@ pub async fn serve_mcp_stdio(state: Arc<AppState>) -> Result<(), Box<dyn std::er
 
 fn err_response(status: StatusCode, message: impl Into<String>, kind: &str) -> Response {
     (status, Json(json!({"error": {"message": message.into(), "type": kind}}))).into_response()
+}
+
+/// 503 + `Retry-After: <secs>` for a `pool::PoolError::Backpressure` — the one error
+/// shape `err_response`/`engine_err_response` can't produce (they have no way to set
+/// a header). Mirrors Python's `resp.headers["Retry-After"] = str(int(e.retry_after))`.
+fn backpressure_response(retry_after_secs: f64) -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("retry-after", (retry_after_secs as u64).to_string())
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"error": {"message": "model busy; retry shortly", "type": "server_error"}}).to_string(),
+        ))
+        .unwrap_or_else(|_| err_response(StatusCode::SERVICE_UNAVAILABLE, "model busy; retry shortly", "server_error"))
 }
 
 fn engine_err_response(e: EngineError) -> Response {
@@ -852,12 +872,23 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
         );
     };
 
+    let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
+
+    // Management-capable inferencer (declares a `management_url`) with a built pool:
+    // resolve virtual models, load-on-demand, and queue/serialize through the Gate.
+    // Everything else (incl. a management_url inferencer somehow missing its pool)
+    // keeps today's exact stateless-relay path, unchanged.
+    if inf.management_url.is_some() {
+        if let Some((manager, gate)) = state.pools.get(provider) {
+            return passthrough_pooled(&inf, manager, gate, &body, &bare).await;
+        }
+    }
+
     let headers = match inf.auth_headers() {
         Ok(h) => h,
         Err(e) => return engine_err_response(e),
     };
 
-    let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
     let mut fwd = body.clone();
     fwd["model"] = json!(bare);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -988,6 +1019,71 @@ async fn passthrough_stream(
         .header("content-type", "text/event-stream")
         .body(Body::from_stream(resp.bytes_stream()))
         .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
+}
+
+/// Resolve → load-on-demand → gate → dispatch, for a management-capable inferencer.
+/// `Backpressure` => 503 + `Retry-After`; device errors => 502. A direct port of
+/// `router.py::_passthrough_pooled`.
+async fn passthrough_pooled(
+    inf: &engine::Inferencer,
+    manager: &Arc<pool::DeviceModelManager>,
+    gate: &pool::Gate,
+    body: &Value,
+    bare: &str,
+) -> Response {
+    let loaded = manager.snapshot();
+    let default = inf.virtual_models.get("default").map(String::as_str);
+    let real = match engine::resolver::resolve(bare, &inf.virtual_models, &loaded, default) {
+        Ok(r) => r,
+        Err(e) => return err_response(StatusCode::BAD_REQUEST, e.0, "invalid_request_error"),
+    };
+
+    let mut fwd = body.clone();
+    fwd["model"] = json!(real);
+
+    let headers = match inf.auth_headers() {
+        Ok(h) => h,
+        Err(e) => return engine_err_response(e),
+    };
+
+    let slot = match gate.enter(&real).await {
+        Ok(s) => s,
+        Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
+        Err(pool::PoolError::Device(msg)) => {
+            return engine_err_response(EngineError::new(msg, "server_error", 502));
+        }
+    };
+
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stream {
+        let resp = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        if resp.status().as_u16() >= 400 {
+            return relay_json(resp).await;
+        }
+        // Hold `slot` for the lifetime of the stream body: it moves into the
+        // generator and drops only once the upstream stream is exhausted (or the
+        // body is dropped early, e.g. a client disconnect) — releasing the
+        // in-flight counter and the concurrency permit at that point, never before.
+        let body_stream = stream! {
+            let _slot = slot;
+            let mut bs = resp.bytes_stream();
+            while let Some(chunk) = bs.next().await {
+                yield chunk;
+            }
+        };
+        return sse_response(Body::from_stream(body_stream));
+    }
+
+    fwd["stream"] = json!(false);
+    let result = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
+        Ok(resp) => relay_json(resp).await,
+        Err(e) => e,
+    };
+    // `slot` drops here (end of scope), after the dispatch has completed.
+    result
 }
 
 // --- POST /v1/responses (stateless, non-stream) -------------------------------
