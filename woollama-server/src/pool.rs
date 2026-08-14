@@ -372,6 +372,97 @@ impl DeviceBackend for RestBackend {
     }
 }
 
+/// The `DeviceBackend` for Ollama's native management API: `GET {base}/api/ps` lists
+/// loaded models, `POST {base}/api/generate` both loads (empty-prompt warm-up) and
+/// unloads (`keep_alive: 0`) a model — there is no separate start/stop endpoint pair
+/// the way `RestBackend` has. `keep_alive` (when set) is forwarded on `load` so a
+/// config author can control how long Ollama keeps a model resident after use; when
+/// unset, the field is omitted entirely so Ollama's own default applies.
+pub struct OllamaBackend {
+    client: reqwest::Client,
+    base_url: String,
+    keep_alive: Option<String>,
+}
+
+impl OllamaBackend {
+    /// Build an `OllamaBackend` against `base_url` (trailing `/` trimmed). `keep_alive`
+    /// is `None` for the built-in `"ollama"` name (Ollama's default applies) or
+    /// `Some(...)` when resolved from a config `ProtocolSpec::Ollama { keep_alive }`.
+    pub fn new(base_url: String, keep_alive: Option<String>) -> OllamaBackend {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs_f64(30.0))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        OllamaBackend { client, base_url: base_url.trim_end_matches('/').to_string(), keep_alive }
+    }
+
+    /// `POST {base}/api/generate` with `body`, mapped to the shared `PoolError::Device`
+    /// error shape (transport failure or non-2xx status), same message style as
+    /// `RestBackend`.
+    async fn generate(&self, real_id: &str, body: Value) -> Result<(), PoolError> {
+        let url = format!("{}/api/generate", self.base_url);
+        let r = self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("generate {real_id}: unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!(
+                "generate {real_id} failed: {status} {}",
+                truncate(&text, 200)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceBackend for OllamaBackend {
+    async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
+        let url = format!("{}/api/ps", self.base_url);
+        let r = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
+        let status = r.status();
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
+        }
+        let v: Value = r
+            .json()
+            .await
+            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
+        let running = v
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        Ok(running)
+    }
+
+    async fn load(&self, real_id: &str) -> Result<(), PoolError> {
+        let mut body = serde_json::json!({ "model": real_id });
+        if let Some(keep_alive) = &self.keep_alive {
+            body["keep_alive"] = Value::String(keep_alive.clone());
+        }
+        self.generate(real_id, body).await
+    }
+
+    async fn unload(&self, real_id: &str) -> Result<(), PoolError> {
+        let body = serde_json::json!({ "model": real_id, "keep_alive": 0 });
+        self.generate(real_id, body).await
+    }
+}
+
 pub struct DeviceModelManager {
     backend: Arc<dyn DeviceBackend>,
     retry_after: f64,
@@ -730,14 +821,6 @@ impl Gate {
 /// `from_registry`); consulted by the chat passthrough to take the pooled path.
 pub struct PoolRegistry(HashMap<String, (Arc<DeviceModelManager>, Gate)>);
 
-/// A `management_protocol` name that resolved to `ProtocolSpec::Ollama` (either the
-/// built-in `"ollama"` name, or a config name whose block has `kind = "ollama"`).
-/// Task 4 replaces this with a real `OllamaBackend`; until then it's a fail-fast
-/// startup error rather than a silent no-op pool.
-fn ollama_not_yet_implemented() -> engine::EngineError {
-    engine::EngineError::new("management_protocol 'ollama' is not yet implemented", "invalid_request_error", 500)
-}
-
 impl PoolRegistry {
     pub fn get(&self, provider: &str) -> Option<&(Arc<DeviceModelManager>, Gate)> {
         self.0.get(provider)
@@ -757,13 +840,13 @@ impl PoolRegistry {
     /// InferencerError: _hdrs = {}`.
     ///
     /// Each inferencer's `management_protocol` (default `"tiiny"` when unset) is
-    /// resolved to a `DeviceBackend`: the built-in `"tiiny"` REST preset, a
-    /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or —
-    /// for `"ollama"`/any config block with `kind = "ollama"` — a fail-fast error
-    /// (Task 4 lands the real adapter). An unresolvable name (not `"tiiny"`, not
-    /// `"ollama"`, and absent from `protocols`) is likewise an `Err` — a config
-    /// mistake should fail startup, not silently produce a pool that always errors on
-    /// first use.
+    /// resolved to a `DeviceBackend`: the built-in `"tiiny"` REST preset, the built-in
+    /// `"ollama"` adapter (`OllamaBackend`, no configured `keep_alive`), a
+    /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or a
+    /// config-defined `kind = "ollama"` block (`OllamaBackend` with its configured
+    /// `keep_alive`). An unresolvable name (not `"tiiny"`, not `"ollama"`, and absent
+    /// from `protocols`) is an `Err` — a config mistake should fail startup, not
+    /// silently produce a pool that always errors on first use.
     pub fn from_registry(
         registry: &engine::Registry,
         protocols: &HashMap<String, engine::ProtocolSpec>,
@@ -775,12 +858,14 @@ impl PoolRegistry {
             let protocol_name = inf.management_protocol.as_deref().unwrap_or("tiiny");
             let backend: Arc<dyn DeviceBackend> = match protocol_name {
                 "tiiny" => Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0)),
-                "ollama" => return Err(ollama_not_yet_implemented()),
+                "ollama" => Arc::new(OllamaBackend::new(management_url, None)),
                 other => match protocols.get(other) {
                     Some(engine::ProtocolSpec::Rest { running, start, stop }) => {
                         Arc::new(RestBackend::from_spec(&management_url, &headers, running, start, stop, 0.5, 120.0))
                     }
-                    Some(engine::ProtocolSpec::Ollama { .. }) => return Err(ollama_not_yet_implemented()),
+                    Some(engine::ProtocolSpec::Ollama { keep_alive }) => {
+                        Arc::new(OllamaBackend::new(management_url, keep_alive.clone()))
+                    }
                     None => {
                         return Err(engine::EngineError::new(
                             format!("inferencer '{}': unknown management_protocol '{other}'", inf.name),
