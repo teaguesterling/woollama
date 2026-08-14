@@ -20,6 +20,8 @@ use async_stream::stream;
 use futures::stream::Stream;
 use serde_json::{json, Value};
 
+pub mod resolver;
+
 // --- structured error ---------------------------------------------------------
 
 /// Structured inference/orchestration error — the pure-Rust core of what the wheel
