@@ -44,6 +44,7 @@ mod mcp_registry;
 mod mcp_surface;
 mod ollama_native;
 mod pattern_backend;
+pub mod pool;
 mod responses;
 
 use mcp_surface::WoollamaMcp;
