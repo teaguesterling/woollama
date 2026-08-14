@@ -12,7 +12,7 @@ never sees a bare not-loaded `503` or a hang. Fully additive: an inferencer with
 no `management_url` behaves exactly as before. Wired into `/v1/chat/completions`;
 the Rust `/v1/responses` core path is intentionally not pooled yet.
 
-- **`resolver`** (pure) — `tiiny/default` → the currently-loaded model, config
+- **`resolver`** (pure) — `device/default` → the currently-loaded model, config
   `virtual` aliases, and real-id passthrough; plus queue-aware LRU eviction
   selection (never a busy model).
 - **`pool.DeviceModelManager`** — async actor owning loaded-model state and device
@@ -39,7 +39,7 @@ OpenAI-compatible endpoints, mirroring the existing chat pass-through — so a s
 OpenAI client pointed at woollama can do chat, images, and vectors.
 
 - **`POST /v1/images/generations`** → forwards to the inferencer's
-  `/v1/images/generations` (e.g. the Tiiny device's `Z-Image-Turbo`), stripping the
+  `/v1/images/generations` (e.g. the device's `Z-Image-Turbo`), stripping the
   namespace prefix and adding auth. Always non-streaming, with a generous 300s read
   timeout for slow diffusion.
 - **`POST /v1/embeddings`** → forwards to the inferencer's `/v1/embeddings` (e.g.

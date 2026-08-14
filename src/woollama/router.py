@@ -276,7 +276,7 @@ async def chat_completions(request: Request) -> Response:
 @app.post("/v1/images/generations")
 async def images_generations(request: Request) -> Response:
     """Text-to-image pass-through: `<provider>/<model>` -> that inferencer's
-    OpenAI-compat /v1/images/generations (e.g. the Tiiny device's Z-Image-Turbo).
+    OpenAI-compat /v1/images/generations (e.g. the device's Z-Image-Turbo).
     Always non-streaming."""
     body = await request.json()
     model = body.get("model", "")
@@ -293,7 +293,7 @@ async def images_generations(request: Request) -> Response:
 @app.post("/v1/embeddings")
 async def embeddings(request: Request) -> Response:
     """Text-embedding pass-through: `<provider>/<model>` -> that inferencer's
-    OpenAI-compat /v1/embeddings (e.g. the Tiiny device's Qwen3-Embedding). For
+    OpenAI-compat /v1/embeddings (e.g. the device's Qwen3-Embedding). For
     local vectorization/RAG through woollama."""
     body = await request.json()
     model = body.get("model", "")
@@ -763,7 +763,7 @@ async def _passthrough_images(body: dict) -> Response:
 
     Pooling / virtual-model resolution is chat-completions-only by design (see
     the model-pooling spec's Non-goals) -- this path never consults `_pools` or
-    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
+    `resolver`, so `device/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known
@@ -788,7 +788,7 @@ async def _passthrough_embeddings(body: dict) -> Response:
 
     Pooling / virtual-model resolution is chat-completions-only by design (see
     the model-pooling spec's Non-goals) -- this path never consults `_pools` or
-    `resolver`, so `tiiny/default` and load-on-demand do not apply here."""
+    `resolver`, so `device/default` and load-on-demand do not apply here."""
     body = dict(body)
     provider, _, bare = body["model"].partition("/")
     inf = inferencers.get(provider)        # caller verified it's known

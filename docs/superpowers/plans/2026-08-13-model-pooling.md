@@ -53,7 +53,7 @@ Add to `tests/test_config.py`:
 def test_load_inferencers_parses_pooling_keys(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\n'
+        '[inferencers.device]\n'
         'base_url = "http://dev/v1"\n'
         'management_url = "http://dev:8800"\n'
         'parallel = 2\n'
@@ -62,7 +62,7 @@ def test_load_inferencers_parses_pooling_keys(monkeypatch, tmp_path):
         'queue_timeout = 45\n'
         'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
     )
-    spec = config.load_inferencers()["tiiny"]
+    spec = config.load_inferencers()["device"]
     assert spec["management_url"] == "http://dev:8800"
     assert spec["parallel"] == 2
     assert spec["pool_max"] == 3
@@ -137,7 +137,7 @@ Add to `tests/test_inferencers.py`:
 def test_registry_threads_pooling_fields(monkeypatch, tmp_path):
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\n'
+        '[inferencers.device]\n'
         'base_url = "http://dev/v1"\n'
         'management_url = "http://dev:8800"\n'
         'parallel = 2\n'
@@ -146,7 +146,7 @@ def test_registry_threads_pooling_fields(monkeypatch, tmp_path):
         'queue_timeout = 45\n'
         'virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }\n'
     )
-    inf = inferencers.get("tiiny")
+    inf = inferencers.get("device")
     assert inf.management_url == "http://dev:8800"
     assert inf.parallel == 2
     assert inf.pool_max == 3
@@ -1062,7 +1062,7 @@ async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypa
     from woollama import pool, inferencers
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\nbase_url="http://dev/v1"\n'
+        '[inferencers.device]\nbase_url="http://dev/v1"\n'
         'management_url="http://dev:8800"\nvirtual={ default = "Cfg/Fallback" }\n')
 
     captured = {}
@@ -1077,13 +1077,13 @@ async def test_pooled_passthrough_resolves_default_and_forwards_real_id(monkeypa
 
     mgr = _FakeManager(loaded=["Qwen/Coder"])
     gate = pool.Gate(mgr, parallel=1)
-    monkeypatch.setitem(router._pools, "tiiny", (mgr, gate))
+    monkeypatch.setitem(router._pools, "device", (mgr, gate))
     try:
         await router.chat_completions(FakeRequest({
-            "model": "tiiny/default",
+            "model": "device/default",
             "messages": [{"role": "user", "content": "hi"}]}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert captured["body"]["model"] == "Qwen/Coder"       # default -> loaded id
     assert mgr.ensured == ["Qwen/Coder"]
 
@@ -1092,17 +1092,17 @@ async def test_pooled_passthrough_backpressure_is_503_with_retry_after(monkeypat
     from woollama import pool
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     (tmp_path / "inferencers.toml").write_text(
-        '[inferencers.tiiny]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
+        '[inferencers.device]\nbase_url="http://dev/v1"\nmanagement_url="http://dev:8800"\n')
 
     class _BusyGate:
         async def enter(self, real_id):
             raise pool.Backpressure(7.0)
-    monkeypatch.setitem(router._pools, "tiiny", (_FakeManager(loaded=["X"]), _BusyGate()))
+    monkeypatch.setitem(router._pools, "device", (_FakeManager(loaded=["X"]), _BusyGate()))
     try:
         resp = await router.chat_completions(FakeRequest({
-            "model": "tiiny/X", "messages": []}))
+            "model": "device/X", "messages": []}))
     finally:
-        router._pools.pop("tiiny", None)
+        router._pools.pop("device", None)
     assert resp.status_code == 503
     assert resp.headers.get("Retry-After") == "7"
 
@@ -1312,15 +1312,15 @@ git commit   # subject: "feat(router): pool-gated passthrough for management-cap
 ## Deferred (explicitly NOT in this plan)
 
 Per the spec's phasing — do not implement here, but named so a reviewer knows they're intentional gaps:
-- `/v1/responses` (Rust core) pooling. The core path stays unchanged; `tiiny/default` and aliases resolve **only** on `/v1/chat/completions`. Wiring the same gate around the core call is a follow-on.
+- `/v1/responses` (Rust core) pooling. The core path stays unchanged; `device/default` and aliases resolve **only** on `/v1/chat/completions`. Wiring the same gate around the core call is a follow-on.
 - Mirroring the config keys onto the Rust `Inferencer`/`Registry`. Unnecessary now: the Rust engine ignores unknown TOML keys and no parity test pins the field set.
-- Explicit drain-before-evict scheduling, cross-client fairness/priority, `tiiny/auto` by request shape, multi-backend load balancing.
+- Explicit drain-before-evict scheduling, cross-client fairness/priority, `device/auto` by request shape, multi-backend load balancing.
 - Device-token refresh (headers are captured once at startup from `auth_data`); a long-lived server past `expire_time` would need a refresh hook.
 - The live, env-gated integration test against a real device (single-call, mindful of `--parallel 1`). The fake-device tests are the hermetic coverage; the one thing they cannot confirm is that the device accepts a raw-slash id in the `/start` path — verify that against a real device before relying on eviction/load in production.
 
-## Deployment note (Tiiny repo, outside this plan)
+## Deployment note (device repo, outside this plan)
 
-To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.tiiny]`, and `run-woollama.sh` must export the `:8800` base. That is Tiiny-side configuration, tracked separately from this woollama code change.
+To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.device]`, and `run-woollama.sh` must export the `:8800` base. That is device-side configuration, tracked separately from this woollama code change.
 
 ## Self-Review
 
@@ -1328,7 +1328,7 @@ To actually enable pooling for the device, `~/.config/woollama/inferencers.toml`
 - Three units — Resolver (Task 2), DeviceModelManager (Task 3), Gate (Task 4); hybrid placement (pure `resolver` vs stateful `pool`) ✓
 - `ensure_loaded` + dedup + ref-count + evict-LRU-idle (Task 3) ✓
 - Gate per-model semaphore, FIFO-within-model, `503`+`Retry-After` backpressure (Task 4/5) ✓
-- Virtual models: `tiiny/<id>`, `tiiny/default` loaded-vs-fallback, aliases (Task 2, wired Task 5) ✓
+- Virtual models: `device/<id>`, `device/default` loaded-vs-fallback, aliases (Task 2, wired Task 5) ✓
 - Queue-aware conservative eviction: never evict in-flight/queued; LRU idle; capacity-full→backpressure (Tasks 2–4) ✓
 - Additive config keys threaded through dataclass + merge + parser (Task 1) ✓
 - Data flow resolve→ensure_loaded→acquire→dispatch→release (Task 5 `_passthrough_pooled`) ✓
