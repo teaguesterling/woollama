@@ -90,11 +90,17 @@ same way `cosmic-fabric fabric-url` works today.
 ```
 GET  /v1/models                — OpenAI-compat list of all addressable models
 POST /v1/chat/completions      — OpenAI-compat chat (the inference primitive)
-POST /v1/embeddings            — OpenAI-compat embeddings (when needed)
+POST /v1/images/generations    — OpenAI-compat image generation (pass-through)
+POST /v1/embeddings            — OpenAI-compat embeddings (pass-through)
 
 POST /mcp                      — MCP over Streamable HTTP for network clients
 stdio (subprocess)             — MCP over stdio for local clients
 ```
+
+> Images/embeddings shipped as pass-through (v0.9.0): forwarded to a
+> `<provider>/<model>` inferencer's own OpenAI-compatible endpoints, same as
+> chat pass-through. See [Configuration](configuration.md) and
+> [Roadmap](roadmap.md).
 
 OpenAI surface: any tool that speaks OpenAI is a client without code changes.
 Cursor, Aider, Continue, the `openai` Python/JS SDKs, anything with
