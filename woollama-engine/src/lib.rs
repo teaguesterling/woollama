@@ -91,6 +91,20 @@ pub struct Inferencer {
     pub models: Vec<String>,
     pub discover: bool,
     pub model_patterns: Vec<String>,
+    /// Model-pooling knobs (device backends only; defaults are no-ops for cloud/ollama
+    /// providers). Mirrors the Python `Inferencer` dataclass's pooling fields.
+    /// The device's management API base (`:8800`); presence enables the pool.
+    pub management_url: Option<String>,
+    /// Per-model concurrency slot size.
+    pub parallel: u32,
+    /// Max concurrently-loaded models; `None` => no cap/eviction.
+    pub pool_max: Option<u32>,
+    pub queue_max: Option<u32>,
+    /// Seconds a request may wait before 503 + Retry-After.
+    pub queue_timeout: f64,
+    /// alias -> real model id; reserved key `default`. TOML key is `virtual`
+    /// (`virtual` is a Rust keyword, hence the field rename).
+    pub virtual_models: std::collections::BTreeMap<String, String>,
 }
 
 /// The built-in providers — same set/URLs/extra_body as `woollama.core.inferencers`.
@@ -104,6 +118,12 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
         models: Vec::new(),
         discover: false,
         model_patterns: Vec::new(),
+        management_url: None,
+        parallel: 1,
+        pool_max: None,
+        queue_max: None,
+        queue_timeout: 30.0,
+        virtual_models: std::collections::BTreeMap::new(),
     };
     match provider {
         "ollama" => {
@@ -119,6 +139,12 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
                 models: Vec::new(),
                 discover: true, // local catalog is small + needs no key → list it
                 model_patterns: Vec::new(),
+                management_url: None,
+                parallel: 1,
+                pool_max: None,
+                queue_max: None,
+                queue_timeout: 30.0,
+                virtual_models: std::collections::BTreeMap::new(),
             })
         }
         "anthropic" => Some(Inferencer {
@@ -129,6 +155,12 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
             models: Vec::new(),
             discover: false,
             model_patterns: Vec::new(),
+            management_url: None,
+            parallel: 1,
+            pool_max: None,
+            queue_max: None,
+            queue_timeout: 30.0,
+            virtual_models: std::collections::BTreeMap::new(),
         }),
         "openai" => Some(cloud("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")),
         "groq" => Some(cloud("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY")),
@@ -166,6 +198,14 @@ impl Inferencer {
     /// The OpenAI-compatible chat endpoint (`<base_url>/chat/completions`).
     pub fn chat_url(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+    /// The OpenAI-compatible image-generation endpoint (`<base_url>/images/generations`).
+    pub fn images_url(&self) -> String {
+        format!("{}/images/generations", self.base_url.trim_end_matches('/'))
+    }
+    /// The OpenAI-compatible embeddings endpoint (`<base_url>/embeddings`).
+    pub fn embeddings_url(&self) -> String {
+        format!("{}/embeddings", self.base_url.trim_end_matches('/'))
     }
     /// Auth headers from the configured `api_key_env` (empty if none); errors if a
     /// required key env is unset — mirrors Python `Inferencer.headers()`. Used by the
@@ -471,7 +511,61 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
         };
         let model_patterns =
             str_list(spec.get("model_patterns")).or_else(|| base.as_ref().map(|b| b.model_patterns.clone())).unwrap_or_default();
-        reg.insert(name.clone(), Inferencer { name, base_url, api_key_env, extra_body, models, discover, model_patterns });
+        // model-pooling knobs (device backends): base_url-style absence-inherit from the
+        // built-in being extended, falling back to the documented defaults.
+        let management_url = spec
+            .get("management_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| base.as_ref().and_then(|b| b.management_url.clone()));
+        let parallel = spec
+            .get("parallel")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .unwrap_or_else(|| base.as_ref().map_or(1, |b| b.parallel));
+        let pool_max = spec
+            .get("pool_max")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .or_else(|| base.as_ref().and_then(|b| b.pool_max));
+        let queue_max = spec
+            .get("queue_max")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .or_else(|| base.as_ref().and_then(|b| b.queue_max));
+        let queue_timeout = spec
+            .get("queue_timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| base.as_ref().map_or(30.0, |b| b.queue_timeout));
+        let virtual_models = spec
+            .get("virtual")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .or_else(|| base.as_ref().map(|b| b.virtual_models.clone()))
+            .unwrap_or_default();
+        reg.insert(
+            name.clone(),
+            Inferencer {
+                name,
+                base_url,
+                api_key_env,
+                extra_body,
+                models,
+                discover,
+                model_patterns,
+                management_url,
+                parallel,
+                pool_max,
+                queue_max,
+                queue_timeout,
+                virtual_models,
+            },
+        );
     }
     Ok(reg)
 }
@@ -503,7 +597,21 @@ impl Registry {
     pub fn add(&mut self, name: String, base_url: String, api_key_env: Option<String>, extra_body: Value) {
         self.infs.insert(
             name.clone(),
-            Inferencer { name, base_url, api_key_env, extra_body, models: Vec::new(), discover: false, model_patterns: Vec::new() },
+            Inferencer {
+                name,
+                base_url,
+                api_key_env,
+                extra_body,
+                models: Vec::new(),
+                discover: false,
+                model_patterns: Vec::new(),
+                management_url: None,
+                parallel: 1,
+                pool_max: None,
+                queue_max: None,
+                queue_timeout: 30.0,
+                virtual_models: std::collections::BTreeMap::new(),
+            },
         );
     }
     /// The resolved inferencer as a JSON dict, or None.
