@@ -58,13 +58,26 @@ class _Entry:
 
 class DeviceBackend(Protocol):
     """A pluggable device-management transport: however a `DeviceModelManager` talks
-    to its inferencer to discover/load/unload models. `RestBackend` is the built-in
-    implementation for Tiiny's REST shape; later work adds config-defined REST
-    protocols and other adapters behind this same seam."""
+    to its inferencer to discover/load/unload models. `RestBackend` and
+    `OllamaBackend` are the two built-in implementations, both owning an
+    `httpx.AsyncClient`.
+
+    `aclose` is part of the contract (not left implicit): `DeviceModelManager
+    .aclose()` calls `self._backend.aclose()` unconditionally, so every
+    backend -- present and future -- must be contractually closeable, not
+    just the two that happen to need it today. Rust has no equivalent method
+    (`reqwest::Client` needs no explicit close and both `RestBackend` and
+    `OllamaBackend` there tear down identically via `Drop`); declaring
+    `aclose` here for both Python backends uniformly is the closest match to
+    that symmetry, and is preferred over an `except AttributeError`/`getattr`
+    guard in `DeviceModelManager.aclose()` -- a guard would silently let a
+    future backend skip cleanup instead of a type-checker catching the
+    omission at the call site."""
 
     async def list_loaded(self) -> set[str]: ...
     async def load(self, real_id: str) -> None: ...
     async def unload(self, real_id: str) -> None: ...
+    async def aclose(self) -> None: ...
 
 
 _METHOD_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")

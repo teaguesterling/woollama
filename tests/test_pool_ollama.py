@@ -278,6 +278,30 @@ async def test_unreachable_ollama_device_raises_device_error():
         await backend.aclose()
 
 
+# --- DeviceModelManager.aclose() closes an OllamaBackend-owned client ------
+#
+# Task 1 review parked this (should-fix): `DeviceBackend` omitted `aclose`
+# from its Protocol, and `DeviceModelManager.aclose()` calls
+# `self._backend.aclose()` unconditionally -- a latent AttributeError for any
+# backend lacking it. `OllamaBackend` now declares `aclose` (like
+# `RestBackend`), and `DeviceBackend` declares it too, so this must succeed
+# cleanly -- and, since `OllamaBackend` owns its own `httpx.AsyncClient` by
+# default, a second `aclose()` must also be a harmless no-op (mirrors
+# `RestBackend`'s `_owns_client` idempotency).
+
+async def test_manager_aclose_closes_ollama_backed_manager_without_error():
+    mock = OllamaMock()
+    try:
+        backend = pool.OllamaBackend(mock.url)
+        mgr = pool.DeviceModelManager(backend)
+        await mgr.ensure_loaded("m1")
+        await mgr.aclose()
+        assert backend._client.is_closed
+        await mgr.aclose()   # idempotent -- must not raise
+    finally:
+        mock.close()
+
+
 # --- lifespan wiring: kind="ollama" resolves to a real pool ----------------
 
 async def test_lifespan_builds_pool_for_kind_ollama_inferencer(monkeypatch, tmp_path):
