@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## v0.11.0 — 2026-08-15
+
+**Pluggable device-management protocols reach the Python reference server, and the
+built-in preset is renamed `tiiny` → `device`.** The Python router (`python -m
+woollama`) now matches the Rust `woollamad` on how it talks to a device: each
+inferencer picks a `management_protocol`, protocols are defined in config, and the
+built-in `device` preset is the back-compat default. Crates and PyPI move together
+to 0.11.0 (`woollama-core` → 0.9.0).
+
+- **`management_protocol` selector + `[management_protocols.<name>]` config** — a
+  device backend is chosen per inferencer (default → built-in `device`). REST
+  protocols declare `base`, default headers, and per-op `endpoints.<op>` tables
+  (url / method / raw-string body / headers map + running path + id_field);
+  `kind = "ollama"` selects the Ollama backend.
+- **`DeviceBackend` seam** — `RestBackend` (config-parameterized, with the `device`
+  preset) and `OllamaBackend` (`/api/ps` list, `/api/generate` + `keep_alive`
+  load, `keep_alive: 0` unload) behind `DeviceModelManager`. `from_spec` does
+  `{base}`/`{id}` templating, `${VAR}` expansion, and a case-insensitive header
+  merge over the default `Authorization: Bearer`. An unknown protocol name skips
+  just that inferencer's pool with a warning; the rest build normally.
+- **BREAKING — `tiiny` → `device`.** The built-in preset name, the default
+  `management_protocol` value, the reserved-names list, and the `RestBackend.tiiny`
+  / `RestBackend::tiiny` method are renamed to `device` across both the Python
+  server and the Rust crates, with **no back-compat alias**. Configs that named
+  `management_protocol = "tiiny"` (or Rust callers of `RestBackend::tiiny`) must
+  switch to `"device"`. The unset default is unchanged in behavior.
+- **`_expand_env` parity fix** — matches the Rust `expand_env` exactly (unset
+  `${VAR}` → empty, braceless `$VAR` left as-is), replacing `os.path.expandvars`.
+
 ## v0.10.0 — 2026-08-13
 
 **Model pooling, request queuing & on-demand loading.** For an inferencer that
