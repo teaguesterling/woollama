@@ -142,7 +142,7 @@ async def lifespan(app: FastAPI):
             _hdrs = _inf.headers()
         except inferencers.InferencerError:
             _hdrs = {}
-        _mgr = pool.DeviceModelManager(_inf.management_url, headers=_hdrs)
+        _mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(_inf.management_url, headers=_hdrs))
         _gate = pool.Gate(_mgr, parallel=_inf.parallel, queue_max=_inf.queue_max,
                           queue_timeout=_inf.queue_timeout, pool_max=_inf.pool_max)
         _pools[_name] = (_mgr, _gate)

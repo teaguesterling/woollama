@@ -127,8 +127,20 @@ def device():
     d.close()
 
 
+async def test_backend_manager_loads_via_rest_backend_tiiny(device):
+    """Pins the new shape: DeviceModelManager driven by an injected DeviceBackend
+    (RestBackend.tiiny), rather than owning management_url/headers/client itself."""
+    backend = pool.RestBackend.tiiny(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(backend)
+    await mgr.ensure_loaded("Qwen/Coder")
+    assert ("start", "Qwen/Coder") in device.calls
+    assert "Qwen/Coder" in device.running
+    assert mgr.snapshot() == ["Qwen/Coder"]
+    await mgr.aclose()
+
+
 async def test_ensure_loaded_starts_when_absent(device):
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     await mgr.ensure_loaded("Qwen/Coder")
     assert ("start", "Qwen/Coder") in device.calls
     assert "Qwen/Coder" in device.running
@@ -138,7 +150,7 @@ async def test_ensure_loaded_starts_when_absent(device):
 
 async def test_ensure_loaded_noop_when_already_loaded(device):
     device.running.add("Qwen/Coder")
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     await mgr.ensure_loaded("Qwen/Coder")   # device already has it
     await mgr.ensure_loaded("Qwen/Coder")   # and again from our own state
     assert [c for c in device.calls if c[0] == "start"] == []
@@ -147,7 +159,7 @@ async def test_ensure_loaded_noop_when_already_loaded(device):
 
 async def test_concurrent_ensure_loaded_dedups_to_one_start(device):
     import asyncio
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     await asyncio.gather(*[mgr.ensure_loaded("Qwen/Coder") for _ in range(5)])
     assert [c for c in device.calls if c == ("start", "Qwen/Coder")] == [("start", "Qwen/Coder")]
     await mgr.aclose()
@@ -155,15 +167,15 @@ async def test_concurrent_ensure_loaded_dedups_to_one_start(device):
 
 async def test_start_failure_raises_device_error(device):
     device.fail_start = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     with pytest.raises(pool.DeviceError):
         await mgr.ensure_loaded("Qwen/Coder")
     await mgr.aclose()
 
 
 async def test_unreachable_device_raises_device_error():
-    mgr = pool.DeviceModelManager("http://127.0.0.1:1", poll_interval=0.01,
-                                  load_timeout=1.0)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(
+        "http://127.0.0.1:1", poll_interval=0.01, load_timeout=1.0))
     with pytest.raises(pool.DeviceError):
         await mgr.ensure_loaded("Qwen/Coder")
     await mgr.aclose()
@@ -171,8 +183,8 @@ async def test_unreachable_device_raises_device_error():
 
 async def test_evicts_lru_idle_at_capacity(device):
     device.running.update({"A", "B"})
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01,
-                                  clock=_fake_clock())
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(
+        device.url, poll_interval=0.01, clock=_fake_clock()))
     await mgr.ensure_loaded("A")            # last_used older
     await mgr.ensure_loaded("B")            # last_used newer
     await mgr.ensure_loaded("C", pool_max=2)   # full -> evict LRU idle (A)
@@ -184,7 +196,7 @@ async def test_evicts_lru_idle_at_capacity(device):
 
 async def test_no_evict_when_all_busy_raises_backpressure(device):
     device.running.update({"A", "B"})
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     await mgr.ensure_loaded("A")
     await mgr.ensure_loaded("B")
     mgr.acquire("A")
@@ -221,7 +233,7 @@ async def test_eviction_race_does_not_strand_or_lose_racer(device):
 
     device.running.update({"A", "B"})
     device.block_stop = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     try:
         await mgr.ensure_loaded("A")            # last_used older -> LRU victim
         await mgr.ensure_loaded("B")            # last_used newer
@@ -275,7 +287,7 @@ async def test_eviction_race_does_not_strand_or_lose_racer(device):
 async def test_gate_serializes_per_model(device):
     import asyncio
     device.running.add("A")
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     gate = pool.Gate(mgr, parallel=1)
     order = []
 
@@ -297,7 +309,7 @@ async def test_gate_serializes_per_model(device):
 async def test_gate_queue_max_saturated_is_backpressure(device):
     import asyncio
     device.running.add("A")
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     gate = pool.Gate(mgr, parallel=1, queue_max=1, queue_timeout=5.0)
 
     holder_ready = asyncio.Event()
@@ -326,7 +338,7 @@ async def test_gate_queue_max_saturated_is_backpressure(device):
 async def test_gate_queue_timeout_is_backpressure(device):
     import asyncio
     device.running.add("A")
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     gate = pool.Gate(mgr, parallel=1, queue_timeout=0.05)
 
     release_holder = asyncio.Event()
@@ -349,7 +361,7 @@ async def test_gate_queue_timeout_is_backpressure(device):
 async def test_gate_protects_serving_model_from_eviction(device):
     import asyncio
     device.running.update({"A", "B"})
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     await mgr.ensure_loaded("A")
     await mgr.ensure_loaded("B")
     gate = pool.Gate(mgr, parallel=1, pool_max=2)
@@ -385,7 +397,7 @@ async def test_running_query_non_2xx_raises_device_error(device):
     transport error) must surface as DeviceError, not propagate a raw HTTP
     status or silently treat it as "nothing running" (pool.py:172-173)."""
     device.fail_running = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     try:
         with pytest.raises(pool.DeviceError):
             await mgr.ensure_loaded("Qwen/Coder")
@@ -397,7 +409,7 @@ async def test_running_query_bad_json_raises_device_error(device):
     """GET /running returning HTTP 200 with a non-JSON body must surface as
     DeviceError, not an uncaught ValueError from `.json()` (pool.py:176-177)."""
     device.running_bad_json = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     try:
         with pytest.raises(pool.DeviceError):
             await mgr.ensure_loaded("Qwen/Coder")
@@ -411,7 +423,8 @@ async def test_start_poll_timeout_raises_device_error(device):
     DeviceError with a "not running" message (pool.py:191-192), not hang or
     return silently."""
     device.start_no_register = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01, load_timeout=0.05)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(
+        device.url, poll_interval=0.01, load_timeout=0.05))
     try:
         with pytest.raises(pool.DeviceError, match="not running"):
             await mgr.ensure_loaded("Qwen/Coder")
@@ -426,7 +439,8 @@ async def test_stop_failure_raises_device_error(device):
     bookkeeping must not claim otherwise."""
     device.running.update({"A", "B"})
     device.fail_stop = True
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01, clock=_fake_clock())
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(
+        device.url, poll_interval=0.01, clock=_fake_clock()))
     try:
         await mgr.ensure_loaded("A")            # last_used older -> LRU victim
         await mgr.ensure_loaded("B")            # last_used newer
@@ -446,7 +460,7 @@ async def test_slot_release_is_idempotent(device):
     import asyncio
 
     device.running.add("X")
-    mgr = pool.DeviceModelManager(device.url, poll_interval=0.01)
+    mgr = pool.DeviceModelManager(pool.RestBackend.tiiny(device.url, poll_interval=0.01))
     gate = pool.Gate(mgr, parallel=1)
     try:
         slot = await gate.enter("X")

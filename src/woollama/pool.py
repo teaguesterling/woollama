@@ -16,6 +16,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Protocol
 
 import httpx
 
@@ -51,12 +52,25 @@ class _Entry:
     last_used: float
 
 
-class DeviceModelManager:
+class DeviceBackend(Protocol):
+    """A pluggable device-management transport: however a `DeviceModelManager` talks
+    to its inferencer to discover/load/unload models. `RestBackend` is the built-in
+    implementation for Tiiny's REST shape; later work adds config-defined REST
+    protocols and other adapters behind this same seam."""
+
+    async def list_loaded(self) -> set[str]: ...
+    async def load(self, real_id: str) -> None: ...
+    async def unload(self, real_id: str) -> None: ...
+
+
+class RestBackend:
+    """The `DeviceBackend` for Tiiny's built-in device-management REST shape:
+    `GET {url}/api/v1/models/running`, `POST .../{id}/start`, `POST .../{id}/stop`."""
+
     def __init__(self, management_url: str, *,
                  headers: dict[str, str] | None = None,
                  client: httpx.AsyncClient | None = None,
                  poll_interval: float = 0.5, load_timeout: float = 120.0,
-                 retry_after: float = 5.0,
                  clock: Callable[[], float] = time.monotonic):
         self._url = management_url.rstrip("/")
         self._headers = dict(headers or {})
@@ -64,6 +78,68 @@ class DeviceModelManager:
         self._owns_client = client is None
         self._poll = poll_interval
         self._load_timeout = load_timeout
+        self._clock = clock
+
+    @classmethod
+    def tiiny(cls, management_url: str, *,
+              headers: dict[str, str] | None = None,
+              client: httpx.AsyncClient | None = None,
+              poll_interval: float = 0.5, load_timeout: float = 120.0,
+              clock: Callable[[], float] = time.monotonic) -> "RestBackend":
+        """The Tiiny device-management REST shape -- the preset every
+        `management_protocol` resolution falls back to when an inferencer names
+        none (or names `"tiiny"` explicitly)."""
+        return cls(management_url, headers=headers, client=client,
+                    poll_interval=poll_interval, load_timeout=load_timeout,
+                    clock=clock)
+
+    async def list_loaded(self) -> set[str]:
+        try:
+            r = await self._client.get(f"{self._url}/api/v1/models/running",
+                                       headers=self._headers)
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"device unreachable: {exc}") from exc
+        if not _ok(r.status_code):
+            raise DeviceError(f"running query failed: {r.status_code} {r.text[:200]}")
+        try:
+            return set(r.json().get("running") or [])
+        except (ValueError, AttributeError) as exc:
+            raise DeviceError(f"running query: bad JSON: {exc}") from exc
+
+    async def load(self, real_id: str) -> None:
+        try:
+            r = await self._client.post(
+                f"{self._url}/api/v1/models/{real_id}/start", headers=self._headers)
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"start {real_id}: unreachable: {exc}") from exc
+        if not _ok(r.status_code):
+            raise DeviceError(f"start {real_id} failed: {r.status_code} {r.text[:200]}")
+        deadline = self._clock() + self._load_timeout
+        while self._clock() < deadline:
+            if real_id in await self.list_loaded():
+                return
+            await asyncio.sleep(self._poll)
+        raise DeviceError(f"start {real_id}: not running after {self._load_timeout}s")
+
+    async def unload(self, real_id: str) -> None:
+        try:
+            r = await self._client.post(
+                f"{self._url}/api/v1/models/{real_id}/stop", headers=self._headers)
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"stop {real_id}: unreachable: {exc}") from exc
+        if not _ok(r.status_code):
+            raise DeviceError(f"stop {real_id} failed: {r.status_code} {r.text[:200]}")
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+
+class DeviceModelManager:
+    def __init__(self, backend: DeviceBackend, *,
+                 retry_after: float = 5.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self._backend = backend
         self._retry_after = retry_after
         self._clock = clock
         self._entries: dict[str, _Entry] = {}
@@ -116,7 +192,7 @@ class DeviceModelManager:
             if e and e.loaded:
                 e.last_used = self._clock()
                 return
-            running = await self._running()
+            running = await self._backend.list_loaded()
             self._reconcile(running)
             if real_id in running:
                 self._mark_loaded(real_id)
@@ -136,7 +212,7 @@ class DeviceModelManager:
                 # loaded" truth while we're mid-teardown -- it must now block
                 # on _load_lock (which we hold) and re-check after we're done.
                 self._entries[victim].loaded = False
-                await self._stop(victim)
+                await self._backend.unload(victim)
                 # Only discard the victim's bookkeeping if nothing referenced
                 # it while the stop was in flight (a racer's enqueue()/
                 # acquire() land directly on the entry, with no lock). Never
@@ -145,7 +221,7 @@ class DeviceModelManager:
                 ve = self._entries.get(victim)
                 if ve is not None and ve.in_flight == 0 and ve.queued == 0:
                     self._entries.pop(victim, None)
-            await self._start(real_id)
+            await self._backend.load(real_id)
             self._mark_loaded(real_id)
 
     def _mark_loaded(self, real_id: str) -> None:
@@ -163,46 +239,8 @@ class DeviceModelManager:
             if rid not in running:
                 e.loaded = False
 
-    async def _running(self) -> set[str]:
-        try:
-            r = await self._client.get(f"{self._url}/api/v1/models/running",
-                                       headers=self._headers)
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"device unreachable: {exc}") from exc
-        if not _ok(r.status_code):
-            raise DeviceError(f"running query failed: {r.status_code} {r.text[:200]}")
-        try:
-            return set(r.json().get("running") or [])
-        except (ValueError, AttributeError) as exc:
-            raise DeviceError(f"running query: bad JSON: {exc}") from exc
-
-    async def _start(self, real_id: str) -> None:
-        try:
-            r = await self._client.post(
-                f"{self._url}/api/v1/models/{real_id}/start", headers=self._headers)
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"start {real_id}: unreachable: {exc}") from exc
-        if not _ok(r.status_code):
-            raise DeviceError(f"start {real_id} failed: {r.status_code} {r.text[:200]}")
-        deadline = self._clock() + self._load_timeout
-        while self._clock() < deadline:
-            if real_id in await self._running():
-                return
-            await asyncio.sleep(self._poll)
-        raise DeviceError(f"start {real_id}: not running after {self._load_timeout}s")
-
-    async def _stop(self, real_id: str) -> None:
-        try:
-            r = await self._client.post(
-                f"{self._url}/api/v1/models/{real_id}/stop", headers=self._headers)
-        except httpx.HTTPError as exc:
-            raise DeviceError(f"stop {real_id}: unreachable: {exc}") from exc
-        if not _ok(r.status_code):
-            raise DeviceError(f"stop {real_id} failed: {r.status_code} {r.text[:200]}")
-
     async def aclose(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self._backend.aclose()
 
 
 class Slot:
