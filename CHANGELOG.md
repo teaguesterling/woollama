@@ -8,8 +8,9 @@
 built-in preset is renamed `tiiny` → `device`.** The Python router (`python -m
 woollama`) now matches the Rust `woollamad` on how it talks to a device: each
 inferencer picks a `management_protocol`, protocols are defined in config, and the
-built-in `device` preset is the back-compat default. Crates and PyPI move together
-to 0.11.0 (`woollama-core` → 0.9.0).
+built-in `device` preset is the back-compat default. The crates and the `woollama`
+PyPI package move to 0.11.0; `woollama-core` is unchanged at 0.8.0 (only its
+`woollama-engine` pin advances to 0.11.0 — the bridge is functionally the same).
 
 - **`management_protocol` selector + `[management_protocols.<name>]` config** — a
   device backend is chosen per inferencer (default → built-in `device`). REST
