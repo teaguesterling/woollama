@@ -5,8 +5,8 @@
 ## Goal
 
 Make woollamad's model-pooling backend **pluggable**: instead of the hardcoded
-Tiiny/Houmo `:8800` API, an inferencer's `management_url` is driven by a named
-**management protocol** — either a built-in adapter (`tiiny`, `ollama`) or one
+device `:8800` API, an inferencer's `management_url` is driven by a named
+**management protocol** — either a built-in adapter (`device`, `ollama`) or one
 **defined entirely in config** (a generic `rest` protocol: URLs, methods,
 bodies, headers, and the JSON path to the loaded-model list). Adding a new
 list/start/stop-style device becomes a config edit, no recompile.
@@ -16,8 +16,8 @@ list/start/stop-style device becomes a config edit, no recompile.
 The pooling stack (virtual models + gate + queue + eviction) is already
 backend-agnostic; the *only* device-specific code is three request builders +
 one JSON parse in `DeviceModelManager` (`woollama-server/src/pool.rs`). Today
-those hardcode the Tiiny protocol, so `management_url` silently *means* "speaks
-the Tiiny `:8800` API." There is no industry-standard model-management protocol
+those hardcode the device protocol, so `management_url` silently *means* "speaks
+the device `:8800` API." There is no industry-standard model-management protocol
 (Ollama auto-loads with `keep_alive`; LM Studio has load/unload over REST with a
 body; vLLM is one-model-per-instance), so pluggability must cover both a
 config-parameterized REST family and a couple of semantically-distinct built-ins.
@@ -25,12 +25,12 @@ config-parameterized REST family and a couple of semantically-distinct built-ins
 ## Scope
 
 - **woollamad (Rust) first.** The Python reference keeps its current behavior
-  (Tiiny, now the built-in default). The differential oracle stays valid because
-  both default to `tiiny`. Python parity is a follow-on.
+  (device, now the built-in default). The differential oracle stays valid because
+  both default to `device`. Python parity is a follow-on.
 - **v1 includes:** the `DeviceBackend` seam, the `rest` kind (config-defined
-  protocols), the `tiiny` built-in preset (a `rest` preset), the `ollama`
+  protocols), the `device` built-in preset (a `rest` preset), the `ollama`
   built-in adapter, and back-compat (`management_url` + no `management_protocol`
-  ⇒ `tiiny`).
+  ⇒ `device`).
 
 ## Architecture
 
@@ -86,12 +86,12 @@ Ollama base URL + a `keep_alive` TTL. Behavior:
 
 At startup, `PoolRegistry::from_registry` resolves each management-capable
 inferencer's `management_protocol` name:
-1. Built-in presets first: `tiiny` (a `RestBackend` preset with the Tiiny URLs
+1. Built-in presets first: `device` (a `RestBackend` preset with the built-in device URLs
    baked in) and `ollama` (an `OllamaBackend`).
 2. Then config-defined `[management_protocols.<name>]` blocks.
 3. Unknown name → a clear startup config error.
 4. **Back-compat:** `management_url` present with no `management_protocol` ⇒
-   `tiiny`. Existing configs are unchanged.
+   `device`. Existing configs are unchanged.
 
 `{base}` in every URL/body/header value is the inferencer's `management_url`;
 `{id}` is the model id. `${VAR}` env-expansion applies to config-defined protocol
@@ -99,12 +99,12 @@ values (same as the rest of `inferencers.toml`).
 
 ## Config surface (`inferencers.toml`)
 
-Per-inferencer selector (additive; default `tiiny`):
+Per-inferencer selector (additive; default `device`):
 
 ```toml
-[inferencers.tiiny]
-management_url      = "${TIINY_URL}:8800"
-management_protocol = "tiiny"     # optional; omitted + management_url present ⇒ "tiiny"
+[inferencers.device]
+management_url      = "${DEVICE_URL}:8800"
+management_protocol = "device"     # optional; omitted + management_url present ⇒ "device"
 ```
 
 Config-defined protocols — a new top-level `[management_protocols.<name>]`
@@ -184,7 +184,7 @@ pooled path is identical to today; `ensure_loaded`/evict just call the trait.
 
 ## Where it lives
 
-- `DeviceBackend` trait + `RestBackend` + `OllamaBackend` + the `tiiny` preset:
+- `DeviceBackend` trait + `RestBackend` + `OllamaBackend` + the `device` preset:
   `woollama-server/src/pool.rs` (or a new `woollama-server/src/backend.rs`
   it re-exports — decide during planning to keep files focused).
 - `[management_protocols.<name>]` parsing: the config layer that already reads
@@ -213,8 +213,8 @@ Rust integration tests against mock `axum` upstreams (mirroring the existing
   end-to-end (list/load/poll-until-ready/unload).
 - **`ollama` adapter:** a mock serving `GET /api/ps` and `POST /api/generate`,
   asserting `load` warms up (keep_alive) and `unload` sends keep_alive=0.
-- **Back-compat:** the existing Tiiny-shaped pool tests pass unchanged via the
-  default `tiiny` preset (no config change).
+- **Back-compat:** the existing device-shaped pool tests pass unchanged via the
+  default `device` preset (no config change).
 - **Config errors:** unknown protocol name and a malformed protocol block each
   produce a clear startup error.
 
@@ -223,7 +223,7 @@ Gate per the repo convention: `cargo test -p woollama-engine -p woollama-server
 
 ## Scope / non-goals
 
-- **In:** the seam; `rest` (config-defined, method/body/headers/path); `tiiny`
+- **In:** the seam; `rest` (config-defined, method/body/headers/path); `device`
   preset; `ollama` adapter; back-compat default.
 - **Out (v1):** Python parity (follow-on); **multi-step per-op sequences**
   (`endpoints.start` stays a single table — an array-of-tables is a
@@ -236,7 +236,7 @@ Gate per the repo convention: `cargo test -p woollama-engine -p woollama-server
 ## Key attachment points
 
 - Backend seam target: `woollama-server/src/pool.rs` — `DeviceModelManager`
-  (the `list_loaded`/`start`/`stop` HTTP methods become the `tiiny` `RestBackend`),
+  (the `list_loaded`/`start`/`stop` HTTP methods become the `device` `RestBackend`),
   `PoolError`/`DeviceError`, `PoolRegistry::from_registry` (protocol resolution +
   backend construction).
 - Config seam: the engine's `inferencers.toml` loader (`load_inferencers_toml` /
