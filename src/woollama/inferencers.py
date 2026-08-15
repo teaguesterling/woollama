@@ -53,6 +53,11 @@ class Inferencer:
     # today's stateless passthrough. Consumed by the Python server layer
     # (pool.py / resolver.py), NOT by the Rust core's build_request. ---
     management_url: str | None = None   # device mgmt base (:8800); presence enables the pool
+    # Selects a named `[management_protocols.<name>]` block (config.load_management_protocols)
+    # describing HOW to talk to the device at management_url. None = the built-in device
+    # backend (back-compat); Task 3 resolves None -> device. Mirrors the Rust
+    # `Inferencer::management_protocol` field (woollama-engine/src/lib.rs).
+    management_protocol: str | None = None
     parallel: int = 1                   # per-model concurrency slot size (device default 1)
     pool_max: int | None = None         # max concurrently-loaded models; None => no cap/eviction
     # Max queued requests per model before backpressure, checked BEFORE enqueue:
@@ -144,6 +149,8 @@ def _registry() -> dict[str, Inferencer]:
                 spec.get("model_patterns") or (base.model_patterns if base else ())),
             management_url=spec.get("management_url",
                                     base.management_url if base else None),
+            management_protocol=spec.get("management_protocol",
+                                         base.management_protocol if base else None),
             parallel=spec.get("parallel", base.parallel if base else 1),
             pool_max=spec.get("pool_max", base.pool_max if base else None),
             queue_max=spec.get("queue_max", base.queue_max if base else None),

@@ -135,6 +135,14 @@ async def lifespan(app: FastAPI):
     register_reexported_tools(_mcp, registry)
     # Device-aware pools: one manager+gate per inferencer that declares a
     # management_url. Reuses the inferencer's api key for the :8800 mgmt API.
+    # Each inferencer's management_protocol (default "device") is resolved to a
+    # DeviceBackend by pool.build_backend -- the built-in device REST preset, a
+    # config-defined [management_protocols.<name>] REST shape, or (until Task 4)
+    # a logged skip for "ollama". An unresolvable name skips ONLY that one
+    # inferencer's pool (pool.build_backend already logged why) -- it must
+    # never disable pooling for every other device inferencer.
+    _protocols = config.load_management_protocols()
+    pool.check_reserved_protocol_names(_protocols)
     for _name, _inf in inferencers.all().items():
         if not _inf.management_url:
             continue
@@ -142,12 +150,16 @@ async def lifespan(app: FastAPI):
             _hdrs = _inf.headers()
         except inferencers.InferencerError:
             _hdrs = {}
-        _mgr = pool.DeviceModelManager(_inf.management_url, headers=_hdrs)
+        _backend = pool.build_backend(_inf, _protocols, headers=_hdrs)
+        if _backend is None:
+            continue
+        _mgr = pool.DeviceModelManager(_backend)
         _gate = pool.Gate(_mgr, parallel=_inf.parallel, queue_max=_inf.queue_max,
                           queue_timeout=_inf.queue_timeout, pool_max=_inf.pool_max)
         _pools[_name] = (_mgr, _gate)
-        log.info("pool ready: inferencer '%s' -> %s (parallel=%d, pool_max=%s, "
-                 "queue_max=%s)", _name, _inf.management_url, _inf.parallel,
+        log.info("pool ready: inferencer '%s' -> %s (protocol=%s, parallel=%d, "
+                 "pool_max=%s, queue_max=%s)", _name, _inf.management_url,
+                 _inf.management_protocol or "device", _inf.parallel,
                  _inf.pool_max, _inf.queue_max)
     # Optional: wire an external conversation store as the state owner for
     # NON-claude models (issue #2), from the `conversationStore` key in mcp.json

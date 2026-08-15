@@ -150,7 +150,7 @@ async fn handle_post(State(st): State<DeviceState>, AxPath(rest): AxPath<String>
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
 }
 
-/// Build a manager over a `RestBackend::tiiny` for the given mock URL/config —
+/// Build a manager over a `RestBackend::device` for the given mock URL/config —
 /// the same shape `DeviceModelManager::with_config` used to build directly.
 fn manager_with_config(
     url: String,
@@ -160,7 +160,7 @@ fn manager_with_config(
     retry_after: f64,
 ) -> DeviceModelManager {
     DeviceModelManager::with_retry_after(
-        Arc::new(RestBackend::tiiny(url, headers, poll_interval, load_timeout)),
+        Arc::new(RestBackend::device(url, headers, poll_interval, load_timeout)),
         retry_after,
     )
 }

@@ -108,8 +108,8 @@ fn truncate(s: &str, n: usize) -> String {
 
 /// A pluggable device-management transport: however a `DeviceModelManager` talks to
 /// its inferencer to discover/load/unload models. `RestBackend` is the built-in
-/// implementation for Tiiny's REST shape (`{url}/api/v1/models/...`); later tasks add
-/// config-defined REST protocols and an Ollama adapter behind this same seam.
+/// implementation for the built-in device-management REST shape (`{url}/api/v1/models/...`);
+/// later tasks add config-defined REST protocols and an Ollama adapter behind this same seam.
 #[async_trait::async_trait]
 pub trait DeviceBackend: Send + Sync {
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError>;
@@ -206,10 +206,10 @@ fn get_dotted<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
-/// The `DeviceBackend` for config-defined (and Tiiny's built-in) REST device-management
-/// shapes: three HTTP calls (list-loaded/start/stop), each independently templated
-/// (`RestBackend::from_spec`). `RestBackend::tiiny` is the Tiiny preset, expressed as a
-/// `from_spec` call with Tiiny's built-in endpoints.
+/// The `DeviceBackend` for config-defined (and the built-in device-management REST
+/// shape's) REST shapes: three HTTP calls (list-loaded/start/stop), each independently
+/// templated (`RestBackend::from_spec`). `RestBackend::device` is the built-in `device`
+/// preset, expressed as a `from_spec` call with its built-in endpoints.
 pub struct RestBackend {
     client: reqwest::Client,
     running: CompiledEndpoint,
@@ -257,12 +257,12 @@ impl RestBackend {
         }
     }
 
-    /// The Tiiny device-management REST shape (`GET {base}/api/v1/models/running`,
+    /// The built-in device-management REST shape (`GET {base}/api/v1/models/running`,
     /// `POST .../{id}/start`, `POST .../{id}/stop`), expressed as a `from_spec` call
-    /// with Tiiny's built-in endpoints — the preset every `management_protocol`
-    /// resolution falls back to when an inferencer names none (or names `"tiiny"`
+    /// with its built-in endpoints — the preset every `management_protocol`
+    /// resolution falls back to when an inferencer names none (or names `"device"`
     /// explicitly).
-    pub fn tiiny(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
+    pub fn device(management_url: String, headers: HashMap<String, String>, poll_interval: f64, load_timeout: f64) -> RestBackend {
         let no_headers = std::collections::BTreeMap::new();
         let running = engine::EndpointSpec {
             url: "{base}/api/v1/models/running".to_string(),
@@ -323,7 +323,7 @@ impl DeviceBackend for RestBackend {
             .await
             .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
         // `get_dotted` returning `None` (key/path absent) is normal and means "no
-        // running models" — this is the tiiny back-compat case: a device response
+        // running models" — this is the device back-compat case: a device response
         // with no "running" key at all (e.g. `{}`) must still resolve to an empty
         // set, not an error. But a path that IS present and resolves to something
         // other than an array is a config-typo signal (the author pointed `path`
@@ -872,12 +872,12 @@ impl PoolRegistry {
     /// auth headers against its management API), matching Python's `except
     /// InferencerError: _hdrs = {}`.
     ///
-    /// Each inferencer's `management_protocol` (default `"tiiny"` when unset) is
-    /// resolved to a `DeviceBackend`: the built-in `"tiiny"` REST preset, the built-in
+    /// Each inferencer's `management_protocol` (default `"device"` when unset) is
+    /// resolved to a `DeviceBackend`: the built-in `"device"` REST preset, the built-in
     /// `"ollama"` adapter (`OllamaBackend`, no configured `keep_alive`), a
     /// config-defined `[management_protocols.<name>]` REST shape (`from_spec`), or a
     /// config-defined `kind = "ollama"` block (`OllamaBackend` with its configured
-    /// `keep_alive`). An unresolvable name (not `"tiiny"`, not `"ollama"`, and absent
+    /// `keep_alive`). An unresolvable name (not `"device"`, not `"ollama"`, and absent
     /// from `protocols`) does NOT fail the whole registry — a typo in ONE
     /// inferencer's `management_protocol` must not silently disable pooling for
     /// every other device inferencer (that used to route them all to the plain,
@@ -888,11 +888,11 @@ impl PoolRegistry {
     /// still gets its pool built normally.
     ///
     /// Also warns (once, up front) if a config `[management_protocols.<name>]`
-    /// block reuses a RESERVED built-in name (`"tiiny"`/`"ollama"`) — that block is
+    /// block reuses a RESERVED built-in name (`"device"`/`"ollama"`) — that block is
     /// always shadowed by the built-in of the same name (see the `match` below),
     /// so silently ignoring it would hide a config mistake.
     pub fn from_registry(registry: &engine::Registry, protocols: &HashMap<String, engine::ProtocolSpec>) -> PoolRegistry {
-        for reserved in ["tiiny", "ollama"] {
+        for reserved in ["device", "ollama"] {
             if protocols.contains_key(reserved) {
                 eprintln!(
                     "woollamad: management_protocols: WARNING: config block '[management_protocols.{reserved}]' \
@@ -904,9 +904,9 @@ impl PoolRegistry {
         for inf in registry.list() {
             let Some(management_url) = inf.management_url.clone() else { continue };
             let headers = inf.auth_headers().unwrap_or_default();
-            let protocol_name = inf.management_protocol.as_deref().unwrap_or("tiiny");
+            let protocol_name = inf.management_protocol.as_deref().unwrap_or("device");
             let backend: Arc<dyn DeviceBackend> = match protocol_name {
-                "tiiny" => Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0)),
+                "device" => Arc::new(RestBackend::device(management_url, headers, 0.5, 120.0)),
                 "ollama" => Arc::new(OllamaBackend::new(management_url, None)),
                 other => match protocols.get(other) {
                     Some(engine::ProtocolSpec::Rest { running, start, stop }) => {

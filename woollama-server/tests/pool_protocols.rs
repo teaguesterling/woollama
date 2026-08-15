@@ -4,7 +4,7 @@
 //! Test A drives a fully config-defined ("custom") REST protocol end to end through
 //! `ensure_loaded`, asserting the mock observed the configured start call (method,
 //! path, body, header) and that the manager's view of loaded models matches the mock.
-//! Test B is the back-compat path (no `management_protocol` => tiiny preset). Test C
+//! Test B is the back-compat path (no `management_protocol` => device preset). Test C
 //! asserts an unresolvable `management_protocol` name is isolated to the offending
 //! inferencer — `from_registry` skips (and warns about) just that one inferencer,
 //! while a sibling inferencer with a valid protocol is still pooled normally (review
@@ -99,10 +99,10 @@ async fn from_registry_resolves_custom_protocol_and_drives_ensure_loaded() {
     assert_eq!(manager.snapshot(), vec!["m1".to_string()]);
 }
 
-// --- Test B: back-compat (no management_protocol => tiiny preset) -----------------
+// --- Test B: back-compat (no management_protocol => device preset) ----------------
 
 #[tokio::test]
-async fn from_registry_back_compat_defaults_to_tiiny() {
+async fn from_registry_back_compat_defaults_to_device() {
     let device = spawn_rest(RestMockConfig {
         running_route: "/api/v1/models/running".to_string(),
         start_route: "/api/v1/models/{id}/start".to_string(),
@@ -129,7 +129,7 @@ async fn from_registry_back_compat_defaults_to_tiiny() {
 /// every other device inferencer. `from_registry` skips (with a warning) only the
 /// offending inferencer — its provider is absent (`get()` => `None`) from the
 /// resulting `PoolRegistry` — while a sibling inferencer with a resolvable protocol
-/// (here, the default `"tiiny"`) is still pooled normally.
+/// (here, the default `"device"`) is still pooled normally.
 #[test]
 fn from_registry_isolates_unknown_protocol_name_to_its_own_inferencer() {
     let mut reg = engine::Registry::new();

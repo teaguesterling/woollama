@@ -100,7 +100,7 @@ async fn handle_chat(State(st): State<DeviceState>, Json(body): Json<Value>) -> 
 
 fn mgr(device: &FakeDevice) -> Arc<DeviceModelManager> {
     Arc::new(DeviceModelManager::with_retry_after(
-        Arc::new(RestBackend::tiiny(device.url.clone(), HashMap::new(), 0.01, 5.0)),
+        Arc::new(RestBackend::device(device.url.clone(), HashMap::new(), 0.01, 5.0)),
         5.0,
     ))
 }

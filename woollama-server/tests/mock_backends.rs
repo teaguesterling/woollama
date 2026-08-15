@@ -7,9 +7,9 @@ mod common;
 
 use common::{spawn_ollama, spawn_rest, IdLoc, RestMockConfig, RunningShape};
 
-// --- rest, path-style ids (tiiny-like) --------------------------------------------
+// --- rest, path-style ids (device-like) --------------------------------------------
 
-fn tiiny_like_cfg() -> RestMockConfig {
+fn device_like_cfg() -> RestMockConfig {
     RestMockConfig {
         running_route: "/api/v1/models/running".to_string(),
         start_route: "/api/v1/models/{id}/start".to_string(),
@@ -21,7 +21,7 @@ fn tiiny_like_cfg() -> RestMockConfig {
 
 #[tokio::test]
 async fn rest_path_style_set_loaded_reflects_in_running() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     device.set_loaded(&["A", "B"]);
 
     let client = reqwest::Client::new();
@@ -35,7 +35,7 @@ async fn rest_path_style_set_loaded_reflects_in_running() {
 
 #[tokio::test]
 async fn rest_path_style_top_level_array_shape() {
-    let mut cfg = tiiny_like_cfg();
+    let mut cfg = device_like_cfg();
     cfg.running_shape = RunningShape::Strings { field: String::new() };
     let device = spawn_rest(cfg);
     device.set_loaded(&["A"]);
@@ -48,7 +48,7 @@ async fn rest_path_style_top_level_array_shape() {
 
 #[tokio::test]
 async fn rest_path_style_start_and_stop_are_recorded_and_mutate_state() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     let client = reqwest::Client::new();
 
     let resp = client.post(format!("{}/api/v1/models/foo/start", device.base_url)).send().await.unwrap();
@@ -68,7 +68,7 @@ async fn rest_path_style_start_and_stop_are_recorded_and_mutate_state() {
 
 #[tokio::test]
 async fn rest_path_style_fail_start_returns_500() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     device.set_fail_start(true);
 
     let client = reqwest::Client::new();
@@ -79,7 +79,7 @@ async fn rest_path_style_fail_start_returns_500() {
 
 #[tokio::test]
 async fn rest_path_style_fail_stop_returns_500() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     device.set_loaded(&["foo"]);
     device.set_fail_stop(true);
 
@@ -91,7 +91,7 @@ async fn rest_path_style_fail_stop_returns_500() {
 
 #[tokio::test]
 async fn rest_path_style_slash_bearing_id_round_trips() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     let client = reqwest::Client::new();
     let id = "Qwen/Coder";
 
@@ -253,7 +253,7 @@ async fn ollama_generate_string_zero_keep_alive_also_unloads() {
 
 #[tokio::test]
 async fn recording_captures_lowercased_headers_and_verbatim_body() {
-    let device = spawn_rest(tiiny_like_cfg());
+    let device = spawn_rest(device_like_cfg());
     let client = reqwest::Client::new();
 
     let resp = client

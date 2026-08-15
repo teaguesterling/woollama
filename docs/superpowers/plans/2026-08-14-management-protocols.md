@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make woollamad's pooling backend pluggable — a `DeviceBackend` trait with a built-in `tiiny` preset + `ollama` adapter, plus config-defined `rest` protocols (`[management_protocols.<name>]`) — selected per-inferencer via `management_protocol`, defaulting to `tiiny` for back-compat.
+**Goal:** Make woollamad's pooling backend pluggable — a `DeviceBackend` trait with a built-in `device` preset + `ollama` adapter, plus config-defined `rest` protocols (`[management_protocols.<name>]`) — selected per-inferencer via `management_protocol`, defaulting to `device` for back-compat.
 
-**Architecture:** Extract the manager's hardcoded Tiiny HTTP into a `DeviceBackend` behind an `Arc<dyn DeviceBackend>` (via `#[async_trait::async_trait]`, as the crate's existing `StoreProvider`/`PatternBackend` do). Two kinds: `RestBackend` (config-parameterized; `tiiny` is a preset of it) and `OllamaBackend`. The resolver, gate, queue, eviction-race fix, and pooled passthrough are untouched — only what talks HTTP moves.
+**Architecture:** Extract the manager's hardcoded device HTTP into a `DeviceBackend` behind an `Arc<dyn DeviceBackend>` (via `#[async_trait::async_trait]`, as the crate's existing `StoreProvider`/`PatternBackend` do). Two kinds: `RestBackend` (config-parameterized; `device` is a preset of it) and `OllamaBackend`. The resolver, gate, queue, eviction-race fix, and pooled passthrough are untouched — only what talks HTTP moves.
 
 **Tech Stack:** Rust, tokio, reqwest, serde_json, `async-trait`. Tests are `#[tokio::test]` integration tests using the mock-backend fixture already on this branch.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **woollamad (Rust) only.** No Python changes. `woollama-engine` stays pyo3-free.
-- **Back-compat is mandatory.** `management_url` with no `management_protocol` ⇒ the `tiiny` preset, byte-identical to today's behavior. Every existing `woollama-server` test must stay green — the `tiiny` `RestBackend` reproduces the current `running`/`start`/`stop` exactly.
+- **Back-compat is mandatory.** `management_url` with no `management_protocol` ⇒ the `device` preset, byte-identical to today's behavior. Every existing `woollama-server` test must stay green — the `device` `RestBackend` reproduces the current `running`/`start`/`stop` exactly.
 - **Conformance untouched:** do NOT surface `management_protocol` (or anything new) in `engine::inferencer_to_json`.
 - **Test fixture (already on this branch):** `woollama-server/tests/common/mod.rs` — `spawn_rest(RestMockConfig)` / `spawn_ollama()` returning a `MockHandle` (`base_url`, `requests()`/`requests_to()`, `loaded()`, `set_loaded()`, `set_fail_start/stop()`). Use `mod common;` in new test files. `RunningShape::{Strings{field}, Objects{field,id_key}}`, `IdLoc::{Path, Body{field}}`.
 - **`dyn DeviceBackend`** requires `#[async_trait::async_trait]` on the trait and impls (native async-fn-in-trait isn't dyn-safe). Match `conversations.rs::StoreProvider`.
@@ -26,9 +26,9 @@
 
 ---
 
-### Task 1: `DeviceBackend` trait + extract the `tiiny` `RestBackend`; make the manager backend-driven
+### Task 1: `DeviceBackend` trait + extract the `device` `RestBackend`; make the manager backend-driven
 
-Pure refactor — no new behavior. Move the manager's Tiiny HTTP (`running`/`start`/`stop`/`apply_headers`, `woollama-server/src/pool.rs`) into a `RestBackend` behind a `DeviceBackend` trait; the manager holds `Arc<dyn DeviceBackend>`.
+Pure refactor — no new behavior. Move the manager's hardcoded device HTTP (`running`/`start`/`stop`/`apply_headers`, `woollama-server/src/pool.rs`) into a `RestBackend` behind a `DeviceBackend` trait; the manager holds `Arc<dyn DeviceBackend>`.
 
 **Files:**
 - Modify: `woollama-server/src/pool.rs` (add trait + `RestBackend`; refactor `DeviceModelManager` fields/ctors/`ensure_loaded`; update `from_registry`)
@@ -36,12 +36,12 @@ Pure refactor — no new behavior. Move the manager's Tiiny HTTP (`running`/`sta
 
 **Interfaces:**
 - Produces: `#[async_trait::async_trait] pub trait DeviceBackend: Send + Sync { async fn list_loaded(&self) -> Result<HashSet<String>, PoolError>; async fn load(&self, id: &str) -> Result<(), PoolError>; async fn unload(&self, id: &str) -> Result<(), PoolError>; }`
-- Produces: `pub struct RestBackend` + `RestBackend::tiiny(management_url: String, headers: HashMap<String,String>, poll_interval: f64, load_timeout: f64) -> RestBackend` (pre-fills the Tiiny endpoints). Its `DeviceBackend` impl: `list_loaded` = today's `running()`; `load` = today's `start()` (POST start + poll `list_loaded` until present or `load_timeout`); `unload` = today's `stop()`.
+- Produces: `pub struct RestBackend` + `RestBackend::device(management_url: String, headers: HashMap<String,String>, poll_interval: f64, load_timeout: f64) -> RestBackend` (pre-fills the built-in device endpoints). Its `DeviceBackend` impl: `list_loaded` = today's `running()`; `load` = today's `start()` (POST start + poll `list_loaded` until present or `load_timeout`); `unload` = today's `stop()`.
 - Changes: `DeviceModelManager` drops `url/headers/client/poll_interval/load_timeout`, gains `backend: Arc<dyn DeviceBackend>`; keeps `retry_after/entries/load_lock/clock`. New ctors: `pub fn new(backend: Arc<dyn DeviceBackend>) -> Self` (retry_after=5.0) and `pub fn with_retry_after(backend: Arc<dyn DeviceBackend>, retry_after: f64) -> Self`. `ensure_loaded` calls `self.backend.{list_loaded,load,unload}` in place of `self.{running,start,stop}` (reconcile/eviction/counters/lock logic unchanged, incl. the eviction-race fix).
 
 - [ ] **Step 1: Add the trait + `RestBackend` (move the HTTP verbatim)**
 
-In `pool.rs`, add `#[async_trait::async_trait] pub trait DeviceBackend …` and `pub struct RestBackend { client: reqwest::Client, base_url: String, headers: HashMap<String,String>, poll_interval: f64, load_timeout: f64 }` with `RestBackend::tiiny(...)`. Move `apply_headers`, `running` (→ `list_loaded`), `start` (→ `load`, keeping the poll loop but polling `self.list_loaded()`), and `stop` (→ `unload`) into `impl RestBackend` / the `DeviceBackend` impl, verbatim in body (same URLs, same `PoolError` messages, same `ok()` check).
+In `pool.rs`, add `#[async_trait::async_trait] pub trait DeviceBackend …` and `pub struct RestBackend { client: reqwest::Client, base_url: String, headers: HashMap<String,String>, poll_interval: f64, load_timeout: f64 }` with `RestBackend::device(...)`. Move `apply_headers`, `running` (→ `list_loaded`), `start` (→ `load`, keeping the poll loop but polling `self.list_loaded()`), and `stop` (→ `unload`) into `impl RestBackend` / the `DeviceBackend` impl, verbatim in body (same URLs, same `PoolError` messages, same `ok()` check).
 
 - [ ] **Step 2: Refactor the manager to hold the backend**
 
@@ -49,11 +49,11 @@ Replace the manager's `url/headers/client/poll_interval/load_timeout` fields wit
 
 - [ ] **Step 3: Update `from_registry`**
 
-`DeviceModelManager::new(management_url, headers)` → `DeviceModelManager::new(Arc::new(RestBackend::tiiny(management_url, headers, 0.5, 120.0)))`. Behavior identical (tiiny defaults).
+`DeviceModelManager::new(management_url, headers)` → `DeviceModelManager::new(Arc::new(RestBackend::device(management_url, headers, 0.5, 120.0)))`. Behavior identical (device defaults).
 
 - [ ] **Step 4: Update the existing pool tests to the new ctor**
 
-In `pool_manager.rs`/`pool_gate.rs`, wherever a manager is built from a mock URL (`DeviceModelManager::with_config(url, headers, poll, timeout, retry)`), build `DeviceModelManager::with_retry_after(Arc::new(RestBackend::tiiny(url, headers, poll, timeout)), retry)`. Add a tiny local helper if it reduces churn. The FakeDevice in `pool_manager.rs` already serves the Tiiny shape, so assertions are unchanged.
+In `pool_manager.rs`/`pool_gate.rs`, wherever a manager is built from a mock URL (`DeviceModelManager::with_config(url, headers, poll, timeout, retry)`), build `DeviceModelManager::with_retry_after(Arc::new(RestBackend::device(url, headers, poll, timeout)), retry)`. Add a tiny local helper if it reduces churn. The FakeDevice in `pool_manager.rs` already serves the built-in device shape, so assertions are unchanged.
 
 - [ ] **Step 5: Run the gate**
 
@@ -64,7 +64,7 @@ Expected: ALL pool tests (manager, gate, race, backpressure, streaming, from_reg
 
 ```bash
 git add woollama-server/src/pool.rs woollama-server/tests/pool_manager.rs woollama-server/tests/pool_gate.rs
-git commit   # "refactor(server): DeviceBackend trait + tiiny RestBackend behind DeviceModelManager" + trailers
+git commit   # "refactor(server): DeviceBackend trait + device RestBackend behind DeviceModelManager" + trailers
 ```
 
 ---
@@ -117,7 +117,7 @@ git commit   # "feat(engine): management_protocol field + [management_protocols]
 
 ### Task 3: Config-driven `RestBackend` + protocol resolution in `from_registry`
 
-Generalize `RestBackend` to build from a `ProtocolSpec::Rest` (templated URLs/method/body/headers, running `path`/`id_field`), keep `tiiny` as a preset, and resolve `management_protocol` → backend at startup.
+Generalize `RestBackend` to build from a `ProtocolSpec::Rest` (templated URLs/method/body/headers, running `path`/`id_field`), keep `device` as a preset, and resolve `management_protocol` → backend at startup.
 
 **Files:**
 - Modify: `woollama-server/src/pool.rs` (`RestBackend` from-spec constructor + templating; `from_registry` resolution)
@@ -127,12 +127,12 @@ Generalize `RestBackend` to build from a `ProtocolSpec::Rest` (templated URLs/me
 **Interfaces:**
 - Consumes: `engine::{ProtocolSpec, EndpointSpec, load_management_protocols}` (Task 2), the `DeviceBackend`/`RestBackend` (Task 1), the fixture.
 - Produces: `RestBackend::from_spec(base_url: &str, default_headers: &HashMap<String,String>, running: &EndpointSpec, start: &EndpointSpec, stop: &EndpointSpec, poll_interval: f64, load_timeout: f64) -> RestBackend`. Templating: replace `{base}` (→ base_url, trimmed) and `{id}` in every `url`, `body`, and header value; per-op method default (GET running, POST start/stop); headers merged over `default_headers` (Bearer); if `body` present and no `content-type` header, add `application/json`; `list_loaded` extracts via `running.path` (dotted) + optional `id_field` (elements are strings when absent).
-- `RestBackend::tiiny(...)` (Task 1) is re-expressed as `from_spec` with the built-in Tiiny endpoints.
-- Changes: `PoolRegistry::from_registry(registry: &engine::Registry, protocols: &HashMap<String, ProtocolSpec>) -> Result<PoolRegistry, EngineError>` — for each `management_url` inferencer, resolve `inf.management_protocol.as_deref().unwrap_or("tiiny")`: `"tiiny"`→tiiny preset; `"ollama"`→Task 4 (stub/return error until Task 4 lands, or land Task 4 first — see ordering note); else look up in `protocols`; **unknown name → `EngineError`** (fail fast at startup). `build_state` calls `engine::load_management_protocols()` and passes the map.
+- `RestBackend::device(...)` (Task 1) is re-expressed as `from_spec` with the built-in device endpoints.
+- Changes: `PoolRegistry::from_registry(registry: &engine::Registry, protocols: &HashMap<String, ProtocolSpec>) -> Result<PoolRegistry, EngineError>` — for each `management_url` inferencer, resolve `inf.management_protocol.as_deref().unwrap_or("device")`: `"device"`→device preset; `"ollama"`→Task 4 (stub/return error until Task 4 lands, or land Task 4 first — see ordering note); else look up in `protocols`; **unknown name → `EngineError`** (fail fast at startup). `build_state` calls `engine::load_management_protocols()` and passes the map.
 
 - [ ] **Step 1: Write failing fixture-driven tests**
 
-Create `woollama-server/tests/pool_protocols.rs` (`mod common;`). Test A (**custom rest**): `spawn_rest` with a body-based config (`IdLoc::Body{field:"model"}`, `RunningShape::Objects{field:"data", id_key:"id"}`, a custom route + a custom header). Build an `engine::Registry` (via `insert`) with an inferencer whose `management_protocol="custom"`, and a `protocols` map holding a matching `ProtocolSpec::Rest` pointed at the mock's `base_url` (`{base}` = base_url). Build a manager via `from_registry`, call `ensure_loaded("m1")`, then assert through `MockHandle::requests()` that the backend issued the configured start (right method/path/body/header) and that `snapshot()`/`list_loaded` reflect the mock's loaded set. Test B (**back-compat**): an inferencer with `management_url` and no `management_protocol`, `spawn_rest` in tiiny shape → `from_registry` builds the tiiny preset and `ensure_loaded` works. Test C (**unknown protocol**): `management_protocol="nope"` not in the map → `from_registry` returns `Err`.
+Create `woollama-server/tests/pool_protocols.rs` (`mod common;`). Test A (**custom rest**): `spawn_rest` with a body-based config (`IdLoc::Body{field:"model"}`, `RunningShape::Objects{field:"data", id_key:"id"}`, a custom route + a custom header). Build an `engine::Registry` (via `insert`) with an inferencer whose `management_protocol="custom"`, and a `protocols` map holding a matching `ProtocolSpec::Rest` pointed at the mock's `base_url` (`{base}` = base_url). Build a manager via `from_registry`, call `ensure_loaded("m1")`, then assert through `MockHandle::requests()` that the backend issued the configured start (right method/path/body/header) and that `snapshot()`/`list_loaded` reflect the mock's loaded set. Test B (**back-compat**): an inferencer with `management_url` and no `management_protocol`, `spawn_rest` in device shape → `from_registry` builds the device preset and `ensure_loaded` works. Test C (**unknown protocol**): `management_protocol="nope"` not in the map → `from_registry` returns `Err`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -141,11 +141,11 @@ Expected: FAIL — `from_spec`/the new `from_registry` signature don't exist.
 
 - [ ] **Step 3: Implement `from_spec` + templating**
 
-Implement `RestBackend::from_spec` (templating, method defaults, header merge, content-type default, `running.path`/`id_field` extraction — a small dotted-path getter + optional element field). Re-express `RestBackend::tiiny` via `from_spec`.
+Implement `RestBackend::from_spec` (templating, method defaults, header merge, content-type default, `running.path`/`id_field` extraction — a small dotted-path getter + optional element field). Re-express `RestBackend::device` via `from_spec`.
 
 - [ ] **Step 4: Resolution in `from_registry` + `build_state`**
 
-Change `from_registry` to take `&protocols` and resolve the protocol name → backend (tiiny preset / config rest / unknown→Err). Update `build_state` (`lib.rs`) to `engine::load_management_protocols()?` and pass it; surface a load error the same way other startup config errors are handled.
+Change `from_registry` to take `&protocols` and resolve the protocol name → backend (device preset / config rest / unknown→Err). Update `build_state` (`lib.rs`) to `engine::load_management_protocols()?` and pass it; surface a load error the same way other startup config errors are handled.
 
 - [ ] **Step 5: Gate**
 
@@ -202,8 +202,8 @@ git commit   # "feat(server): ollama management backend (auto-load + keep_alive)
 
 ## Self-Review
 
-**Spec coverage:** `DeviceBackend` seam (Task 1) ✓; `rest` config-defined (Task 3) ✓; `tiiny` preset + back-compat default (Tasks 1+3) ✓; `ollama` adapter (Task 4) ✓; `management_protocol` field + `[management_protocols]` parsing (Task 2) ✓; unknown-protocol startup error (Task 3) ✓; resolver/gate/eviction untouched (all tasks preserve them) ✓; conformance untouched (Task 2 leaves `inferencer_to_json`) ✓. Non-goals (multi-step endpoints, response-field success, retries, config-driven ollama bodies, Python parity) are respected — none introduced.
+**Spec coverage:** `DeviceBackend` seam (Task 1) ✓; `rest` config-defined (Task 3) ✓; `device` preset + back-compat default (Tasks 1+3) ✓; `ollama` adapter (Task 4) ✓; `management_protocol` field + `[management_protocols]` parsing (Task 2) ✓; unknown-protocol startup error (Task 3) ✓; resolver/gate/eviction untouched (all tasks preserve them) ✓; conformance untouched (Task 2 leaves `inferencer_to_json`) ✓. Non-goals (multi-step endpoints, response-field success, retries, config-driven ollama bodies, Python parity) are respected — none introduced.
 
 **Placeholder scan:** none — each step names concrete types/functions, the fixture API, and the exact gate commands. Task 1 bodies are "move verbatim"; the readiness poll + eviction-race fix are explicitly preserved.
 
-**Type consistency:** `DeviceBackend`/`RestBackend`/`OllamaBackend`/`PoolError` (Tasks 1/3/4); `EndpointSpec`/`ProtocolSpec`/`load_management_protocols` (Task 2 → consumed 3/4); `RestBackend::{tiiny, from_spec}` (Task 1 → generalized Task 3); `from_registry(registry, protocols) -> Result<…>` signature is introduced in Task 3 and its caller (`build_state`) updated in the same task; `Inferencer.management_protocol` (Task 2 → read in Task 3's resolution).
+**Type consistency:** `DeviceBackend`/`RestBackend`/`OllamaBackend`/`PoolError` (Tasks 1/3/4); `EndpointSpec`/`ProtocolSpec`/`load_management_protocols` (Task 2 → consumed 3/4); `RestBackend::{device, from_spec}` (Task 1 → generalized Task 3); `from_registry(registry, protocols) -> Result<…>` signature is introduced in Task 3 and its caller (`build_state`) updated in the same task; `Inferencer.management_protocol` (Task 2 → read in Task 3's resolution).
