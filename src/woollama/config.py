@@ -409,7 +409,7 @@ def load_management_protocols() -> dict[str, ProtocolSpec]:
     """User-defined device management protocols from `[management_protocols.<name>]`
     in `$config/inferencers.toml` (same file as `[inferencers.*]`, optional). A
     protocol is selected per-inferencer via `Inferencer.management_protocol`;
-    `None` means "use the built-in tiiny backend" (resolved by Task 3).
+    `None` means "use the built-in device backend" (resolved by Task 3).
 
     Missing file, or a file with no `[management_protocols]` section at all,
     both yield `{}` — this section is entirely optional. `${VAR}` is expanded

@@ -135,8 +135,8 @@ async def lifespan(app: FastAPI):
     register_reexported_tools(_mcp, registry)
     # Device-aware pools: one manager+gate per inferencer that declares a
     # management_url. Reuses the inferencer's api key for the :8800 mgmt API.
-    # Each inferencer's management_protocol (default "tiiny") is resolved to a
-    # DeviceBackend by pool.build_backend -- the built-in tiiny REST preset, a
+    # Each inferencer's management_protocol (default "device") is resolved to a
+    # DeviceBackend by pool.build_backend -- the built-in device REST preset, a
     # config-defined [management_protocols.<name>] REST shape, or (until Task 4)
     # a logged skip for "ollama". An unresolvable name skips ONLY that one
     # inferencer's pool (pool.build_backend already logged why) -- it must
@@ -159,7 +159,7 @@ async def lifespan(app: FastAPI):
         _pools[_name] = (_mgr, _gate)
         log.info("pool ready: inferencer '%s' -> %s (protocol=%s, parallel=%d, "
                  "pool_max=%s, queue_max=%s)", _name, _inf.management_url,
-                 _inf.management_protocol or "tiiny", _inf.parallel,
+                 _inf.management_protocol or "device", _inf.parallel,
                  _inf.pool_max, _inf.queue_max)
     # Optional: wire an external conversation store as the state owner for
     # NON-claude models (issue #2), from the `conversationStore` key in mcp.json

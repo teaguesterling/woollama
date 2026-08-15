@@ -54,8 +54,8 @@ class Inferencer:
     # (pool.py / resolver.py), NOT by the Rust core's build_request. ---
     management_url: str | None = None   # device mgmt base (:8800); presence enables the pool
     # Selects a named `[management_protocols.<name>]` block (config.load_management_protocols)
-    # describing HOW to talk to the device at management_url. None = the built-in tiiny
-    # backend (back-compat); Task 3 resolves None -> tiiny. Mirrors the Rust
+    # describing HOW to talk to the device at management_url. None = the built-in device
+    # backend (back-compat); Task 3 resolves None -> device. Mirrors the Rust
     # `Inferencer::management_protocol` field (woollama-engine/src/lib.rs).
     management_protocol: str | None = None
     parallel: int = 1                   # per-model concurrency slot size (device default 1)

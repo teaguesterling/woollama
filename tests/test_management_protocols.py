@@ -50,7 +50,7 @@ keep_alive = "5m"
 
 
 def test_inferencer_management_protocol_field_default():
-    # Back-compat: absent -> None, the "use the built-in tiiny backend" sentinel.
+    # Back-compat: absent -> None, the "use the built-in device backend" sentinel.
     inf = inferencers.Inferencer(name="x", base_url="http://x/v1")
     assert inf.management_protocol is None
 

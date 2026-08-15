@@ -5,7 +5,7 @@ Test A drives a fully config-defined ("custom") REST protocol end to end
 through `ensure_loaded`, asserting the mock observed the configured start
 call (method, path, body, header) and that the manager's view of loaded
 models matches the mock. Test B is the back-compat path (no
-`management_protocol` => tiiny preset). Test C asserts an unresolvable
+`management_protocol` => device preset). Test C asserts an unresolvable
 `management_protocol` name is isolated to the offending inferencer --
 `router.lifespan` skips (and warns about) just that one inferencer, while a
 sibling inferencer with a valid protocol is still pooled normally. Test D
@@ -17,7 +17,8 @@ exactly one `authorization` header line, never both.
 (configurable running-response shape, id-in-path or id-in-body start/stop,
 full recorded-request headers including every line for a header-count
 assertion), adapted to Python/httpx -- extending the pattern established by
-`tests/test_pool.py`'s `FakeDevice` (which only serves Tiiny's fixed shape).
+`tests/test_pool.py`'s `FakeDevice` (which only serves the built-in `device`
+preset's fixed shape).
 """
 from __future__ import annotations
 
@@ -224,10 +225,10 @@ async def test_build_backend_resolves_custom_protocol_and_drives_ensure_loaded()
         mock.close()
 
 
-# --- Test B: back-compat (no management_protocol => tiiny preset) ----------
+# --- Test B: back-compat (no management_protocol => device preset) ---------
 
-async def test_build_backend_back_compat_defaults_to_tiiny():
-    mock = RestMock()   # defaults already match the Tiiny REST shape
+async def test_build_backend_back_compat_defaults_to_device():
+    mock = RestMock()   # defaults already match the built-in device REST shape
     try:
         inf = _device_inferencer("device", mock.url, management_protocol=None)
         backend = pool.build_backend(inf, {}, poll_interval=0.01)
@@ -250,7 +251,7 @@ async def test_lifespan_isolates_unknown_protocol_to_its_own_inferencer(monkeypa
     pooling for every other device inferencer. `router.lifespan` (via
     `pool.build_backend`) skips (with a warning) only the offending
     inferencer -- absent from `router._pools` -- while a sibling inferencer
-    with a resolvable protocol (here, the default `tiiny`) is still pooled
+    with a resolvable protocol (here, the default `device`) is still pooled
     normally."""
     monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("WOOLLAMA_STATE_DIR", str(tmp_path / "state"))
@@ -417,14 +418,14 @@ async def test_build_backend_invalid_configured_method_falls_back_to_op_default(
 
 def test_check_reserved_protocol_names_warns_on_shadowed_builtin(caplog):
     protocols = {
-        "tiiny": config.RestProtocolSpec(
+        "device": config.RestProtocolSpec(
             running=config.EndpointSpec(url="{base}/x", path=""),
             start=config.EndpointSpec(url="{base}/y"),
             stop=config.EndpointSpec(url="{base}/z")),
     }
     with caplog.at_level(logging.WARNING, logger="woollama.pool"):
         pool.check_reserved_protocol_names(protocols)
-    assert any("tiiny" in rec.message and "shadowed" in rec.message for rec in caplog.records)
+    assert any("device" in rec.message and "shadowed" in rec.message for rec in caplog.records)
 
 
 def test_check_reserved_protocol_names_silent_when_no_reserved_names():

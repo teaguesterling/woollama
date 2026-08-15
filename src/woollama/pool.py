@@ -161,11 +161,11 @@ def _compile_endpoint(base: str, default_headers: dict[str, str],
 
 
 class RestBackend:
-    """The `DeviceBackend` for config-defined (and Tiiny's built-in) REST
-    device-management shapes: three HTTP calls (list-loaded/start/stop), each
-    independently templated (`RestBackend.from_spec`). `RestBackend.tiiny` is
-    the Tiiny preset, expressed as a `from_spec` call with Tiiny's built-in
-    endpoints. Mirrors Rust's `RestBackend` (pool.rs)."""
+    """The `DeviceBackend` for config-defined (and the built-in device-
+    management REST shape's) shapes: three HTTP calls (list-loaded/start/stop),
+    each independently templated (`RestBackend.from_spec`). `RestBackend.device`
+    is the built-in `device` preset, expressed as a `from_spec` call with its
+    built-in endpoints. Mirrors Rust's `RestBackend` (pool.rs)."""
 
     def __init__(self, *, client: httpx.AsyncClient, owns_client: bool,
                  running: _CompiledEndpoint, start: _CompiledEndpoint, stop: _CompiledEndpoint,
@@ -214,16 +214,16 @@ class RestBackend:
         )
 
     @classmethod
-    def tiiny(cls, management_url: str, *,
-              headers: dict[str, str] | None = None,
-              client: httpx.AsyncClient | None = None,
-              poll_interval: float = 0.5, load_timeout: float = 120.0,
-              clock: Callable[[], float] = time.monotonic) -> "RestBackend":
-        """The Tiiny device-management REST shape (`GET {base}/api/v1/models/
+    def device(cls, management_url: str, *,
+               headers: dict[str, str] | None = None,
+               client: httpx.AsyncClient | None = None,
+               poll_interval: float = 0.5, load_timeout: float = 120.0,
+               clock: Callable[[], float] = time.monotonic) -> "RestBackend":
+        """The built-in device-management REST shape (`GET {base}/api/v1/models/
         running`, `POST .../{id}/start`, `POST .../{id}/stop`), expressed as a
-        `from_spec` call with Tiiny's built-in endpoints -- the preset every
+        `from_spec` call with its built-in endpoints -- the preset every
         `management_protocol` resolution falls back to when an inferencer
-        names none (or names `"tiiny"` explicitly)."""
+        names none (or names `"device"` explicitly)."""
         running = config.EndpointSpec(url="{base}/api/v1/models/running", path="running")
         start = config.EndpointSpec(url="{base}/api/v1/models/{id}/start")
         stop = config.EndpointSpec(url="{base}/api/v1/models/{id}/stop")
@@ -253,7 +253,7 @@ class RestBackend:
         except ValueError as exc:
             raise DeviceError(f"running query: bad JSON: {exc}") from exc
         # `_get_dotted` returning `None` (key/path absent) is normal and means
-        # "no running models" -- the tiiny back-compat case: a device response
+        # "no running models" -- the device back-compat case: a device response
         # with no "running" key at all (e.g. `{}`) must still resolve to an
         # empty set, not an error. But a path that IS present and resolves to
         # something other than a list is a config-typo signal (the author
@@ -403,12 +403,12 @@ class OllamaBackend:
             await self._client.aclose()
 
 
-_RESERVED_PROTOCOL_NAMES = ("tiiny", "ollama")
+_RESERVED_PROTOCOL_NAMES = ("device", "ollama")
 
 
 def check_reserved_protocol_names(protocols: dict[str, config.ProtocolSpec]) -> None:
     """Warn (once, up front) if a config `[management_protocols.<name>]` block
-    reuses a RESERVED built-in name (`tiiny`/`ollama`). That block is always
+    reuses a RESERVED built-in name (`device`/`ollama`). That block is always
     shadowed by the built-in of the same name (see `build_backend`), so
     silently ignoring it would hide a config mistake. Mirrors Rust's
     reserved-name loop in `PoolRegistry.from_registry` (pool.rs): warn-and-
@@ -425,8 +425,8 @@ def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], 
                    headers: dict[str, str] | None = None,
                    poll_interval: float = 0.5, load_timeout: float = 120.0,
                    client: httpx.AsyncClient | None = None) -> "DeviceBackend | None":
-    """Resolve one inferencer's `management_protocol` (default `"tiiny"` when
-    unset) to a `DeviceBackend`: the built-in `"tiiny"` REST preset, the
+    """Resolve one inferencer's `management_protocol` (default `"device"` when
+    unset) to a `DeviceBackend`: the built-in `"device"` REST preset, the
     built-in `"ollama"` adapter (`OllamaBackend`, no configured `keep_alive`),
     a config-defined `[management_protocols.<name>]` REST shape (`RestBackend
     .from_spec`), or a config-defined `kind = "ollama"` block (`OllamaBackend`
@@ -441,12 +441,12 @@ def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], 
 
     `inf.management_url` must be set (the caller only invokes this for
     management-capable inferencers)."""
-    name = inf.management_protocol or "tiiny"
+    name = inf.management_protocol or "device"
     hdrs = headers or {}
-    if name == "tiiny":
-        return RestBackend.tiiny(inf.management_url, headers=hdrs,
-                                  poll_interval=poll_interval, load_timeout=load_timeout,
-                                  client=client)
+    if name == "device":
+        return RestBackend.device(inf.management_url, headers=hdrs,
+                                   poll_interval=poll_interval, load_timeout=load_timeout,
+                                   client=client)
     if name == "ollama":
         # No configured keep_alive for the built-in name (Ollama's own
         # default applies) and no headers -- Ollama's API takes none. Mirrors
