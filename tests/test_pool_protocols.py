@@ -346,29 +346,26 @@ def test_check_reserved_protocol_names_silent_when_no_reserved_names():
     pool.check_reserved_protocol_names(protocols)
 
 
-# --- The "ollama" arm: T4 fills this in; T3 must ship green on its own -----
+# --- The "ollama" arm: resolved to a real OllamaBackend (Task 4) -----------
 #
-# Per the task-3 ruling, resolving "ollama" (the built-in name, or any config
-# block with kind="ollama") is left as a clearly-logged skip -- NOT a hard
-# raise/whole-registry failure -- so it composes with the same
-# skip-just-this-inferencer policy Test C exercises for an unresolvable name.
-# Task 4 replaces both `build_backend` arms below with a real `OllamaBackend`.
+# Per the task-3 ruling, "ollama" (the built-in name, or any config block with
+# kind="ollama") used to be a clearly-logged skip. Task 4 replaced both
+# `build_backend` arms with a real `OllamaBackend`; full behavioral coverage
+# (list_loaded/load/unload wire shapes, keep_alive forwarding, eviction, and
+# the lifespan wiring) lives in tests/test_pool_ollama.py. These two just
+# confirm resolution no longer skips.
 
-def test_build_backend_builtin_ollama_name_is_skip_not_implemented(caplog):
+def test_build_backend_builtin_ollama_name_resolves_to_ollama_backend():
     inf = _device_inferencer("device", "http://device.example:8800", management_protocol="ollama")
-    with caplog.at_level(logging.WARNING, logger="woollama.pool"):
-        backend = pool.build_backend(inf, {})
-    assert backend is None
-    assert any("device" in rec.message and "ollama" in rec.message for rec in caplog.records)
+    backend = pool.build_backend(inf, {})
+    assert isinstance(backend, pool.OllamaBackend)
 
 
-def test_build_backend_config_kind_ollama_is_skip_not_implemented(caplog):
+def test_build_backend_config_kind_ollama_resolves_to_ollama_backend():
     protocols = {"oll": config.OllamaProtocolSpec(keep_alive="5m")}
     inf = _device_inferencer("device", "http://device.example:8800", management_protocol="oll")
-    with caplog.at_level(logging.WARNING, logger="woollama.pool"):
-        backend = pool.build_backend(inf, protocols)
-    assert backend is None
-    assert any("device" in rec.message and "oll" in rec.message for rec in caplog.records)
+    backend = pool.build_backend(inf, protocols)
+    assert isinstance(backend, pool.OllamaBackend)
 
 
 # --- A present-but-non-array running path is a clear DeviceError -----------

@@ -296,6 +296,100 @@ class RestBackend:
             await self._client.aclose()
 
 
+class OllamaBackend:
+    """The `DeviceBackend` for Ollama's native management API: `GET {base}/api/ps`
+    lists loaded models; `POST {base}/api/generate` both loads (empty-prompt
+    warm-up -- Ollama's own lazy-load semantics) and unloads (`keep_alive: 0`) a
+    model -- there is no separate start/stop endpoint pair the way `RestBackend`
+    has. `keep_alive` (when set) is forwarded on `load` so a config author can
+    control how long Ollama keeps a model resident after use; when unset, the
+    field is omitted entirely so Ollama's own default applies.
+
+    Unlike `RestBackend` (which sends `default_headers`, e.g. a Bearer token
+    derived from `api_key_env`), `OllamaBackend` sends NO auth headers at all --
+    stock Ollama's HTTP API is unauthenticated, so there is nothing to attach.
+
+    No readiness poll (unlike `RestBackend.load`, which starts the device then
+    polls `list_loaded` until `load_timeout`): Ollama's `/api/generate` itself
+    blocks until the model is fully resident before returning a 2xx, so by the
+    time `_generate` below succeeds the model is already loaded -- polling
+    would be redundant. Mirrors Rust's `OllamaBackend` (pool.rs).
+
+    Latent accuracy note (carried over from Rust, not fixed here): `/api/ps`
+    can return a name-NORMALIZED id (e.g. Ollama may report `qwen3:latest` for
+    a model this backend posted to `/api/generate` as plain `qwen3`).
+    `list_loaded`/reconcile compare ids by exact string match, so such a
+    normalization would make `DeviceModelManager` think the model it just
+    loaded is NOT running (and vice versa on eviction bookkeeping) -- a
+    reconcile/eviction-accuracy gap, not currently handled here."""
+
+    def __init__(self, base_url: str, *, keep_alive: str | None = None,
+                 client: httpx.AsyncClient | None = None):
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(timeout=30.0)
+        self._base = base_url.rstrip("/")
+        self._keep_alive = keep_alive
+
+    @classmethod
+    def from_spec(cls, base_url: str, spec: "config.OllamaProtocolSpec", *,
+                   client: httpx.AsyncClient | None = None) -> "OllamaBackend":
+        """Build an `OllamaBackend` from a config `OllamaProtocolSpec`'s
+        `keep_alive`. Mirrors `RestBackend.from_spec`'s role as the
+        config-driven constructor -- but unlike `RestBackend`, there are no
+        `default_headers` to merge here: Ollama's HTTP API takes no auth
+        headers at all (see class docstring), so there is nothing to fold in
+        case-insensitively."""
+        return cls(base_url, keep_alive=spec.keep_alive, client=client)
+
+    async def _generate(self, real_id: str, body: dict) -> None:
+        """Issue one `POST {base}/api/generate` -- the single endpoint both
+        `load` and `unload` drive, differing only in `body`."""
+        try:
+            r = await self._client.post(f"{self._base}/api/generate", json=body)
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"generate {real_id}: unreachable: {exc}") from exc
+        if not _ok(r.status_code):
+            raise DeviceError(f"generate {real_id} failed: {r.status_code} {r.text[:200]}")
+
+    async def list_loaded(self) -> set[str]:
+        try:
+            r = await self._client.get(f"{self._base}/api/ps")
+        except httpx.HTTPError as exc:
+            raise DeviceError(f"device unreachable: {exc}") from exc
+        if not _ok(r.status_code):
+            raise DeviceError(f"running query failed: {r.status_code} {r.text[:200]}")
+        try:
+            v = r.json()
+        except ValueError as exc:
+            raise DeviceError(f"running query: bad JSON: {exc}") from exc
+        # Mirrors Rust: `v.get("models").and_then(Value::as_array)` -- absent
+        # or non-array "models" is "no running models", not an error (Ollama's
+        # /api/ps always returns {"models": [...]}` when reachable; this is
+        # just defensive parsing of an unexpected shape, same posture as
+        # `RestBackend.list_loaded`'s handling of an absent `path`).
+        models = v.get("models") if isinstance(v, dict) else None
+        if not isinstance(models, list):
+            return set()
+        return {m["name"] for m in models
+                if isinstance(m, dict) and isinstance(m.get("name"), str)}
+
+    async def load(self, real_id: str) -> None:
+        body: dict = {"model": real_id}
+        if self._keep_alive is not None:
+            body["keep_alive"] = self._keep_alive
+        await self._generate(real_id, body)
+
+    async def unload(self, real_id: str) -> None:
+        # Numeric 0 (not the string "0") -- Ollama treats `keep_alive: 0` as
+        # "evict immediately after this call", mirroring Rust's
+        # `serde_json::json!({ "model": real_id, "keep_alive": 0 })`.
+        await self._generate(real_id, {"model": real_id, "keep_alive": 0})
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+
 _RESERVED_PROTOCOL_NAMES = ("tiiny", "ollama")
 
 
@@ -319,13 +413,11 @@ def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], 
                    poll_interval: float = 0.5, load_timeout: float = 120.0,
                    client: httpx.AsyncClient | None = None) -> "DeviceBackend | None":
     """Resolve one inferencer's `management_protocol` (default `"tiiny"` when
-    unset) to a `DeviceBackend`: the built-in `"tiiny"` REST preset, a
-    config-defined `[management_protocols.<name>]` REST shape (`RestBackend
-    .from_spec`), or -- for `"ollama"` (built-in or a config block with
-    `kind = "ollama"`) -- `None` (Task 4 lands `OllamaBackend`; until then this
-    is a clearly-logged not-yet-implemented skip, not a hard failure, so it
-    composes with the same skip-just-this-inferencer policy as an unresolvable
-    name).
+    unset) to a `DeviceBackend`: the built-in `"tiiny"` REST preset, the
+    built-in `"ollama"` adapter (`OllamaBackend`, no configured `keep_alive`),
+    a config-defined `[management_protocols.<name>]` REST shape (`RestBackend
+    .from_spec`), or a config-defined `kind = "ollama"` block (`OllamaBackend`
+    with its configured `keep_alive`).
 
     Caller contract: `None` means "skip this ONE inferencer's pool" -- a
     `log.warning` naming the inferencer and protocol has already been emitted;
@@ -343,11 +435,10 @@ def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], 
                                   poll_interval=poll_interval, load_timeout=load_timeout,
                                   client=client)
     if name == "ollama":
-        log.warning(
-            "management_protocols: inferencer '%s': built-in 'ollama' protocol "
-            "is not yet implemented -- skipping this inferencer's pool (other "
-            "inferencers are unaffected)", inf.name)
-        return None
+        # No configured keep_alive for the built-in name (Ollama's own
+        # default applies) and no headers -- Ollama's API takes none. Mirrors
+        # Rust's `"ollama" => Arc::new(OllamaBackend::new(management_url, None))`.
+        return OllamaBackend(inf.management_url, client=client)
     spec = protocols.get(name)
     if spec is None:
         log.warning(
@@ -360,13 +451,8 @@ def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], 
                                       running=spec.running, start=spec.start, stop=spec.stop,
                                       poll_interval=poll_interval, load_timeout=load_timeout,
                                       client=client)
-    # isinstance(spec, config.OllamaProtocolSpec): same not-yet-implemented
-    # skip as the built-in "ollama" name above (Task 4 replaces both arms).
-    log.warning(
-        "management_protocols: inferencer '%s': protocol %r has kind=\"ollama\", "
-        "which is not yet implemented -- skipping this inferencer's pool (other "
-        "inferencers are unaffected)", inf.name, name)
-    return None
+    # isinstance(spec, config.OllamaProtocolSpec)
+    return OllamaBackend.from_spec(inf.management_url, spec, client=client)
 
 
 class DeviceModelManager:
