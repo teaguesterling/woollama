@@ -343,12 +343,15 @@ def _parse_endpoint_spec(
         raise _protocol_err(path, proto_name, f"{key}.url", "required")
     if not isinstance(url, str):
         raise _protocol_err(path, proto_name, f"{key}.url", "must be a string")
+    # method/body are OPTIONAL: mirror Rust's `.and_then(Value::as_str)` (lib.rs
+    # L534-535) — a present-but-non-string value is silently treated as absent
+    # (None), not an error. Only `url` (required) errors on wrong type.
     method = eobj.get("method")
-    if method is not None and not isinstance(method, str):
-        raise _protocol_err(path, proto_name, f"{key}.method", "must be a string")
+    if not isinstance(method, str):
+        method = None
     body = eobj.get("body")
-    if body is not None and not isinstance(body, str):
-        raise _protocol_err(path, proto_name, f"{key}.body", "must be a string")
+    if not isinstance(body, str):
+        body = None
     headers: dict[str, str] = {}
     headers_raw = eobj.get("headers")
     if headers_raw is not None:
@@ -362,9 +365,11 @@ def _parse_endpoint_spec(
         p = eobj.get("path")
         if not isinstance(p, str):
             raise _protocol_err(path, proto_name, f"{key}.path", "required")
+        # id_field is OPTIONAL: same silent-None-on-wrong-type as method/body
+        # above (mirrors Rust lib.rs L555).
         id_field = eobj.get("id_field")
-        if id_field is not None and not isinstance(id_field, str):
-            raise _protocol_err(path, proto_name, f"{key}.id_field", "must be a string")
+        if not isinstance(id_field, str):
+            id_field = None
     else:
         p = None
         id_field = None
@@ -440,9 +445,12 @@ def load_management_protocols() -> dict[str, ProtocolSpec]:
             stop = _parse_endpoint_spec(path, name, "stop", endpoints, require_path=False)
             out[name] = RestProtocolSpec(running=running, start=start, stop=stop)
         elif kind == "ollama":
+            # keep_alive is OPTIONAL: mirror Rust's `.and_then(Value::as_str)`
+            # (lib.rs L606) — a present-but-non-string value is silently
+            # treated as absent (None), not an error.
             keep_alive = entry.get("keep_alive")
-            if keep_alive is not None and not isinstance(keep_alive, str):
-                raise _protocol_err(path, name, "keep_alive", "must be a string")
+            if not isinstance(keep_alive, str):
+                keep_alive = None
             out[name] = OllamaProtocolSpec(keep_alive=keep_alive)
         else:
             raise _protocol_err(path, name, "kind",

@@ -112,6 +112,36 @@ def test_load_management_protocols_rest_missing_stop(tmp_path):
         config.load_management_protocols()
 
 
+def test_load_management_protocols_optional_fields_nonstring_coerce_to_none(tmp_path):
+    """Parity pin: the Rust authority (woollama-engine/src/lib.rs) parses
+    method/body/id_field/keep_alive with `.and_then(Value::as_str)`, which
+    SILENTLY treats a present-but-non-string value as absent (None) rather than
+    erroring. Only required fields (url, path) reject wrong types. This must
+    not raise."""
+    (tmp_path / "inferencers.toml").write_text(
+        '[management_protocols.weird]\n'
+        'kind = "rest"\n\n'
+        '[management_protocols.weird.endpoints.running]\n'
+        'url = "http://x/loaded"\n'
+        'path = "models"\n'
+        'id_field = 123\n\n'                        # wrong type, optional
+        '[management_protocols.weird.endpoints.start]\n'
+        'url = "http://x/load"\n'
+        'method = 42\n'                              # wrong type, optional
+        'body = true\n\n'                             # wrong type, optional
+        '[management_protocols.weird.endpoints.stop]\n'
+        'url = "http://x/unload"\n\n'
+        '[management_protocols.weird2]\n'
+        'kind = "ollama"\n'
+        'keep_alive = 99\n')                          # wrong type, optional
+
+    protos = config.load_management_protocols()
+    assert protos["weird"].running.id_field is None
+    assert protos["weird"].start.method is None
+    assert protos["weird"].start.body is None
+    assert protos["weird2"].keep_alive is None
+
+
 def test_load_management_protocols_running_requires_path(tmp_path):
     (tmp_path / "inferencers.toml").write_text(
         '[management_protocols.mybox]\n'
