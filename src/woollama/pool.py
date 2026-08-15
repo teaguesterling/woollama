@@ -12,15 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Protocol
 
 import httpx
 
-from . import resolver
+from . import config, resolver
+
+if TYPE_CHECKING:
+    from .inferencers import Inferencer
 
 log = logging.getLogger("woollama.pool")
 
@@ -63,22 +67,138 @@ class DeviceBackend(Protocol):
     async def unload(self, real_id: str) -> None: ...
 
 
-class RestBackend:
-    """The `DeviceBackend` for Tiiny's built-in device-management REST shape:
-    `GET {url}/api/v1/models/running`, `POST .../{id}/start`, `POST .../{id}/stop`."""
+_METHOD_TOKEN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 
-    def __init__(self, management_url: str, *,
-                 headers: dict[str, str] | None = None,
-                 client: httpx.AsyncClient | None = None,
-                 poll_interval: float = 0.5, load_timeout: float = 120.0,
-                 clock: Callable[[], float] = time.monotonic):
-        self._url = management_url.rstrip("/")
-        self._headers = dict(headers or {})
-        self._client = client or httpx.AsyncClient(timeout=30.0)
-        self._owns_client = client is None
+
+def _resolve_method(configured: str | None, default: str) -> str:
+    """Method parsed case-insensitively from an optional config override,
+    falling back to `default` when unset OR unparseable (an invalid method
+    string in config shouldn't fail startup; it just loses the override --
+    logged so the typo isn't silently invisible). Mirrors Rust's
+    `resolve_method` (pool.rs)."""
+    if configured is None:
+        return default
+    m = configured.upper()
+    if not _METHOD_TOKEN.match(m):
+        log.warning("management_protocols: invalid HTTP method %r, falling back to %s",
+                    configured, default)
+        return default
+    return m
+
+
+def _get_dotted(v, path: str):
+    """Dotted-path lookup into a parsed JSON value (`""` => the value itself;
+    `"a.b"` => `v["a"]["b"]`) -- how `RestBackend.list_loaded` finds the
+    running-models array/object inside an arbitrary config-defined response
+    shape. Mirrors Rust's `get_dotted` (pool.rs)."""
+    if path == "":
+        return v
+    cur = v
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+@dataclass(frozen=True)
+class _CompiledEndpoint:
+    """One HTTP call (`running`/`start`/`stop`) fully resolved against a base
+    URL and default headers, but still carrying an `{id}` placeholder in
+    `url`/`body`/header values -- substituted per-call by `render` (there's no
+    id yet at construction time for `start`/`stop`, and never one for
+    `running`). Mirrors Rust's `CompiledEndpoint` (pool.rs)."""
+    method: str
+    url: str
+    body: str | None
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def render(self, real_id: str | None) -> tuple[str, str, str | None, dict[str, str]]:
+        def sub(s: str) -> str:
+            return s.replace("{id}", real_id) if real_id is not None else s
+        url = sub(self.url)
+        body = sub(self.body) if self.body is not None else None
+        headers = {k: sub(v) for k, v in self.headers.items()}
+        return self.method, url, body, headers
+
+
+def _compile_endpoint(base: str, default_headers: dict[str, str],
+                       spec: config.EndpointSpec, default_method: str) -> _CompiledEndpoint:
+    """Build a `_CompiledEndpoint` from a config `EndpointSpec`: substitute
+    `{base}` into `url`/`body`/header values now (known at construction time),
+    merge `spec.headers` OVER `default_headers` (an endpoint header key
+    overrides the shared Bearer auth -- keyed CASE-INSENSITIVELY, since HTTP
+    header names are; both maps are folded to lowercase keys so e.g. an
+    endpoint header keyed `authorization` overrides a default `Authorization`,
+    never sending both), and default `content-type: application/json` when a
+    `body` is present and no `content-type` header was set either way. Mirrors
+    Rust's `compile_endpoint` (pool.rs) -- INCLUDING the case-insensitive merge
+    fix and the skip-just-the-offending-inferencer behavior it enables."""
+    def sub_base(s: str) -> str:
+        return s.replace("{base}", base)
+    method = _resolve_method(spec.method, default_method)
+    url = sub_base(spec.url)
+    body = sub_base(spec.body) if spec.body is not None else None
+    headers: dict[str, str] = {k.lower(): v for k, v in default_headers.items()}
+    for k, v in spec.headers.items():
+        headers[k.lower()] = sub_base(v)
+    if body is not None and "content-type" not in headers:
+        headers["content-type"] = "application/json"
+    return _CompiledEndpoint(method=method, url=url, body=body, headers=headers)
+
+
+class RestBackend:
+    """The `DeviceBackend` for config-defined (and Tiiny's built-in) REST
+    device-management shapes: three HTTP calls (list-loaded/start/stop), each
+    independently templated (`RestBackend.from_spec`). `RestBackend.tiiny` is
+    the Tiiny preset, expressed as a `from_spec` call with Tiiny's built-in
+    endpoints. Mirrors Rust's `RestBackend` (pool.rs)."""
+
+    def __init__(self, *, client: httpx.AsyncClient, owns_client: bool,
+                 running: _CompiledEndpoint, start: _CompiledEndpoint, stop: _CompiledEndpoint,
+                 running_path: str | None, running_id_field: str | None,
+                 poll_interval: float, load_timeout: float,
+                 clock: Callable[[], float]):
+        self._client = client
+        self._owns_client = owns_client
+        self._running = running
+        self._start = start
+        self._stop = stop
+        self._running_path = running_path
+        self._running_id_field = running_id_field
         self._poll = poll_interval
         self._load_timeout = load_timeout
         self._clock = clock
+
+    @classmethod
+    def from_spec(cls, base_url: str, *,
+                   default_headers: dict[str, str] | None = None,
+                   running: config.EndpointSpec, start: config.EndpointSpec,
+                   stop: config.EndpointSpec,
+                   poll_interval: float = 0.5, load_timeout: float = 120.0,
+                   client: httpx.AsyncClient | None = None,
+                   clock: Callable[[], float] = time.monotonic) -> "RestBackend":
+        """Build a `RestBackend` from a config `ProtocolSpec.Rest`'s three
+        endpoints. `{base}` (-> `base_url` trimmed of a trailing `/`) is
+        substituted into every `url`/`body`/header value now; `{id}` is
+        substituted per-call (see `_CompiledEndpoint.render`). Per-op method
+        defaults: GET for `running`, POST for `start`/`stop` (an explicit
+        `method` on the spec overrides). No further `${VAR}` expansion happens
+        here -- that already ran once over the whole `inferencers.toml` text
+        at config-load time (`config._expand_env`), matching Rust's
+        equally-upfront `expand_env` pass over the TOML text before parsing."""
+        base = base_url.rstrip("/")
+        owns_client = client is None
+        client = client or httpx.AsyncClient(timeout=30.0)
+        headers = dict(default_headers or {})
+        return cls(
+            client=client, owns_client=owns_client,
+            running=_compile_endpoint(base, headers, running, "GET"),
+            start=_compile_endpoint(base, headers, start, "POST"),
+            stop=_compile_endpoint(base, headers, stop, "POST"),
+            running_path=running.path, running_id_field=running.id_field,
+            poll_interval=poll_interval, load_timeout=load_timeout, clock=clock,
+        )
 
     @classmethod
     def tiiny(cls, management_url: str, *,
@@ -86,30 +206,72 @@ class RestBackend:
               client: httpx.AsyncClient | None = None,
               poll_interval: float = 0.5, load_timeout: float = 120.0,
               clock: Callable[[], float] = time.monotonic) -> "RestBackend":
-        """The Tiiny device-management REST shape -- the preset every
-        `management_protocol` resolution falls back to when an inferencer names
-        none (or names `"tiiny"` explicitly)."""
-        return cls(management_url, headers=headers, client=client,
-                    poll_interval=poll_interval, load_timeout=load_timeout,
-                    clock=clock)
+        """The Tiiny device-management REST shape (`GET {base}/api/v1/models/
+        running`, `POST .../{id}/start`, `POST .../{id}/stop`), expressed as a
+        `from_spec` call with Tiiny's built-in endpoints -- the preset every
+        `management_protocol` resolution falls back to when an inferencer
+        names none (or names `"tiiny"` explicitly)."""
+        running = config.EndpointSpec(url="{base}/api/v1/models/running", path="running")
+        start = config.EndpointSpec(url="{base}/api/v1/models/{id}/start")
+        stop = config.EndpointSpec(url="{base}/api/v1/models/{id}/stop")
+        return cls.from_spec(management_url, default_headers=headers,
+                              running=running, start=start, stop=stop,
+                              poll_interval=poll_interval, load_timeout=load_timeout,
+                              client=client, clock=clock)
+
+    async def _call(self, endpoint: _CompiledEndpoint, real_id: str | None) -> httpx.Response:
+        """Issue one templated call: apply `endpoint.render(real_id)`'s
+        method/url/body/headers to `self._client` and send it."""
+        method, url, body, headers = endpoint.render(real_id)
+        kwargs: dict = {"headers": headers}
+        if body is not None:
+            kwargs["content"] = body.encode()
+        return await self._client.request(method, url, **kwargs)
 
     async def list_loaded(self) -> set[str]:
         try:
-            r = await self._client.get(f"{self._url}/api/v1/models/running",
-                                       headers=self._headers)
+            r = await self._call(self._running, None)
         except httpx.HTTPError as exc:
             raise DeviceError(f"device unreachable: {exc}") from exc
         if not _ok(r.status_code):
             raise DeviceError(f"running query failed: {r.status_code} {r.text[:200]}")
         try:
-            return set(r.json().get("running") or [])
-        except (ValueError, AttributeError) as exc:
+            v = r.json()
+        except ValueError as exc:
             raise DeviceError(f"running query: bad JSON: {exc}") from exc
+        # `_get_dotted` returning `None` (key/path absent) is normal and means
+        # "no running models" -- the tiiny back-compat case: a device response
+        # with no "running" key at all (e.g. `{}`) must still resolve to an
+        # empty set, not an error. But a path that IS present and resolves to
+        # something other than a list is a config-typo signal (the author
+        # pointed `path` at the wrong field/shape) -- that gets a loud
+        # `DeviceError` naming the path and what it actually found, instead of
+        # silently treating it as "no models" and surfacing a much more
+        # confusing `load_timeout`-expiry "not running" error downstream.
+        path = self._running_path or ""
+        found = _get_dotted(v, path)
+        if found is None:
+            items = []
+        elif isinstance(found, list):
+            items = found
+        else:
+            raise DeviceError(
+                f"running query: path '{path}' is present but not an array: "
+                f"{str(found)[:200]}")
+        running: set[str] = set()
+        for item in items:
+            if self._running_id_field:
+                if isinstance(item, dict):
+                    val = item.get(self._running_id_field)
+                    if isinstance(val, str):
+                        running.add(val)
+            elif isinstance(item, str):
+                running.add(item)
+        return running
 
     async def load(self, real_id: str) -> None:
         try:
-            r = await self._client.post(
-                f"{self._url}/api/v1/models/{real_id}/start", headers=self._headers)
+            r = await self._call(self._start, real_id)
         except httpx.HTTPError as exc:
             raise DeviceError(f"start {real_id}: unreachable: {exc}") from exc
         if not _ok(r.status_code):
@@ -123,8 +285,7 @@ class RestBackend:
 
     async def unload(self, real_id: str) -> None:
         try:
-            r = await self._client.post(
-                f"{self._url}/api/v1/models/{real_id}/stop", headers=self._headers)
+            r = await self._call(self._stop, real_id)
         except httpx.HTTPError as exc:
             raise DeviceError(f"stop {real_id}: unreachable: {exc}") from exc
         if not _ok(r.status_code):
@@ -133,6 +294,79 @@ class RestBackend:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+
+_RESERVED_PROTOCOL_NAMES = ("tiiny", "ollama")
+
+
+def check_reserved_protocol_names(protocols: dict[str, config.ProtocolSpec]) -> None:
+    """Warn (once, up front) if a config `[management_protocols.<name>]` block
+    reuses a RESERVED built-in name (`tiiny`/`ollama`). That block is always
+    shadowed by the built-in of the same name (see `build_backend`), so
+    silently ignoring it would hide a config mistake. Mirrors Rust's
+    reserved-name loop in `PoolRegistry.from_registry` (pool.rs): warn-and-
+    ignore, not warn-and-use -- the built-in always wins."""
+    for reserved in _RESERVED_PROTOCOL_NAMES:
+        if reserved in protocols:
+            log.warning(
+                "management_protocols: config block '[management_protocols.%s]' "
+                "is shadowed by the built-in '%s' protocol and will be ignored",
+                reserved, reserved)
+
+
+def build_backend(inf: "Inferencer", protocols: dict[str, config.ProtocolSpec], *,
+                   headers: dict[str, str] | None = None,
+                   poll_interval: float = 0.5, load_timeout: float = 120.0,
+                   client: httpx.AsyncClient | None = None) -> "DeviceBackend | None":
+    """Resolve one inferencer's `management_protocol` (default `"tiiny"` when
+    unset) to a `DeviceBackend`: the built-in `"tiiny"` REST preset, a
+    config-defined `[management_protocols.<name>]` REST shape (`RestBackend
+    .from_spec`), or -- for `"ollama"` (built-in or a config block with
+    `kind = "ollama"`) -- `None` (Task 4 lands `OllamaBackend`; until then this
+    is a clearly-logged not-yet-implemented skip, not a hard failure, so it
+    composes with the same skip-just-this-inferencer policy as an unresolvable
+    name).
+
+    Caller contract: `None` means "skip this ONE inferencer's pool" -- a
+    `log.warning` naming the inferencer and protocol has already been emitted;
+    the caller must NOT let this fail every other inferencer's pool. Mirrors
+    the (already-merged, final-reviewed) Rust `PoolRegistry.from_registry`
+    per-inferencer `match` (pool.rs), which fixed exactly that
+    degrade-ALL-pools bug during review -- do not reproduce it here.
+
+    `inf.management_url` must be set (the caller only invokes this for
+    management-capable inferencers)."""
+    name = inf.management_protocol or "tiiny"
+    hdrs = headers or {}
+    if name == "tiiny":
+        return RestBackend.tiiny(inf.management_url, headers=hdrs,
+                                  poll_interval=poll_interval, load_timeout=load_timeout,
+                                  client=client)
+    if name == "ollama":
+        log.warning(
+            "management_protocols: inferencer '%s': built-in 'ollama' protocol "
+            "is not yet implemented -- skipping this inferencer's pool (other "
+            "inferencers are unaffected)", inf.name)
+        return None
+    spec = protocols.get(name)
+    if spec is None:
+        log.warning(
+            "management_protocols: inferencer '%s': unknown management_protocol "
+            "%r -- skipping this inferencer (its device pool is disabled; other "
+            "inferencers are unaffected)", inf.name, name)
+        return None
+    if isinstance(spec, config.RestProtocolSpec):
+        return RestBackend.from_spec(inf.management_url, default_headers=hdrs,
+                                      running=spec.running, start=spec.start, stop=spec.stop,
+                                      poll_interval=poll_interval, load_timeout=load_timeout,
+                                      client=client)
+    # isinstance(spec, config.OllamaProtocolSpec): same not-yet-implemented
+    # skip as the built-in "ollama" name above (Task 4 replaces both arms).
+    log.warning(
+        "management_protocols: inferencer '%s': protocol %r has kind=\"ollama\", "
+        "which is not yet implemented -- skipping this inferencer's pool (other "
+        "inferencers are unaffected)", inf.name, name)
+    return None
 
 
 class DeviceModelManager:
