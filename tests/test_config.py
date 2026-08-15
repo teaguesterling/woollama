@@ -309,3 +309,42 @@ def test_load_inferencers_rejects_non_table_virtual(monkeypatch, tmp_path):
     from woollama import config
     with pytest.raises(ValueError, match="virtual"):
         config.load_inferencers()
+
+
+# --- _expand_env: pin exact parity with Rust's expand_env --------------------
+#
+# woollama-engine/src/lib.rs::expand_env deliberately diverges from Python's
+# `os.path.expandvars` in two ways; `_expand_env` must match Rust, not
+# `expandvars`. See config.py's `_expand_env` docstring for the algorithm.
+
+def test_expand_env_set_braced_var_expands_to_value(monkeypatch):
+    monkeypatch.setenv("WOOLLAMA_TEST_SET", "hello")
+    from woollama import config
+    assert config._expand_env("x=${WOOLLAMA_TEST_SET}") == "x=hello"
+
+
+def test_expand_env_unset_braced_var_expands_to_empty_string(monkeypatch):
+    monkeypatch.delenv("WOOLLAMA_TEST_UNSET", raising=False)
+    from woollama import config
+    # Diverges from os.path.expandvars, which would leave the literal
+    # "${WOOLLAMA_TEST_UNSET}" text untouched.
+    assert config._expand_env("x=${WOOLLAMA_TEST_UNSET}y") == "x=y"
+
+
+def test_expand_env_braceless_var_is_left_literal(monkeypatch):
+    monkeypatch.setenv("VAR", "should-not-appear")
+    from woollama import config
+    # Diverges from os.path.expandvars, which would expand this.
+    assert config._expand_env("x=$VAR y") == "x=$VAR y"
+
+
+def test_expand_env_unclosed_brace_emits_literal_remainder_and_stops():
+    from woollama import config
+    assert config._expand_env("before ${FOO after") == "before ${FOO after"
+
+
+def test_expand_env_multiple_vars_in_one_string(monkeypatch):
+    monkeypatch.setenv("WOOLLAMA_TEST_A", "1")
+    monkeypatch.setenv("WOOLLAMA_TEST_B", "2")
+    from woollama import config
+    assert config._expand_env("${WOOLLAMA_TEST_A}-${WOOLLAMA_TEST_B}") == "1-2"

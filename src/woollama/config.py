@@ -10,10 +10,13 @@ When a user config file doesn't exist, the packaged default ships at
 && woollama` works out of the box with the bundled hello + textops example
 servers and the two example recipes.
 
-Env var substitution: `${VAR}` is expanded at load time using `os.path
-.expandvars`. The loader also sets `WOOLLAMA_EXAMPLES_DIR` to the absolute
-path of the package's `examples/` directory so the bundled defaults can
-reference the bundled example servers portably.
+Env var substitution: `${VAR}` is expanded at load time (unset -> empty
+string; an unclosed `${` is left literal; braceless `$VAR` is NOT expanded --
+see `_expand_env`, which mirrors Rust's `expand_env` in
+woollama-engine/src/lib.rs exactly). The loader also sets
+`WOOLLAMA_EXAMPLES_DIR` to the absolute path of the package's `examples/`
+directory so the bundled defaults can reference the bundled example servers
+portably.
 
 Override the config search dir entirely with `$WOOLLAMA_CONFIG_DIR`.
 """
@@ -67,9 +70,34 @@ def _examples_dir() -> Path:
 
 def _expand_env(text: str) -> str:
     """Apply env-var substitution. We set WOOLLAMA_EXAMPLES_DIR before
-    calling so the bundled defaults can reference packaged examples."""
+    calling so the bundled defaults can reference packaged examples.
+
+    Mirrors Rust's `expand_env` (woollama-engine/src/lib.rs) EXACTLY, which
+    diverges from `os.path.expandvars` in two ways this must match:
+      - only the BRACED `${VAR}` form is expanded; an UNSET var expands to
+        an empty string (`os.path.expandvars` would instead leave the
+        literal `${VAR}` text untouched);
+      - braceless `$VAR` is left EXACTLY as-is, never expanded (`os.path
+        .expandvars` would expand it).
+    An unclosed `${` (no matching `}`) emits the literal remainder unchanged
+    and stops scanning right there -- same as Rust's early `return`."""
     os.environ["WOOLLAMA_EXAMPLES_DIR"] = str(_examples_dir())
-    return os.path.expandvars(text)
+    out: list[str] = []
+    rest = text
+    while True:
+        pos = rest.find("${")
+        if pos == -1:
+            break
+        out.append(rest[:pos])
+        after = rest[pos + 2:]
+        end = after.find("}")
+        if end == -1:
+            out.append(rest[pos:])
+            return "".join(out)
+        out.append(os.environ.get(after[:end], ""))
+        rest = after[end + 1:]
+    out.append(rest)
+    return "".join(out)
 
 
 def _read_user_or_default(filename: str) -> tuple[str, str]:
