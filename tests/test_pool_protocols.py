@@ -321,6 +321,98 @@ async def test_build_backend_endpoint_header_overrides_default_auth_case_insensi
         mock.close()
 
 
+# --- Test E: default Bearer auth reaches a header-less endpoint ------------
+#
+# Test D above pins the header-OVERRIDE case (an endpoint header wins over
+# the default Bearer). This pins the complementary header-ABSENT case: an
+# endpoint (and protocol) that defines NO headers of its own must still carry
+# the inferencer's default Bearer auth on the wire -- `_compile_endpoint`
+# merges `spec.headers` OVER `default_headers`, so an empty `spec.headers`
+# must leave the default untouched, not drop it.
+
+async def test_build_backend_default_bearer_reaches_headerless_endpoint(monkeypatch):
+    monkeypatch.setenv("WOOLLAMA_TEST_DEVICE_TOKEN", "default-secret-2")
+    mock = RestMock(running_route="/status", start_route="/models/{id}/start",
+                     stop_route="/models/{id}/stop", running_field="running")
+    try:
+        # Deliberately no `headers=` on any endpoint -- the only headers that
+        # can reach the device are whatever `build_backend(headers=...)`
+        # supplies as `default_headers`.
+        running = config.EndpointSpec(url="{base}/status", path="running")
+        start = config.EndpointSpec(url="{base}/models/{id}/start", method="POST")
+        stop = config.EndpointSpec(url="{base}/models/{id}/stop", method="POST")
+        protocols = {"no-headers": config.RestProtocolSpec(running=running, start=start, stop=stop)}
+
+        inf = _device_inferencer("device", mock.url, management_protocol="no-headers",
+                                  api_key_env="WOOLLAMA_TEST_DEVICE_TOKEN")
+        hdrs = inf.headers()
+        assert hdrs == {"Authorization": "Bearer default-secret-2"}
+
+        backend = pool.build_backend(inf, protocols, headers=hdrs, poll_interval=0.01)
+        assert backend is not None
+        mgr = pool.DeviceModelManager(backend)
+        try:
+            await mgr.ensure_loaded("m1")
+
+            starts = mock.requests_to("/start")
+            assert len(starts) == 1, "exactly one start request"
+            assert header_count(starts[0], "authorization") == 1
+            assert starts[0]["headers"]["authorization"] == "Bearer default-secret-2", (
+                "the inferencer's default Bearer auth must reach the device when "
+                "neither the protocol nor the endpoint defines a header of its own")
+        finally:
+            await mgr.aclose()
+    finally:
+        mock.close()
+
+
+# --- Test F: invalid configured method falls back to the per-op default ----
+#
+# Mirrors Rust's `resolve_method`: an unparseable configured `method` (here,
+# containing a space -- not a valid HTTP token) must not fail startup; it
+# just loses the override and falls back to the per-op default (GET for
+# `running`, POST for `start`/`stop`), logging a warning so the typo isn't
+# silently invisible.
+
+async def test_build_backend_invalid_configured_method_falls_back_to_op_default(caplog):
+    mock = RestMock(running_route="/status", start_route="/models/{id}/start",
+                     stop_route="/models/{id}/stop", running_field="running")
+    try:
+        running = config.EndpointSpec(url="{base}/status", path="running",
+                                       method="not a method")
+        start = config.EndpointSpec(url="{base}/models/{id}/start",
+                                     method="also not valid")
+        stop = config.EndpointSpec(url="{base}/models/{id}/stop")
+        protocols = {"bad-method": config.RestProtocolSpec(running=running, start=start, stop=stop)}
+        inf = _device_inferencer("device", mock.url, management_protocol="bad-method")
+
+        with caplog.at_level(logging.WARNING, logger="woollama.pool"):
+            backend = pool.build_backend(inf, protocols, poll_interval=0.01)
+        assert backend is not None
+        mgr = pool.DeviceModelManager(backend)
+        try:
+            await mgr.ensure_loaded("m1")
+
+            status_reqs = mock.requests_to("/status")
+            assert status_reqs, "expected at least one running-query request"
+            assert status_reqs[0]["method"] == "GET", (
+                "an invalid configured method on 'running' must fall back to GET")
+
+            starts = mock.requests_to("/start")
+            assert len(starts) == 1, "exactly one start request"
+            assert starts[0]["method"] == "POST", (
+                "an invalid configured method on 'start' must fall back to POST")
+        finally:
+            await mgr.aclose()
+
+        assert any("not a method" in rec.message for rec in caplog.records), (
+            "the invalid 'running' method must be logged so the typo isn't invisible")
+        assert any("also not valid" in rec.message for rec in caplog.records), (
+            "the invalid 'start' method must be logged so the typo isn't invisible")
+    finally:
+        mock.close()
+
+
 # --- Reserved-name shadow warning -------------------------------------------
 
 def test_check_reserved_protocol_names_warns_on_shadowed_builtin(caplog):

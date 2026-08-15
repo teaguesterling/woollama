@@ -20,6 +20,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from woollama import config, pool, router
 from woollama.inferencers import Inferencer
 
+_UNSET = object()
+
 
 class OllamaMock:
     """In-process stand-in for Ollama's `:11434` management surface.
@@ -31,11 +33,18 @@ class OllamaMock:
     /api/ps` reflects exactly what `OllamaBackend.load`/`unload` just did,
     the same way the real device would."""
 
-    def __init__(self, *, fail_generate: bool = False, fail_ps: bool = False):
+    def __init__(self, *, fail_generate: bool = False, fail_ps: bool = False,
+                 ps_response: object = _UNSET):
         self.loaded: set[str] = set()
         self.generate_calls: list[dict] = []
         self.fail_generate = fail_generate
         self.fail_ps = fail_ps
+        # When set (not _UNSET), `GET /api/ps` serves this literal JSON value
+        # instead of the normal `{"models": [...]}` computed from `loaded` --
+        # mirrors `RestMock.running_non_array` (tests/test_pool_protocols.py),
+        # for testing OllamaBackend.list_loaded's defensive parsing of an
+        # unexpected /api/ps shape (missing "models" key, malformed items).
+        self.ps_response = ps_response
         self._lock = threading.Lock()
         mock = self
 
@@ -58,6 +67,9 @@ class OllamaMock:
                     with mock._lock:
                         if mock.fail_ps:
                             self._json(500, {"error": "ps failed"})
+                            return
+                        if mock.ps_response is not _UNSET:
+                            self._json(200, mock.ps_response)
                             return
                         models = [{"name": m} for m in sorted(mock.loaded)]
                     self._json(200, {"models": models})
@@ -151,6 +163,49 @@ async def test_list_loaded_parses_multiple_models_from_api_ps():
         backend = pool.OllamaBackend(mock.url)
         try:
             assert await backend.list_loaded() == {"qwen3", "llama3"}
+        finally:
+            await backend.aclose()
+    finally:
+        mock.close()
+
+
+# --- /api/ps missing the "models" key entirely: empty set, not a KeyError --
+#
+# Mirrors Rust's `v.get("models").and_then(Value::as_array)`: an absent
+# "models" key is just "no running models" (defensive parsing of an
+# unexpected response shape), never a crash.
+
+async def test_list_loaded_missing_models_key_yields_empty_set():
+    mock = OllamaMock(ps_response={})
+    try:
+        backend = pool.OllamaBackend(mock.url)
+        try:
+            assert await backend.list_loaded() == set()
+        finally:
+            await backend.aclose()
+    finally:
+        mock.close()
+
+
+# --- /api/ps with malformed items: skipped, not raised -----------------
+#
+# Mirrors Rust's `filter_map(|item| item.get("name").and_then(Value::as_str)
+# .map(String::from))`: a non-object item, or an object whose "name" is not
+# a string, is silently skipped -- only well-formed {"name": <str>} entries
+# contribute to the loaded set.
+
+async def test_list_loaded_skips_malformed_items_in_models_array():
+    mock = OllamaMock(ps_response={"models": [
+        {"name": "ok1"},
+        {"name": 123},          # non-string name -- skipped
+        "just-a-string",        # non-dict item -- skipped
+        {"notname": "x"},       # missing "name" -- skipped
+        {"name": "ok2"},
+    ]})
+    try:
+        backend = pool.OllamaBackend(mock.url)
+        try:
+            assert await backend.list_loaded() == {"ok1", "ok2"}
         finally:
             await backend.aclose()
     finally:
