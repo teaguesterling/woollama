@@ -165,6 +165,12 @@ pub fn scan_vars(system: &str) -> Vec<String> {
 pub struct McpServerSpec {
     pub command: String,
     pub args: Vec<String>,
+    /// Extra environment for the spawned server, merged OVER the scrubbed base env
+    /// (`mcp_registry::merged_env`) — explicit entries win, but nothing arrives by
+    /// inheritance. Restores parity with the Python reference, which parses this key
+    /// (`config.py:136`) and hands it to `StdioServerParameters.env` (`manager.py:89`)
+    /// rather than argv, where a secret would show up in `ps`.
+    pub env: HashMap<String, String>,
 }
 
 fn read_user_or_default(filename: &str, default: &str) -> String {
@@ -417,7 +423,16 @@ pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            out.insert(name.clone(), McpServerSpec { command, args });
+            let env = s
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert(name.clone(), McpServerSpec { command, args, env });
         }
     }
     Ok(out)
@@ -567,5 +582,33 @@ mod tests {
         std::env::remove_var("WOOLLAMA_CONFIG_DIR");
         assert!(out.is_empty(), "no [patterns] block → no patterns");
         let _ = std::fs::remove_dir_all(&none);
+    }
+
+    /// Load `mcp.json` from a throwaway config dir. `WOOLLAMA_CONFIG_DIR` is process-global,
+    /// so callers must run their cases sequentially inside ONE `#[test]` (see `load_patterns`).
+    fn servers_from(json: &str) -> Result<HashMap<String, McpServerSpec>, String> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mcp.json"), json).unwrap();
+        std::env::set_var("WOOLLAMA_CONFIG_DIR", dir.path());
+        let out = load_mcp_servers();
+        std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+        out
+    }
+
+    #[test]
+    fn mcp_server_env_block_is_parsed() {
+        // The Python reference parses this key (config.py:136) and hands it to the spawned
+        // server via StdioServerParameters.env (manager.py:89). woollamad dropped it in the
+        // Rust port, so a documented key was silently ignored; this pins it restored.
+        let servers = servers_from(
+            r#"{"mcpServers": {"git": {"command": "git-mcp", "env": {"GIT_AUTHOR_NAME": "woollama"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(servers["git"].env.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
+
+        // Case 2 (SAME test fn — `WOOLLAMA_CONFIG_DIR` is process-global): an absent `env` is
+        // an empty map, not an error.
+        let servers = servers_from(r#"{"mcpServers": {"hello": {"command": "hi"}}}"#).unwrap();
+        assert!(servers["hello"].env.is_empty(), "absent 'env' is an empty map, not an error");
     }
 }

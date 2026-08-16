@@ -42,6 +42,16 @@ fn scrubbed_env() -> HashMap<String, String> {
         .collect()
 }
 
+/// The scrubbed base env with the spec's `env` block merged OVER it — explicit entries win.
+/// The scrub stays a floor: nothing reaches a tool server by inheritance, but an operator can
+/// deliberately name a var (including a provider key) in mcp.json. Mirrors the Python
+/// reference, where `StdioServerParameters.env` merges over the SDK's safe default env.
+fn merged_env(spec_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = scrubbed_env();
+    env.extend(spec_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
 /// default 30s. Bounds startup so a hung downstream server can't wedge the daemon.
 fn connect_timeout() -> std::time::Duration {
@@ -129,7 +139,7 @@ impl McpRegistry {
         // Scrub the child env: a downstream tool server must NOT inherit the daemon's
         // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
         // and the Python MCP SDK's default-scrubbed stdio environment.
-        cmd.args(&spec.args).env_clear().envs(scrubbed_env());
+        cmd.args(&spec.args).env_clear().envs(merged_env(&spec.env));
         let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
         let running = ().serve(transport).await.map_err(|e| e.to_string())?;
         let peer = running.peer().clone();
@@ -294,9 +304,15 @@ mod tests {
         std::env::set_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS", "1");
         let mut specs = HashMap::new();
         // `sleep` spawns but never speaks MCP -> the initialize handshake hangs -> timed out.
-        specs.insert("hung".to_string(), McpServerSpec { command: "sleep".into(), args: vec!["30".into()] });
+        specs.insert(
+            "hung".to_string(),
+            McpServerSpec { command: "sleep".into(), args: vec!["30".into()], env: HashMap::new() },
+        );
         // `false` exits immediately -> connect_one errors -> skipped.
-        specs.insert("dead".to_string(), McpServerSpec { command: "false".into(), args: vec![] });
+        specs.insert(
+            "dead".to_string(),
+            McpServerSpec { command: "false".into(), args: vec![], env: HashMap::new() },
+        );
         let start = std::time::Instant::now();
         let reg = McpRegistry::connect(specs).await;
         let elapsed = start.elapsed();
@@ -306,6 +322,36 @@ mod tests {
         );
         assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
         std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spec_env_merges_over_the_scrub_without_reopening_it() {
+        std::env::set_var("ANTHROPIC_API_KEY", "leak-me");
+        let mut spec_env = HashMap::new();
+        spec_env.insert("GIT_AUTHOR_NAME".to_string(), "woollama".to_string());
+        let merged = merged_env(&spec_env);
+        // The half that makes the feature work.
+        assert_eq!(merged.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
+        // The half that rots if nobody pins it: the scrub is still a floor. Nothing reaches a
+        // tool server by inheritance just because the spec has an `env` block.
+        assert!(
+            !merged.contains_key("ANTHROPIC_API_KEY"),
+            "a non-allow-listed var must not reach the server just because `env` exists"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spec_env_can_deliberately_reinject_a_provider_key() {
+        let mut spec_env = HashMap::new();
+        spec_env.insert("ANTHROPIC_API_KEY".to_string(), "on-purpose".to_string());
+        // Explicit, in the operator's config, greppable — categorically different from
+        // inheriting one silently. Pinned so nobody later "hardens" it into a surprise.
+        assert_eq!(
+            merged_env(&spec_env).get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("on-purpose")
+        );
     }
 
     #[test]
