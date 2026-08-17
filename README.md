@@ -220,9 +220,10 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
 ## What works today
 
 - OpenAI surface: `/v1/models`, `/v1/chat/completions` (pass-through +
-  recipe orchestration, both with `stream:true` → OpenAI SSE), `/v1/tools`
-  introspection, plus `/v1/images/generations` and `/v1/embeddings`
-  pass-through (see below)
+  recipe orchestration, both with `stream:true` → OpenAI SSE), plus
+  `/v1/images/generations` and `/v1/embeddings` pass-through (see below).
+  (`/v1/tools` introspection is Python-reference-only today — see
+  [#23](https://github.com/teaguesterling/woollama/issues/23))
 - **Stateful surface**: `/v1/responses` (stateless subset, incl. `stream:true` →
   OpenAI Responses SSE, + stateful) and `/v1/conversations` (create/list/get/
   delete, plus `items` where the backend exposes its transcript). woollama routes
@@ -255,6 +256,13 @@ Lint only — the project does not use `ruff format` (lines are hand-wrapped,
   the same port — recipes as **parameterized prompts** (their `{{var}}` tokens →
   arguments), a `chat` verb (with live tool-progress notifications), and every
   downstream tool re-exported with its `output_schema` (aggregator)
+- **MCP client side, stdio *and* HTTP**: an `mcp.json` server is either a
+  `command` (stdio subprocess) or a `url` (Streamable HTTP). Since woollama also
+  *serves* `/mcp`, the `url` form is how **one woollamad consumes another** — an
+  inference-holding instance reaching a tools-only instance's namespace, so the
+  tools instance can hold zero provider API keys. Credentials are `${VAR}` in
+  `headers`, validated fail-closed at load. `woollamad check-config` validates
+  every config file and exits non-zero on any problem
 - **Pattern templating** on woollama's own `/w1/` namespace (not OpenAI's `/v1/`):
   parameterized recipes/patterns with `{{var}}` substitution —
   `GET /w1/patterns` (discovery), `POST /w1/patterns/{name}/render` (assemble),

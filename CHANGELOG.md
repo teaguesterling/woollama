@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+## v0.12.0 — 2026-08-16
+
+**`woollamad` can consume downstream MCP servers over Streamable HTTP.** An
+`mcp.json` server is now either a `command` (stdio subprocess, as before) or a
+`url`. Because woollama already *serves* `/mcp`, the `url` form is how one
+woollamad consumes another — an inference-holding instance reaching a tools-only
+instance's namespace, so the tools instance can hold zero provider API keys and a
+compromise there exposes read-only corpora rather than the ability to spend money.
+Rust-only: `woollamad` is the canonical router, and the Python reference (the
+differential-test oracle) still requires `command`. The `woollama-server` crate
+and the `woollama` PyPI package move to 0.12.0; `woollama-engine` (0.11.0) and
+`woollama-core` (0.8.0) are unchanged.
+
+> **Not yet validated against a real remote.** This ships verified between two
+> loopback `woollamad` processes on one host, driven with a real Streamable-HTTP
+> handshake. It has **not** been exercised across a LAN, through a reverse proxy,
+> with TLS, or with a proxy-injected credential — a materially different failure
+> surface. Acceptance against a real downstream is pending.
+
+- **`url` + `headers` in `mcp.json`** (issue #19). `McpServerSpec` becomes an enum
+  over transport; `connect_one` branches on the variant. Everything after
+  `.serve(transport)` — peer handling, `list_all_tools`, the `wire_index` — is
+  unchanged, so re-export, dispatch and the recipe allow-list work identically for
+  an HTTP downstream.
+- **Credentials use the existing `${VAR}` expansion**, not a second secrets path —
+  the same shape as `api_key_env` for inferencers. Header values are **validated
+  fail-closed at load**: `engine::expand_env` resolves an unset variable to the
+  empty string, so `"Bearer ${TOKEN}"` with `TOKEN` unset would otherwise produce
+  the literal header `Bearer ` — a well-formed request carrying *no credential*,
+  which a permissive downstream accepts while everything reports healthy. An empty
+  value or a bare `Authorization` scheme now invalidates that server. Sending
+  `headers` to a non-loopback plain `http://` URL warns. (The general `expand_env`
+  fail-open is filed as #21.)
+- **Secrets stay out of `Debug`.** `HttpSpec` and `StdioSpec` implement `Debug` by
+  hand, printing header/env *names* only and dropping the URL query string —
+  `env` is a documented home for a provider key, `headers` for a bearer, and a URL
+  can carry `?token=`. A derived `Debug` would put all three into any `{:?}`, log
+  line, or panic message.
+- **BUGFIX — `env` restored.** The Python reference parses `mcp.json`'s `env`
+  (`config.py`) and forwards it to `StdioServerParameters.env` (`manager.py`); the
+  Rust port dropped it silently, so a key documented in `docs/configuration.md`
+  was ignored with no message. It is merged **over** the scrubbed base env —
+  explicit entries win, but nothing arrives by inheritance, so the child-env scrub
+  stays a floor. An operator can deliberately re-inject a provider key by naming
+  it, which is explicit and greppable rather than silent.
+- **BUGFIX — claude-code delegation forwards `env`.** It previously emitted only
+  `{command, args}`, so after the fix above a stdio server would have worked in
+  woollama's own loop and silently misbehaved under delegation, both paths
+  reporting success.
+- **A `url` server cannot be delegated to claude-code.** A recipe whose tools
+  reference one is rejected with a 400 naming the server, rather than translated:
+  the child `claude` process would connect to a network peer woollama never
+  brokers, outside the allow-list boundary that makes delegation containable.
+- **An invalid `mcp.json` entry is skipped, not fatal to its siblings.** One
+  server's typo must not cost an operator the other eleven — `build_state`
+  degrades a load error to an empty registry, so a whole-file abort would start
+  the daemon "healthy" with zero MCP servers. Only unparseable JSON leaves woollama
+  with no servers. A non-string `env` value is now an error rather than a silent
+  drop, matching `headers`.
+- **NEW — `woollamad check-config`.** Because a bad entry is skipped rather than
+  fatal, its only runtime trace is a boot-log line. This subcommand validates
+  `mcp.json`, `recipes.toml` and `inferencers.toml`, reports which servers are
+  usable and which were skipped and why, and **exits non-zero** on any problem. It
+  connects to nothing and binds nothing, so it is safe against a live deployment's
+  config dir and suitable for gating a reload or a CI job.
+- **Docs** — `docs/configuration.md` documents the `url` form and now splits a
+  claim that was true only of the Python server: on a downstream that fails to
+  start, `woollamad` logs and skips while the Python reference aborts startup.
+- Also filed while building this: #21 (`expand_env` fails open), #22 (`wire_name`'s
+  hash fallback uses `DefaultHasher`, whose algorithm is not stable across Rust
+  releases — federation is what pushes tool names onto that path), #23 (`/v1/tools`
+  exists only in the Python reference). `docs/roadmap.md` also records that
+  federation **loop protection is deferred, not solved**: mutual A→B→A cycles are
+  reachable through ordinary restarts and are unguarded.
+
 ## v0.11.0 — 2026-08-15
 
 **Pluggable device-management protocols reach the Python reference server, and the
