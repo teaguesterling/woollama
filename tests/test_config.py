@@ -434,3 +434,47 @@ def test_documentation_keys_are_not_scanned_for_variables(monkeypatch, tmp_path)
         '{"_doc": "use ${WOOLLAMA_T_DOCONLY} like this", "mcpServers": {}}'
     )
     assert config.load_mcp_servers() == {}
+
+
+def test_a_server_name_is_not_a_documentation_key(monkeypatch, tmp_path):
+    """`_` marks a documentation KEY, not a namespace.
+
+    Skipping `_`-prefixed keys at every depth also skipped MCP server NAMES, so
+    `_disabled` passed the check and then LOADED with a silently-empty command
+    -- while Rust, which does not skip server names, refused the same file.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_MISSING", raising=False)
+    from woollama import config
+
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"_disabled": {"command": "${WOOLLAMA_T_MISSING}/x"}}}'
+    )
+    with pytest.raises(ValueError):
+        config.load_mcp_servers()
+
+
+def test_inferencers_toml_documentation_keys_are_not_scanned(monkeypatch, tmp_path):
+    """A `_`-prefixed TOML key is prose, matching the JSON rule and Rust.
+
+    The Rust TOML walker skipped comments but not `_` keys, so the same file
+    loaded here and hard-failed there -- the cross-implementation divergence
+    both sides exist to prevent.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_MISSING", raising=False)
+    from woollama import config
+
+    (tmp_path / "inferencers.toml").write_text(
+        '# see ${WOOLLAMA_T_MISSING}\n'
+        '_doc = "also set ${WOOLLAMA_T_MISSING}"\n'
+        '[inferencers.x]\nbase_url = "http://h/v1"\n'
+    )
+    assert "x" in config.load_inferencers()
+
+    # But a real value referencing it IS refused.
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.x]\nbase_url = "${WOOLLAMA_T_MISSING}/v1"\n'
+    )
+    with pytest.raises(ValueError):
+        config.load_inferencers()

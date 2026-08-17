@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Capability-aware routing (#20)
+
+- **`<provider>/default` picks a model that can serve the endpoint.** `default` is never asked in
+  the abstract — it is asked *at* an endpoint — so on a device holding an embedder, a reranker and
+  a chat model, two of the three were never candidates. Capability comes from the backend where it
+  publishes one (the `device` protocol carries it in the payload woollama already fetches, so
+  discovery costs no extra call), and from `[inferencers.<name>.capabilities]` glob patterns where
+  it does not.
+- **Declare what a model *is*, not what may chat.** A positive allow-list requires naming every
+  model that might ever legitimately serve the endpoint — on a shared device that means predicting
+  what other consumers will load. Observed in production: a peer session loaded a chat model nobody
+  had listed and every allow-list-shaped route failed. Exclusions survive models you did not
+  foresee.
+- **Pre-dispatch validation**: a request naming a model declared for another capability is refused
+  with `400` naming what it *is*, rather than sent to a backend that may respond by taking the
+  whole model service down. **`GET /v1/models`** annotates declared capability; absent never means
+  "cannot".
+- Precedence is **config → discovery → unknown**, and unknown is always eligible, so a backend
+  that publishes nothing and has no declarations behaves exactly as before.
+
+### Config variables (#21)
+
+- **`${VAR:-default}`** — POSIX `:-` semantics (unset *or* empty takes the fallback), in **both**
+  implementations, because a config file is read by both and a Rust-only syntax would behave
+  differently depending on which loaded it.
+- **A bare `${VAR}` that is not set is now a hard load error.** woollamad refuses to start, naming
+  every offending variable and pointing at `check-config`; the Python reference likewise refuses.
+  Safe to do only because `:-` exists: without a way to say "absent is intended", refusing would
+  break configurations that legitimately depend on an optional value — including the bundled
+  default, which now declares its own fallback.
+- A variable that is **set but empty** is not missing — `FOO=` is an explicit operator choice.
+  Inside a server's `env` block it is still *warned* about, because there the consumer is a child
+  process woollama cannot check for.
+- The check runs on the **parsed** structure, so a `${VAR}` appearing only in documentation
+  (`_`-prefixed keys in JSON and TOML, TOML comments) is prose and never fails a load. Applies to
+  `mcp.json` and `inferencers.toml`.
+
+### Fixes
+
+- **`default` no longer blames a config that is fine.** The fail-open warning fired whenever the
+  candidate set came back empty, including when the residency read itself *failed* — telling an
+  operator to fix a correct config while three models were resident and the real cause was a 401.
+
+
 ## v0.13.0 — 2026-08-17
 
 **Downstream MCP servers reconnect on their own, per-server health is visible, and
