@@ -497,6 +497,20 @@ impl DeviceBackend for OllamaBackend {
     }
 }
 
+/// What the device is running, plus whether we could actually see it.
+///
+/// The distinction is load-bearing for anything reasoning about an EMPTY set. "The query succeeded
+/// and nothing matched" and "the query failed" produce the same empty vec but justify opposite
+/// advice — the first means the operator's expectations are wrong, the second means we are blind.
+/// Conflating them yields a confident instruction derived from missing information, which
+/// misdirects rather than confuses.
+pub struct Residency {
+    pub models: Vec<String>,
+    /// False when the most recent device query failed. `models` is then a last-known view, and an
+    /// empty one means "we could not see", NOT "nothing is loaded".
+    pub current: bool,
+}
+
 pub struct DeviceModelManager {
     backend: Arc<dyn DeviceBackend>,
     retry_after: f64,
@@ -744,23 +758,27 @@ impl DeviceModelManager {
     /// Best-effort: it runs on the request path, so a device that is down must not turn into an
     /// earlier, different error than the one the request itself will produce. A failed read leaves
     /// the previous view in place and is not latched.
-    pub async fn residency(&self) -> Vec<String> {
+    pub async fn residency(&self) -> Residency {
         if self.fresh_enough() {
-            return self.snapshot();
+            return Residency { models: self.snapshot(), current: true };
         }
         let _guard = self.residency_lock.lock().await;
         // Re-check: another request may have refreshed while we waited for the lock.
         if self.fresh_enough() {
-            return self.snapshot();
+            return Residency { models: self.snapshot(), current: true };
         }
+        let mut current = true;
         match self.backend.list_loaded().await {
             Ok(running) => {
                 self.reconcile(&running);
                 *self.residency_read_at.lock().unwrap() = Some(std::time::Instant::now());
             }
-            Err(e) => eprintln!("woollamad: could not read device residency (using last known): {e}"),
+            Err(e) => {
+                eprintln!("woollamad: could not read device residency (using last known): {e}");
+                current = false;
+            }
         }
-        self.snapshot()
+        Residency { models: self.snapshot(), current }
     }
 
     fn fresh_enough(&self) -> bool {

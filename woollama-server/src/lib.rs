@@ -1206,7 +1206,8 @@ fn warn_fail_open(name: &str) {
 ///
 /// Fails open: with no `models` configured, every resident stays a candidate, so a backend that
 /// never declares a catalog behaves as before.
-fn default_candidates(inf: &engine::Inferencer, residency: Vec<String>) -> Vec<String> {
+fn default_candidates(inf: &engine::Inferencer, residency: pool::Residency) -> Vec<String> {
+    let pool::Residency { models: residency, current } = residency;
     let mut candidates: Vec<String> = if inf.models.is_empty() {
         residency
     } else {
@@ -1222,7 +1223,13 @@ fn default_candidates(inf: &engine::Inferencer, residency: Vec<String>) -> Vec<S
         // Reliably wrong is easier to diagnose than usually wrong, but only if it is announced;
         // silently it just looks like the router is broken.
         if filtered.is_empty() {
-            warn_fail_open(&inf.name);
+            // ONLY when we actually saw the device. An empty set from a FAILED read means we are
+            // blind, not that the operator's `models` list is wrong — and telling someone to fix a
+            // config that is fine sends them to the wrong place, especially when they have just
+            // edited it. The read failure logs its own specific line; that one is enough.
+            if current {
+                warn_fail_open(&inf.name);
+            }
             residency
         } else {
             filtered
@@ -1762,7 +1769,11 @@ mod default_candidate_tests {
         }
     }
 
-    fn residency() -> Vec<String> {
+    fn current(models: Vec<String>) -> pool::Residency {
+        pool::Residency { models, current: true }
+    }
+
+    fn residency_models() -> Vec<String> {
         // Device-wide residency, as a real device reports it: a chat model plus two that cannot
         // serve chat at all.
         ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B", "Qwen/Qwen3.6-35B-A3B-turbo"]
@@ -1776,7 +1787,7 @@ mod default_candidate_tests {
         // The reported failure: `default` picked the embedder, which was never in this
         // inferencer's `models` list, and the backend rejected it as "not loaded" — it IS loaded,
         // just not servable on the chat endpoint.
-        let got = default_candidates(&inf(&["Qwen/Qwen3.6-35B-A3B-turbo"], None), residency());
+        let got = default_candidates(&inf(&["Qwen/Qwen3.6-35B-A3B-turbo"], None), current(residency_models()));
         assert_eq!(got, vec!["Qwen/Qwen3.6-35B-A3B-turbo".to_string()]);
     }
 
@@ -1787,17 +1798,17 @@ mod default_candidate_tests {
         // Rust's per-process hash seed. `default` was therefore stable within a process and
         // different in the next one.
         let i = inf(&[], None);
-        let first = default_candidates(&i, residency());
-        let mut shuffled = residency();
+        let first = default_candidates(&i, current(residency_models()));
+        let mut shuffled = residency_models();
         shuffled.reverse();
-        assert_eq!(first, default_candidates(&i, shuffled), "same residency ⇒ same choice, any input order");
+        assert_eq!(first, default_candidates(&i, current(shuffled)), "same residency ⇒ same choice, any input order");
     }
 
     #[test]
     fn a_resident_virtual_default_wins_the_tiebreak() {
         let got = default_candidates(
             &inf(&[], Some("Qwen/Qwen3.6-35B-A3B-turbo")),
-            residency(),
+            current(residency_models()),
         );
         assert_eq!(got[0], "Qwen/Qwen3.6-35B-A3B-turbo", "a configured default that IS resident wins");
     }
@@ -1810,10 +1821,10 @@ mod default_candidate_tests {
         // mixed-residency device means a hard failure EVERY time rather than intermittently.
         // Determinism makes it diagnosable; the warning makes it discoverable.
         let i = inf(&["Qwen/Qwen3-30B-A3B-Instruct"], Some("Qwen/Qwen3-30B-A3B-Instruct"));
-        let got = default_candidates(&i, residency());
+        let got = default_candidates(&i, current(residency_models()));
         assert_eq!(got.len(), 3, "falls open to every resident rather than reporting none loaded");
         assert_eq!(got, {
-            let mut r = residency();
+            let mut r = residency_models();
             r.sort();
             r
         }, "and does so deterministically — same input, same order, every process");
@@ -1822,10 +1833,10 @@ mod default_candidate_tests {
     #[test]
     fn no_configured_models_keeps_every_resident_a_candidate() {
         // Fail open: a backend that declares no catalog must behave as before.
-        assert_eq!(default_candidates(&inf(&[], None), residency()).len(), 3);
+        assert_eq!(default_candidates(&inf(&[], None), current(residency_models())).len(), 3);
         // And if nothing resident is a configured model, don't report an empty set — let the
         // caller's virtual.default / load-on-demand path handle it.
-        assert_eq!(default_candidates(&inf(&["Not/Resident"], None), residency()).len(), 3);
+        assert_eq!(default_candidates(&inf(&["Not/Resident"], None), current(residency_models())).len(), 3);
     }
 }
 
