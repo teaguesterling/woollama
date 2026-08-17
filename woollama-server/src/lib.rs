@@ -545,9 +545,11 @@ fn referenced_mcp_servers(
                 json!({"command": s.command, "args": s.args, "env": s.env})
             }
             // Refused rather than translated. Claude Code's mcp.json CAN express an HTTP server,
-            // but emitting one would (a) have the child connect to the downstream directly,
-            // outside woollama's allow-list boundary, and (b) write its bearer token into a temp
-            // config file for another process. Neither is in scope for issue #19.
+            // but emitting one would have the child connect to the downstream ITSELF — a network
+            // peer woollama never brokers — putting it outside the allow-list boundary that makes
+            // delegation containable. (Secrets on disk are not the distinction: the stdio arm
+            // above already writes `env` into the same file, which `claude_code` creates under a
+            // 0700 `tempfile::tempdir()` that unlinks on drop.) Out of scope for issue #19.
             config::McpServerSpec::Http(_) => {
                 return Err(EngineError::new(
                     format!(

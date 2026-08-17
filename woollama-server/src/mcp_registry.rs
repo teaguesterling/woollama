@@ -69,7 +69,15 @@ fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwe
         headers.insert(name, value);
     }
     let config = StreamableHttpClientTransportConfig::with_uri(spec.url.clone()).custom_headers(headers);
-    Ok(StreamableHttpClientTransport::with_client(reqwest::Client::new(), config))
+    // `Client::new()` PANICS if a TLS backend or the system resolver config can't be initialized
+    // (a minimal container with no CA bundle or a broken /etc/resolv.conf). connect_one runs as a
+    // plain future inside build_state, not a spawned task, so that panic would unwind into main
+    // and the daemon would never start — defeating the logged-and-skipped contract every other
+    // downstream failure honours. Build fallibly and let it be one skipped server.
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("could not build the HTTP client for this downstream: {e}"))?;
+    Ok(StreamableHttpClientTransport::with_client(client, config))
 }
 
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,

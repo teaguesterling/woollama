@@ -66,13 +66,23 @@ tools-only instance's namespace without either spawning the other's servers.
 secrets mechanism: `${VAR}` expansion already applies to `mcp.json`, the same
 shape as `api_key_env` for inferencers.
 
-Header values are validated at load — an empty value, or a bare auth scheme with
-nothing after it, is a startup error naming the server and header. This is
-deliberate: `${VAR}` expansion resolves an **unset** variable to the empty
-string, so `"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset would otherwise
-produce the literal header `Bearer ` — a well-formed request carrying no
-credential, which a permissive downstream accepts while everything reports
-healthy.
+Header values are validated at load. An empty value, or a bare `Authorization`
+scheme with nothing after it, makes **that server** invalid: it is logged and
+skipped, and the rest of `mcp.json` loads normally. This is deliberate: `${VAR}`
+expansion resolves an **unset** variable to the empty string, so
+`"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset would otherwise produce the
+literal header `Bearer ` — a well-formed request carrying no credential, which a
+permissive downstream accepts while everything reports healthy.
+
+The same per-server scoping applies to every other invalid entry (setting both
+`command` and `url`, setting neither, a non-string `env`/`headers` value): the
+bad server is skipped with a warning naming it, never taking its siblings with
+it. Only `mcp.json` being unparseable JSON — where nothing is recoverable —
+leaves woollama with no servers at all.
+
+woollama also warns when a server sends `headers` to a plain `http://` URL that
+isn't loopback, since that puts the credential on the network in cleartext on
+every request.
 
 `env` has no meaning for a `url` server (there is no child process), and the
 child-env scrub below likewise applies only to the stdio form. A `url` server
