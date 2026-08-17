@@ -451,12 +451,37 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | Field | Required | Description |
 |---|---|---|
 | `management_url` | — | Base URL of the backend's model-management API (`GET/POST /api/v1/models/{running,start,stop}`). Its presence is what turns on pooling for this inferencer. |
-| `parallel` | — | Requests the backend actually serves concurrently per loaded model (default `1`). Sizes the per-model queue semaphore. |
+| `parallel` | — | How many requests **woollama** sends the backend concurrently per loaded model (default `1`). Sizes the per-model queue semaphore. |
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
+| `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
-| `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
+#### woollama is not the device's only consumer
+
+Pool state is a **cache of the backend's state, not a ledger of it**. The vendor's own UI may load
+models; any caller needing endpoints woollama does not serve (images, embeddings, ASR) has to
+drive the backend directly, and that traffic changes residency. Exclusivity is therefore not
+achievable even in principle, and two things follow:
+
+- **`<provider>/default` reads through to the backend.** It asks what is actually running rather
+  than trusting woollama's own bookkeeping, which would be empty after a restart and stale after
+  anyone else's load. Concrete: without this, `default` returns *"no model is loaded"* while the
+  backend is running one, or falls through to the `virtual.default` entry and evicts a perfectly
+  good resident model to load it. Concrete model ids and ordinary aliases need no such round trip.
+- **`parallel` bounds what woollama sends, not what the backend receives.** Another consumer can
+  drive it concurrently regardless. Treat it as self-restraint, not a guarantee.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `WOOLLAMA_POOL_RESIDENCY_TTL_MS` | `1000` | Coalescing window for residency reads — a burst of `default` requests shares one query. `0` reads every time. This is a *coalescing* window, not a staleness budget: it bounds request amplification, and does not license trusting the cached view for longer. |
+
+**Inferencers sharing a `management_url` share one pool and one gate.** Two routes onto the same
+device are two views of one truth, so keeping them separate meant neither saw the other's loads —
+alternating between them swapped the model on *every* call — and it enforced `parallel` once per
+route, **doubling** the concurrency the device actually saw. The shared gate takes the most
+restrictive limit configured across them, except `queue_timeout`, where the most forgiving value
+wins (a shorter wait causes spurious `503`s on a slow cold load without protecting the device).
 
 > **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
 > The first request for a model that isn't resident waits for the backend to load it, and that

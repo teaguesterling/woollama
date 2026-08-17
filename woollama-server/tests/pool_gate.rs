@@ -285,6 +285,11 @@ async fn gate_protects_serving_model_from_eviction() {
 #[tokio::test]
 async fn pooled_passthrough_end_to_end() {
     let device = FakeDevice::spawn(&[]).await;
+    // `device2` exists only to force queue_max=0 backpressure. It gets its OWN device because
+    // inferencers sharing a management_url now share one pool and one gate (issue #26) — pointing
+    // both at one URL would apply device2's queue_max=0 to `device` as well. The shared URL was
+    // incidental convenience when this test was written, not its subject.
+    let device2 = FakeDevice::spawn(&[]).await;
 
     let cfg = tempfile::tempdir().unwrap();
     std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
@@ -294,8 +299,9 @@ async fn pooled_passthrough_end_to_end() {
         format!(
             "[inferencers.device]\nbase_url=\"{u}\"\nmanagement_url=\"{u}\"\n\
              [inferencers.device.virtual]\ndefault=\"Qwen/Coder\"\n\
-             [inferencers.device2]\nbase_url=\"{u}\"\nmanagement_url=\"{u}\"\nqueue_max=0\n",
+             [inferencers.device2]\nbase_url=\"{u2}\"\nmanagement_url=\"{u2}\"\nqueue_max=0\n",
             u = device.url,
+            u2 = device2.url,
         ),
     )
     .unwrap();
