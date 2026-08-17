@@ -107,6 +107,46 @@ async fn configured_headers_reach_the_downstream_request() {
     );
 }
 
+/// `woollamad check-config` on a config dir holding exactly `mcp_json` → (exit code, stdout+stderr).
+/// Drives the real binary, because the exit code IS the contract an operator scripts against.
+fn check_config(mcp_json: &str) -> (i32, String) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mcp.json"), mcp_json).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_woollamad"))
+        .arg("check-config")
+        .env("WOOLLAMA_CONFIG_DIR", dir.path())
+        .output()
+        .expect("run woollamad check-config");
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.code().unwrap_or(-1), text)
+}
+
+#[test]
+fn check_config_exits_nonzero_on_a_skipped_server() {
+    // A malformed entry is SKIPPED at boot so one typo can't cost the operator every other tool
+    // server — but a skip is otherwise announced only in the boot log. This subcommand is where
+    // that becomes actionable: an operator can gate a reload on it, and CI can gate a config
+    // change on it. If this ever exits 0 on a bad entry, the skip is silent again.
+    let (code, text) = check_config(
+        r#"{"mcpServers": {
+             "good": {"command": "hi"},
+             "bad": {"url": "http://h/mcp", "headers": {"Authorization": "Bearer "}}
+           }}"#,
+    );
+    assert_eq!(code, 1, "a skipped server must fail the check: {text}");
+    assert!(text.contains("bad"), "must name the offending server: {text}");
+    assert!(text.contains("good"), "must still report the usable server: {text}");
+    assert!(!text.contains("config OK"), "{text}");
+}
+
+#[test]
+fn check_config_exits_zero_on_a_healthy_config() {
+    let (code, text) = check_config(r#"{"mcpServers": {"hello": {"command": "hi"}}}"#);
+    assert_eq!(code, 0, "a valid config must pass: {text}");
+    assert!(text.contains("config OK"), "{text}");
+}
+
 #[tokio::test]
 async fn a_url_server_that_is_not_listening_is_skipped_not_fatal() {
     // Matches the stdio posture (mcp_registry.rs: failed server logged and skipped). A dead

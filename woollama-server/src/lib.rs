@@ -52,6 +52,67 @@ use pattern_backend::PatternBackend;
 
 pub use config::{load_mcp_servers, load_recipes};
 
+/// `woollamad check-config` — validate the config files and report, without connecting to
+/// anything or binding a port. Returns the process exit code: 0 clean, 1 if anything is wrong.
+///
+/// This exists because a malformed `mcp.json` entry is *skipped*, not fatal (one server's typo
+/// must not cost an operator the other eleven), and a skip is otherwise announced only in the
+/// boot log — one journal line, read approximately never. A connection failure may self-heal on
+/// the next request; a config error will still be there in six weeks. So strictness lives in a
+/// deliberate step the operator runs before a reload, rather than in the daemon's startup path.
+pub fn check_config() -> i32 {
+    config::ensure_examples_dir();
+    let mut errors = 0usize;
+
+    match config::diagnose_mcp_servers() {
+        Err(e) => {
+            eprintln!("error: {e}");
+            errors += 1;
+        }
+        Ok((specs, per_server, warnings)) => {
+            for e in &per_server {
+                eprintln!("error: {e}");
+            }
+            for w in &warnings {
+                eprintln!("warning: {w}");
+            }
+            errors += per_server.len();
+            let mut names: Vec<&str> = specs.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            println!(
+                "mcp.json: {} server(s) usable{}{}",
+                specs.len(),
+                if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) },
+                if per_server.is_empty() { String::new() } else { format!(", {} skipped", per_server.len()) },
+            );
+        }
+    }
+
+    match config::load_recipes() {
+        Err(e) => {
+            eprintln!("error: recipes.toml: {e}");
+            errors += 1;
+        }
+        Ok(r) => println!("recipes.toml: {} recipe(s)", r.len()),
+    }
+
+    match engine::Registry::from_config() {
+        Err(e) => {
+            eprintln!("error: inferencers.toml: {e}");
+            errors += 1;
+        }
+        Ok(_) => println!("inferencers.toml: OK"),
+    }
+
+    if errors == 0 {
+        println!("config OK");
+        0
+    } else {
+        eprintln!("{errors} problem(s) found");
+        1
+    }
+}
+
 /// Shared, process-lifetime server state: loaded recipes, the connected downstream MCP
 /// registry, and the inferencer registry. Built once at startup, shared via axum state.
 pub struct AppState {

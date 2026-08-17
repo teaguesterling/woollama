@@ -160,6 +160,10 @@ pub fn scan_vars(system: &str) -> Vec<String> {
     out
 }
 
+/// A parsed `mcp.json`: the usable servers, the per-server errors (entries that were skipped —
+/// a bad entry never costs its siblings), and operator warnings that don't invalidate an entry.
+pub type McpConfigLoad = (HashMap<String, McpServerSpec>, Vec<String>, Vec<String>);
+
 /// A downstream MCP server. Matches Claude Code's mcp.json shape, extended with a `url` form
 /// (issue #19) for a Streamable-HTTP endpoint instead of a spawned subprocess.
 #[derive(Clone, Debug)]
@@ -488,6 +492,15 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
     Ok(())
 }
 
+/// `load_mcp_servers`, but returning the per-server diagnostics it would otherwise log and
+/// discard. For `woollamad check-config`, which exists because those diagnostics are otherwise
+/// visible only in the boot log: a *connection* failure may self-heal on the next request, but a
+/// malformed entry stays malformed until a human edits the file, and the only evidence it was
+/// ever configured is a startup line nobody re-reads.
+pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
+    parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))
+}
+
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
     let (specs, errors, warnings) =
         parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))?;
@@ -511,10 +524,7 @@ pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
 /// Split out from `load_mcp_servers` so tests exercise parsing without touching
 /// `WOOLLAMA_CONFIG_DIR` — that env var is process-global, so a test that sets it races every
 /// other test that does (see the `load_patterns` test, which owns it).
-#[allow(clippy::type_complexity)]
-fn parse_mcp_servers(
-    text: &str,
-) -> Result<(HashMap<String, McpServerSpec>, Vec<String>, Vec<String>), String> {
+fn parse_mcp_servers(text: &str) -> Result<McpConfigLoad, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     let mut out = HashMap::new();
     let mut errors = Vec::new();

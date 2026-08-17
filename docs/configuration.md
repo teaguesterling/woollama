@@ -80,6 +80,25 @@ bad server is skipped with a warning naming it, never taking its siblings with
 it. Only `mcp.json` being unparseable JSON — where nothing is recoverable —
 leaves woollama with no servers at all.
 
+> **Check your config before a reload.** Because a bad entry is skipped rather
+> than fatal, the only trace at runtime is a line in the boot log. Run
+> `woollamad check-config` to make that actionable — it validates `mcp.json`,
+> `recipes.toml` and `inferencers.toml`, reports which servers are usable and
+> which were skipped and why, and **exits non-zero if anything is wrong**. It
+> connects to nothing and binds nothing, so it is safe to run against a live
+> deployment's config dir, and it is the thing to gate a `systemctl reload` (or
+> a CI job) on.
+>
+> ```console
+> $ woollamad check-config
+> error: mcp.json: server 'bad' header 'Authorization' is the bare auth scheme
+>        'Bearer' with no credential — an unset ${VAR} expands to nothing
+> mcp.json: 1 server(s) usable (good), 1 skipped
+> recipes.toml: 4 recipe(s)
+> inferencers.toml: OK
+> 1 problem(s) found
+> ```
+
 woollama also warns when a server sends `headers` to a plain `http://` URL that
 isn't loopback, since that puts the credential on the network in cleartext on
 every request.
