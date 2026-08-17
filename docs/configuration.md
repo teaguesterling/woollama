@@ -405,6 +405,14 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
+
+> **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
+> The first request for a model that isn't resident waits for the backend to load it, and that
+> is backend- and model-dependent — measured at **33s** for a 30B model on one NPU device, where
+> the 30s default would have returned `503` on first use. The failure looks exactly like
+> pooling being broken: the request that should have triggered the load is the one that times
+> out, so the model never becomes warm and every retry repeats the wait. Measure a cold load on
+> your own hardware and set `queue_timeout` comfortably above it.
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
 Pooling applies to `/v1/chat/completions` (in both `woollama` and `woollamad`);

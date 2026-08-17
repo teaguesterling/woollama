@@ -150,6 +150,32 @@ fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwe
     Ok(StreamableHttpClientTransport::with_client(client, config))
 }
 
+/// How many levels of `mcp__` namespacing a re-exported tool may carry.
+/// `WOOLLAMA_MCP_MAX_NESTING`, default 2. `0` disables the cap.
+///
+/// This exists because reconnect made unbounded growth reachable. Tool names nest one level per
+/// federation hop, and in a mutual topology (A consumes B, B consumes A) each refresh ingests a
+/// roster that already contains the previous round's nesting:
+///
+/// ```text
+/// t1  A pulls B  ->  A: [chat, mcp__B__chat]
+/// t2  B pulls A  ->  B: [chat, mcp__A__chat, mcp__A__mcp__B__chat]
+/// t3  A pulls B  ->  A: [..., mcp__B__mcp__A__mcp__B__chat]
+/// ```
+///
+/// Before reconnect that cost one level per RESTART. On a refresh timer it is one level per tick,
+/// forever — a roster that grows without bound, with every name past 64 chars falling back to the
+/// hashed form (and so onto issue #22's unstable-hash path). The cap bounds it locally, with no
+/// protocol change and nothing to coordinate between routers.
+fn max_nesting() -> usize {
+    std::env::var("WOOLLAMA_MCP_MAX_NESTING").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+/// How many `mcp__` namespace levels a tool name already carries.
+fn nesting_depth(name: &str) -> usize {
+    name.matches("mcp__").count()
+}
+
 /// Backoff ceiling for downstream reconnect. `WOOLLAMA_MCP_RETRY_MAX_SECS`, default 60s.
 /// **`0` disables retry entirely** — for a deployment that prefers a downstream to stay down
 /// until someone looks at it.
@@ -352,8 +378,15 @@ impl McpRegistry {
     pub fn reexport_tools(&self) -> Vec<Tool> {
         let mut out = Vec::new();
         let snap = self.snapshot();
+        let cap = max_nesting();
+        let mut skipped = 0usize;
         for (server, conn) in &snap.servers {
             for t in &conn.tools {
+                // Re-exporting adds one level, so compare the RESULTING depth against the cap.
+                if cap > 0 && nesting_depth(&t.name) + 1 > cap {
+                    skipped += 1;
+                    continue;
+                }
                 let mut nt = Tool::new(
                     wire_name(server, &t.name),
                     t.description.clone().unwrap_or_default(),
@@ -364,6 +397,14 @@ impl McpRegistry {
                 }
                 out.push(nt);
             }
+        }
+        if skipped > 0 {
+            // Loud rather than silent: a shrinking roster with no explanation is exactly the
+            // kind of quiet degradation that gets misdiagnosed as "the downstream is broken".
+            eprintln!(
+                "woollamad: {skipped} downstream tool(s) already at {cap} levels of federation \
+                 namespacing were not re-exported (WOOLLAMA_MCP_MAX_NESTING={cap})"
+            );
         }
         out
     }
@@ -634,6 +675,13 @@ mod tests {
         );
         let reg = McpRegistry::connect(specs).await;
         assert!(reg.snapshot().servers.is_empty(), "an unbuildable transport is skipped, not registered");
+    }
+
+    #[test]
+    fn nesting_depth_counts_federation_levels() {
+        assert_eq!(nesting_depth("count_to"), 0, "a plain downstream tool");
+        assert_eq!(nesting_depth("mcp__fix__count_to"), 1, "one hop of federation");
+        assert_eq!(nesting_depth("mcp__b__mcp__a__count_to"), 2, "two hops");
     }
 
     #[test]
