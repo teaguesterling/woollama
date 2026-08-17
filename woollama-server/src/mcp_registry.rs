@@ -318,7 +318,7 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::StdioSpec;
+    use crate::config::{HttpSpec, StdioSpec};
 
     #[test]
     #[cfg(unix)]
@@ -393,6 +393,25 @@ mod tests {
             merged_env(&spec_env).get("ANTHROPIC_API_KEY").map(String::as_str),
             Some("on-purpose")
         );
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_cannot_be_built_is_skipped_not_fatal() {
+        // `http_transport` has two construction failures that are not connection failures:
+        // an unusable header, and `reqwest::Client::builder().build()` erroring when TLS or the
+        // system resolver can't initialize. The latter is not reproducible in-process (it needs a
+        // broken CA store or /etc/resolv.conf), but both return through the SAME `?` path, so
+        // this pins that the path degrades to a skipped server rather than taking the daemon
+        // down — connect_one runs unspawned inside build_state, where a panic would reach main.
+        let mut headers = HashMap::new();
+        headers.insert("Invalid Header Name".to_string(), "x".to_string());
+        let mut specs = HashMap::new();
+        specs.insert(
+            "bad".to_string(),
+            McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers }),
+        );
+        let reg = McpRegistry::connect(specs).await;
+        assert!(reg.servers.is_empty(), "an unbuildable transport is skipped, not registered");
     }
 
     #[test]

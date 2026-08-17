@@ -489,9 +489,13 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
 }
 
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
-    let (specs, errors) = parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))?;
+    let (specs, errors, warnings) =
+        parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))?;
     for e in errors {
         eprintln!("woollamad: {e}, skipping");
+    }
+    for w in warnings {
+        eprintln!("woollamad: {w}");
     }
     Ok(specs)
 }
@@ -508,10 +512,13 @@ pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
 /// `WOOLLAMA_CONFIG_DIR` — that env var is process-global, so a test that sets it races every
 /// other test that does (see the `load_patterns` test, which owns it).
 #[allow(clippy::type_complexity)]
-fn parse_mcp_servers(text: &str) -> Result<(HashMap<String, McpServerSpec>, Vec<String>), String> {
+fn parse_mcp_servers(
+    text: &str,
+) -> Result<(HashMap<String, McpServerSpec>, Vec<String>, Vec<String>), String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     let mut out = HashMap::new();
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     if let Some(servers) = v.get("mcpServers").and_then(Value::as_object) {
         for (name, s) in servers {
             let url = s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty());
@@ -525,7 +532,10 @@ fn parse_mcp_servers(text: &str) -> Result<(HashMap<String, McpServerSpec>, Vec<
                     "mcp.json: server '{name}' needs either 'command' (stdio) or 'url' (HTTP)"
                 )),
                 (Some(command), None) => parse_stdio(name, s, command).map(McpServerSpec::Stdio),
-                (None, Some(url)) => parse_http(name, s, url).map(McpServerSpec::Http),
+                (None, Some(url)) => parse_http(name, s, url).map(|(h, warn)| {
+                    warnings.extend(warn);
+                    McpServerSpec::Http(h)
+                }),
             };
             match spec {
                 Ok(spec) => {
@@ -537,7 +547,7 @@ fn parse_mcp_servers(text: &str) -> Result<(HashMap<String, McpServerSpec>, Vec<
             }
         }
     }
-    Ok((out, errors))
+    Ok((out, errors, warnings))
 }
 
 fn parse_stdio(name: &str, s: &Value, command: &str) -> Result<StdioSpec, String> {
@@ -565,7 +575,10 @@ fn parse_stdio(name: &str, s: &Value, command: &str) -> Result<StdioSpec, String
     Ok(StdioSpec { command: command.to_string(), args, env })
 }
 
-fn parse_http(name: &str, s: &Value, url: &str) -> Result<HttpSpec, String> {
+/// Returns the spec plus an optional operator warning — returned rather than printed so the
+/// WIRING is testable. A warning that is merely `eprintln`'d can be silently disconnected from
+/// its trigger, and the predicate's own unit test would still pass.
+fn parse_http(name: &str, s: &Value, url: &str) -> Result<(HttpSpec, Option<String>), String> {
     let mut headers = HashMap::new();
     if let Some(o) = s.get("headers").and_then(Value::as_object) {
         for (k, v) in o {
@@ -579,14 +592,14 @@ fn parse_http(name: &str, s: &Value, url: &str) -> Result<HttpSpec, String> {
     // Credentials in cleartext on every request, forever. Loopback is exempt (it never leaves the
     // host); anything else carrying a header over plain http is worth saying out loud, since the
     // config that does it looks entirely healthy.
-    if !headers.is_empty() && !is_encrypted_or_local(url) {
-        eprintln!(
-            "woollamad: MCP server '{name}' sends {} header(s) over plaintext http — \
-             credentials will cross the network in the clear; prefer https",
+    let warning = (!headers.is_empty() && !is_encrypted_or_local(url)).then(|| {
+        format!(
+            "MCP server '{name}' sends {} header(s) over plaintext http — credentials will \
+             cross the network in the clear; prefer https",
             headers.len()
-        );
-    }
-    Ok(HttpSpec { url: url.to_string(), headers })
+        )
+    });
+    Ok((HttpSpec { url: url.to_string(), headers }, warning))
 }
 
 /// `https`, or a loopback host where plaintext never leaves the machine.
@@ -754,7 +767,7 @@ mod tests {
     /// but WITHOUT `WOOLLAMA_CONFIG_DIR` — that var is process-global, so setting it here
     /// would race the `load_patterns` test that owns it.
     fn servers_from(json: &str) -> Result<HashMap<String, McpServerSpec>, String> {
-        let (specs, errors) = parse_mcp_servers(&engine::expand_env(json))?;
+        let (specs, errors, _warnings) = parse_mcp_servers(&engine::expand_env(json))?;
         // Tests that expect a rejection assert on the per-server error; a bad entry is skipped
         // rather than fatal (see `one_bad_entry_does_not_discard_the_healthy_servers`).
         match errors.into_iter().next() {
@@ -769,7 +782,7 @@ mod tests {
         // load error to an empty registry, so a whole-file abort means the daemon comes up
         // "healthy" with zero MCP servers — every pre-existing stdio tool gone and every recipe
         // referencing them failing. That is a far worse failure than the misconfiguration.
-        let (specs, errors) = parse_mcp_servers(&engine::expand_env(
+        let (specs, errors, _warnings) = parse_mcp_servers(&engine::expand_env(
             r#"{"mcpServers": {
                  "good": {"command": "hi"},
                  "bad": {"url": "http://h/mcp", "headers": {"Authorization": "Bearer "}}
@@ -874,6 +887,35 @@ mod tests {
         // silent divergence `headers` already errors on.
         let err = servers_from(r#"{"mcpServers": {"s": {"command": "x", "env": {"PORT": 8080}}}}"#).unwrap_err();
         assert!(err.contains("PORT") && err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn a_plaintext_credential_warns_and_still_loads() {
+        // Exercises the WIRING, not just the predicate: a warning that is disconnected from its
+        // trigger would still pass `plaintext_detection_exempts_loopback_only` below.
+        let (specs, errors, warnings) = parse_mcp_servers(&engine::expand_env(
+            r#"{"mcpServers": {"suite": {"url": "http://mcp.dobby.lan:9200/mcp",
+                 "headers": {"Authorization": "Bearer sk-cleartext"}}}}"#,
+        ))
+        .unwrap();
+        assert!(specs.contains_key("suite"), "a plaintext credential warns — it does not block");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("suite") && warnings[0].contains("plaintext"), "{warnings:?}");
+        assert!(!warnings[0].contains("sk-cleartext"), "the warning must not echo the credential");
+    }
+
+    #[test]
+    fn https_and_loopback_and_headerless_do_not_warn() {
+        let quiet = |json: &str| {
+            let (_, errors, warnings) = parse_mcp_servers(&engine::expand_env(json)).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(warnings.is_empty(), "should not warn: {warnings:?}");
+        };
+        quiet(r#"{"mcpServers": {"a": {"url": "https://h/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
+        quiet(r#"{"mcpServers": {"b": {"url": "http://127.0.0.1:9200/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
+        // No credential to expose ⇒ nothing to warn about, even over plaintext.
+        quiet(r#"{"mcpServers": {"c": {"url": "http://mcp.dobby.lan:9200/mcp"}}}"#);
     }
 
     #[test]
