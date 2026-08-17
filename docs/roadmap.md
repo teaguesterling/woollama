@@ -84,8 +84,16 @@ only — see v0.10.0 above).
   topologies are still reachable through ordinary restarts and are still unguarded; a capped
   roster in a cycle is bounded and wrong rather than unbounded and wrong. The instance-id `Via`
   chain is the mechanism that would actually detect one.
-- **Refresh is reconnect-only.** A server that connected once is never re-polled, so a downstream
-  that *changes* its tool roster while staying up is not picked up until woollama restarts.
+- **Refresh is reconnect-only, and so is liveness.** A server that connected once is never
+  re-polled. Two consequences, and the second is the one that bites: a downstream that *changes*
+  its tool roster while staying up is not picked up until restart; and a downstream that **dies
+  after connecting is never re-detected** — its health stays `connected`, `GET /v1/tools` keeps
+  reporting a stale tool count, and every dispatch through the dead peer fails. Reconnect covers
+  "down at startup, comes up later", not "up at startup, goes away later". The endpoint sold as
+  the incident-time view will show a dead downstream as healthy until woollama restarts.
+  A dispatch failure marking its server degraded (and re-arming its reconnect task) is the
+  event-driven fix; it needs the registry to retain the specs, and is deliberately not bolted on
+  here.
 
 ### Latent issues surfaced by #19 (not yet filed as issues)
 

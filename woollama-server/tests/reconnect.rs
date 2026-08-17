@@ -11,6 +11,11 @@ use std::sync::Arc;
 
 use woollama_server::{spawn_reconnect, McpRegistry, McpServerSpec, ServerHealth, StdioSpec};
 
+/// Serializes every test in this binary that touches process-global `WOOLLAMA_*` config.
+/// Setting one of those vars is visible to EVERY concurrently-running test in the process — this
+/// file has already lost two tests to that, in both directions.
+static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A stdio spec pointing at `path`, which need not exist yet — `connect_one` resolves the command
 /// on every attempt, so making it appear mid-test is exactly the "downstream comes up late" case.
 fn stdio_spec(path: &std::path::Path) -> McpServerSpec {
@@ -82,21 +87,31 @@ async fn reconnect_picks_up_a_late_downstream_and_can_be_disabled() {
     // --- Case 2 (SAME test fn, see the note above): retry disabled ---
     // An operator may prefer a downstream to stay down until someone looks at it. Pinned because
     // a retry loop that cannot be turned off is its own operational hazard.
+    //
+    // The env var is held for as short a window as possible and under ENV, because it is
+    // process-global: an earlier version kept it set across a 4-second sleep, silently disabling
+    // retry for whatever else was running.
+    let _env = ENV.lock().await;
     std::env::set_var("WOOLLAMA_MCP_RETRY_MAX_SECS", "0");
     let never = dir.path().join("never");
     let mut off_specs = HashMap::new();
     off_specs.insert("never".to_string(), stdio_spec(&never));
     let off = Arc::new(McpRegistry::connect(off_specs.clone()).await);
     spawn_reconnect(off.clone(), off_specs);
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_mcp_fixture"), &never).unwrap();
-    // Ample time for a retry loop to fire if one were running (backoff starts at 1s).
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let status = off.status();
     std::env::remove_var("WOOLLAMA_MCP_RETRY_MAX_SECS");
-    assert!(
-        !off.all_connected(),
-        "retry was disabled; the router must NOT have reconnected: {:?}",
-        off.status()
-    );
+    drop(_env);
+
+    // With retry off, nothing will ever try again — so reporting `retrying` would be exactly the
+    // conflation ServerHealth exists to prevent. It must say so terminally, and say why.
+    match &status[0].health {
+        ServerHealth::Failed { reason } => assert!(
+            reason.contains("retry disabled"),
+            "a server that will never be retried must say so: {reason}"
+        ),
+        other => panic!("retry is disabled; expected Failed, got {other:?}"),
+    }
+    assert!(!off.all_connected());
 }
 
 /// The nesting cap, against a REAL downstream advertising an already-federated name — not
@@ -160,6 +175,7 @@ async fn v1_tools_lists_tool_origins_and_reports_a_downstream_that_is_down() {
     )
     .unwrap();
 
+    let _env = ENV.lock().await;
     std::env::set_var("WOOLLAMA_CONFIG_DIR", &cfg);
     std::env::set_var("WOOLLAMA_STATE_DIR", &cfg);
     // NOTE: deliberately does NOT touch WOOLLAMA_MCP_RETRY_MAX_SECS. That var is process-global,

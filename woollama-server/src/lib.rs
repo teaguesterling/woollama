@@ -291,15 +291,15 @@ fn parse_tcp_address(addr: &str) -> (String, u16) {
 /// `tools` keeps the Python reference's shape (`<server>.<tool>` names); `data` and `servers` are
 /// additive.
 async fn list_tools(State(state): State<Arc<AppState>>) -> Response {
-    let listing = state.registry.tool_listing();
+    // ONE snapshot for both halves: two reads would let a reconnect land between them and return
+    // a server reported `retrying` with 0 tools whose tools already appear in `data`.
+    let (listing, statuses) = state.registry.introspect();
     let tools: Vec<String> = listing.iter().map(|(s, bare, _)| format!("{s}.{bare}")).collect();
     let data: Vec<Value> = listing
         .iter()
         .map(|(server, bare, wire)| json!({"name": wire, "server": server, "tool": bare}))
         .collect();
-    let servers: Vec<Value> = state
-        .registry
-        .status()
+    let servers: Vec<Value> = statuses
         .into_iter()
         .map(|s| {
             let mut o = json!({

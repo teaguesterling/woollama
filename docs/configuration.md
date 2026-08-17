@@ -115,9 +115,16 @@ leaves woollama with no servers at all.
 
 A downstream that is unreachable at startup is retried on a per-server exponential backoff
 (1s doubling to a ceiling), so a peer that comes up later is picked up without restarting
-woollama. A server whose *transport* could not be built — an unusable header, say — is **not**
-retried: that is a config fault, and retrying it would only produce noise until someone edits
-the file.
+woollama. A server whose *transport* could not be built — an unusable header, say — is reported
+`failed` and **not** retried: that is a config fault, and retrying it would only produce noise
+until someone edits the file. With retry disabled (`WOOLLAMA_MCP_RETRY_MAX_SECS=0`) an
+unreachable server is likewise reported `failed`, not `retrying` — nothing will try again, and
+saying otherwise would defeat the point of distinguishing the two.
+
+> **Reconnect covers "down at startup, comes up later" — not the reverse.** A downstream that
+> dies *after* connecting is not currently re-detected: its health stays `connected` and
+> `GET /v1/tools` keeps reporting its last known tool count until woollama restarts. Dispatches
+> through it fail in the meantime.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -449,6 +456,8 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
 
+| `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
+
 > **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
 > The first request for a model that isn't resident waits for the backend to load it, and that
 > is backend- and model-dependent — measured at **33s** for a 30B model on one NPU device, where
@@ -456,7 +465,6 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 > pooling being broken: the request that should have triggered the load is the one that times
 > out, so the model never becomes warm and every retry repeats the wait. Measure a cold load on
 > your own hardware and set `queue_timeout` comfortably above it.
-| `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
 Pooling applies to `/v1/chat/completions` (in both `woollama` and `woollamad`);
 the `/v1/responses` path is not pooled yet. Raw real model ids remain routable
