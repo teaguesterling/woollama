@@ -2,6 +2,82 @@
 
 ## Unreleased
 
+## v0.13.0 — 2026-08-17
+
+**Downstream MCP servers reconnect on their own, per-server health is visible, and
+pool state stops pretending woollama owns the device.** Two tracks landed together
+plus two fixes that came out of running them against real hardware. The
+`woollama-server` crate and the `woollama` PyPI package move to 0.13.0;
+`woollama-engine` (0.11.0) and `woollama-core` (0.8.0) are unchanged.
+
+### Downstream reconnect + introspection (Track 0, #23)
+
+- **Reconnect.** A `url`- or `command`-form downstream that is unreachable at
+  startup is retried on a per-server exponential backoff
+  (`WOOLLAMA_MCP_RETRY_MAX_SECS`, default 60; `0` disables). A server whose
+  *transport* cannot be built is reported `failed` and **not** retried — that is a
+  config fault, and retrying produces noise until someone edits a file.
+- **Per-server health.** `connected` / `retrying` (with attempts and last error) /
+  `failed` (with reason), carried in the same snapshot as the tool set so a caller
+  never sees health and tools from different instants. Distinct states because
+  "absent" conflates a peer that will come back with one that never will.
+- **`GET /v1/tools`** — each tool with its originating server, each server with its
+  health. A downstream that is **down appears with its reason** rather than being
+  omitted: absence and not-yet-connected are indistinguishable from outside, and a
+  router showing neither looks healthy with its tools quietly gone. (Ports a route
+  that existed only in the Python reference.)
+- **Federation nesting cap** (`WOOLLAMA_MCP_MAX_NESTING`, default 2). Tool names
+  gain a namespace level per federation hop; reconnect turns that from one level
+  per *restart* into one per *refresh tick*, unbounded, in a mutual topology.
+- Refresh is **background-only**, never request-triggered: `tools/list` serves the
+  cached snapshot, so one router's request can never cause a fetch from the next.
+
+### Pool state is a cache of the device, not a ledger (#26)
+
+- **`<provider>/default` reads through to the backend** and lets it arbitrate.
+  woollama is not the only consumer of a device's management API — the vendor's own
+  UI loads models, and any caller needing endpoints woollama does not serve (images,
+  embeddings, ASR) must drive it directly. Exclusivity is not achievable even in
+  principle, so our view of residency is a cache. Concrete model ids and ordinary
+  aliases need no device round trip.
+- The freshness window (`WOOLLAMA_POOL_RESIDENCY_TTL_MS`, default 1000) is a
+  **coalescing** window — a burst of `default` requests shares one query — not a
+  staleness budget.
+- **Inferencers sharing a `management_url` share one pool and one gate.** Separate
+  gates enforced `parallel` once per route, **doubling** the concurrency the device
+  actually saw; on hardware where `parallel = 1` exists to prevent a wedge, that is
+  a safety property silently halved. Verified on real hardware: two routes,
+  concurrent requests, serialized, no wedge.
+- `parallel` documentation now claims the true thing — woollama sends at most N; the
+  device may still receive more from other consumers.
+
+### Fixes found by running the above against real hardware
+
+- **BUGFIX — `<provider>/default` was nondeterministic across restarts.**
+  `reconcile` stamped every newly-discovered resident with the same `last_used`, so
+  `snapshot`'s sort was a no-op and the winner came from `HashMap` iteration order —
+  i.e. Rust's per-process hash seed. Measured **9 failures in 12** independent starts
+  on a device holding a chat model plus an embedder and a reranker. Now: if an
+  inferencer declares `models`, only those are candidates (residency is device-wide,
+  not per-route), ordered deterministically with a resident `virtual.default` first.
+  Fails open where no catalog is declared, and **warns once** when it does.
+- **BUGFIX — the >64-char tool-name hash is now stable (#22).** It used std's
+  `DefaultHasher`, whose algorithm is explicitly not guaranteed between Rust
+  releases, so a toolchain upgrade could silently rename a tool — and a renamed tool
+  stops resolving, on both the recipe allow-list and any client that cached it.
+  Now FNV-1a with pinned test vectors. **This renames any tool currently on the
+  hashed path**; federation is what pushes names there, so it only gets more
+  expensive to change later.
+
+### Also
+
+- `mcp.json`'s `env` and the `check-config` subcommand shipped in v0.12.0; the
+  review findings tracked in #8 are all resolved across both implementations.
+- Known gap, recorded rather than overclaimed: a downstream that dies **after**
+  connecting is not re-detected. Reconnect covers "down at startup, comes up later",
+  not the reverse. Federation loop protection likewise remains deferred — mutual
+  A→B→A cycles are reachable through ordinary restarts and unguarded.
+
 ## v0.12.0 — 2026-08-16
 
 **`woollamad` can consume downstream MCP servers over Streamable HTTP.** An
