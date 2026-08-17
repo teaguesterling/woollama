@@ -111,6 +111,49 @@ bad server is skipped with a warning naming it, never taking its siblings with
 it. Only `mcp.json` being unparseable JSON — where nothing is recoverable —
 leaves woollama with no servers at all.
 
+### Downstream reconnect and introspection
+
+A downstream that is unreachable at startup is retried on a per-server exponential backoff
+(1s doubling to a ceiling), so a peer that comes up later is picked up without restarting
+woollama. A server whose *transport* could not be built — an unusable header, say — is **not**
+retried: that is a config fault, and retrying it would only produce noise until someone edits
+the file.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `WOOLLAMA_MCP_RETRY_MAX_SECS` | `60` | Backoff ceiling for downstream reconnect. `0` disables retry entirely. |
+| `WOOLLAMA_MCP_MAX_NESTING` | `2` | Federation levels a re-exported tool may carry. `0` disables the cap. |
+
+Refresh is **background-only** — a request never triggers a downstream fetch. That is
+deliberate: if it did, then in a federated topology one router's `tools/list` would fetch from
+the next, whose `tools/list` would fetch back, recursing at request time. Serving from a cached
+snapshot is what keeps that impossible.
+
+`WOOLLAMA_MCP_MAX_NESTING` exists because reconnect makes unbounded growth reachable. Tool names
+gain one namespace level per federation hop, so in a mutual topology (A consumes B, B consumes A)
+each refresh ingests a roster that already carries the previous round's nesting — one level per
+tick, forever. The cap bounds it; capped tools are logged with a count rather than silently
+dropped.
+
+**`GET /v1/tools`** reports what the router actually has:
+
+```json
+{
+  "tools": ["shelf.search"],
+  "data":  [{"name": "mcp__shelf__search", "server": "shelf", "tool": "search"}],
+  "servers": [
+    {"name": "shelf", "transport": "http", "health": "connected", "tools": 1},
+    {"name": "git", "transport": "stdio", "health": "retrying", "tools": 0,
+     "attempts": 4, "last_error": "No such file or directory (os error 2)"}
+  ]
+}
+```
+
+A downstream that is **down appears here with its reason**, rather than being omitted — absence
+and not-yet-connected are indistinguishable from outside, and a router showing neither would look
+healthy with its tools quietly gone. Each tool names its originating server, which is how to read
+a federated namespace without driving an MCP handshake by hand.
+
 > **Check your config before a reload.** Because a bad entry is skipped rather
 > than fatal, the only trace at runtime is a line in the boot log. Run
 > `woollamad check-config` to make that actionable — it validates `mcp.json`,

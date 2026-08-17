@@ -135,3 +135,76 @@ async fn re_export_stops_at_the_nesting_cap() {
     // unhealthy. Conflating the two would make a capped roster look like a connection failure.
     assert!(reg.all_connected(), "the cap must not affect health: {:?}", reg.status());
 }
+
+/// `GET /v1/tools` (issue #23) — and specifically that a downstream which is DOWN appears in it.
+///
+/// The easy version of this endpoint lists what's connected, which is worse than useless during
+/// an incident: a router with a dead downstream would render identically to one with no
+/// downstream configured. The assertion that matters is the retrying server being present, named,
+/// with its reason.
+#[tokio::test]
+async fn v1_tools_lists_tool_origins_and_reports_a_downstream_that_is_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    let fixture = env!("CARGO_BIN_EXE_mcp_fixture");
+    std::fs::write(
+        cfg.join("mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{
+                 "up":   {{"command": "{fixture}"}},
+                 "down": {{"command": "{}/definitely-not-here"}}
+               }}}}"#,
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", &cfg);
+    std::env::set_var("WOOLLAMA_STATE_DIR", &cfg);
+    // NOTE: deliberately does NOT touch WOOLLAMA_MCP_RETRY_MAX_SECS. That var is process-global,
+    // and setting it here disabled retry underneath the reconnect test running in parallel — the
+    // same race this repo has now hit four times. Instead 'down' points at a path that will never
+    // exist, so retry can never succeed and the assertions are stable with retry left ON.
+    let state = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = woollama_server::router(state);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/v1/tools"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // A tool names the server it came from — the only way to read a federated namespace without
+    // driving an MCP handshake by hand.
+    let data = body["data"].as_array().expect("data array");
+    let found = data.iter().find(|t| t["tool"] == "count_to").expect("the live server's tool");
+    assert_eq!(found["server"], "up");
+    assert_eq!(found["name"], "mcp__up__count_to");
+    assert!(body["tools"].as_array().unwrap().iter().any(|n| n == "up.count_to"),
+        "the Python reference's `<server>.<tool>` shape is preserved: {}", body["tools"]);
+
+    let servers = body["servers"].as_array().expect("servers array");
+    let up = servers.iter().find(|s| s["name"] == "up").expect("live server reported");
+    assert_eq!(up["health"], "connected");
+    assert_eq!(up["tools"], 1);
+
+    // THE point of the endpoint: the dead one is present, not omitted, and says why.
+    let down = servers
+        .iter()
+        .find(|s| s["name"] == "down")
+        .expect("a downstream that is DOWN must still be reported — absence is not a status");
+    assert_eq!(down["health"], "retrying");
+    assert_eq!(down["tools"], 0);
+    assert!(
+        down["last_error"].as_str().map(|e| !e.is_empty()).unwrap_or(false),
+        "a retrying server must carry WHY: {down}"
+    );
+}

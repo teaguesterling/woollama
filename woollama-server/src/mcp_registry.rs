@@ -373,12 +373,13 @@ impl McpRegistry {
         self.snapshot().servers.get(server)?.tools.iter().find(|t| t.name == bare).cloned()
     }
 
-    /// Every downstream tool, re-exported namespaced `<server>.<tool>` with input +
-    /// output schema MIRRORED — for woollama's own tools/list (the MCP aggregator).
-    pub fn reexport_tools(&self) -> Vec<Tool> {
-        let mut out = Vec::new();
+    /// Every downstream tool that survives the federation nesting cap, as
+    /// `(server, original tool)`. The single place the cap is applied, so what a client is
+    /// TOLD about and what gets re-exported can never disagree.
+    fn exported(&self) -> Vec<(String, Tool)> {
         let snap = self.snapshot();
         let cap = max_nesting();
+        let mut out = Vec::new();
         let mut skipped = 0usize;
         for (server, conn) in &snap.servers {
             for t in &conn.tools {
@@ -387,26 +388,50 @@ impl McpRegistry {
                     skipped += 1;
                     continue;
                 }
-                let mut nt = Tool::new(
-                    wire_name(server, &t.name),
-                    t.description.clone().unwrap_or_default(),
-                    t.input_schema.clone(),
-                );
-                if let Some(os) = t.output_schema.clone() {
-                    nt = nt.with_raw_output_schema(os);
-                }
-                out.push(nt);
+                out.push((server.clone(), t.clone()));
             }
         }
         if skipped > 0 {
-            // Loud rather than silent: a shrinking roster with no explanation is exactly the
-            // kind of quiet degradation that gets misdiagnosed as "the downstream is broken".
+            // Loud rather than silent: a quietly shrinking roster gets misdiagnosed as a broken
+            // downstream.
             eprintln!(
                 "woollamad: {skipped} downstream tool(s) already at {cap} levels of federation \
                  namespacing were not re-exported (WOOLLAMA_MCP_MAX_NESTING={cap})"
             );
         }
         out
+    }
+
+    /// Every downstream tool, re-exported namespaced with input + output schema MIRRORED —
+    /// for woollama's own tools/list (the MCP aggregator).
+    pub fn reexport_tools(&self) -> Vec<Tool> {
+        self.exported()
+            .into_iter()
+            .map(|(server, t)| {
+                let mut nt = Tool::new(
+                    wire_name(&server, &t.name),
+                    t.description.clone().unwrap_or_default(),
+                    t.input_schema.clone(),
+                );
+                if let Some(os) = t.output_schema.clone() {
+                    nt = nt.with_raw_output_schema(os);
+                }
+                nt
+            })
+            .collect()
+    }
+
+    /// `(server, bare name, advertised wire name)` for every re-exported tool — the introspection
+    /// view behind `GET /v1/tools`. Derived from the same `exported()` set as the aggregator, so
+    /// introspection cannot advertise a tool the aggregator drops (or vice versa).
+    pub fn tool_listing(&self) -> Vec<(String, String, String)> {
+        self.exported()
+            .into_iter()
+            .map(|(server, t)| {
+                let wire = wire_name(&server, &t.name);
+                (server, t.name.to_string(), wire)
+            })
+            .collect()
     }
 
     /// Call a tool by BARE name on a specific server (for the MCP conversation-store

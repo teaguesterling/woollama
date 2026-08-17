@@ -278,6 +278,50 @@ fn parse_tcp_address(addr: &str) -> (String, u16) {
     }
 }
 
+/// `GET /v1/tools` — what tools this router actually has, and the health of every configured
+/// downstream (issue #23).
+///
+/// Two things make this more than a debugging nicety once federation is in play:
+/// a downstream that is retrying appears here **with its last error**, rather than being silently
+/// absent — absence and not-yet-connected are indistinguishable from the outside, and a router
+/// that showed neither would look healthy with its tools quietly gone. And each tool names the
+/// server it came from, which is the only way to read a federated namespace without driving an
+/// MCP handshake by hand.
+///
+/// `tools` keeps the Python reference's shape (`<server>.<tool>` names); `data` and `servers` are
+/// additive.
+async fn list_tools(State(state): State<Arc<AppState>>) -> Response {
+    let listing = state.registry.tool_listing();
+    let tools: Vec<String> = listing.iter().map(|(s, bare, _)| format!("{s}.{bare}")).collect();
+    let data: Vec<Value> = listing
+        .iter()
+        .map(|(server, bare, wire)| json!({"name": wire, "server": server, "tool": bare}))
+        .collect();
+    let servers: Vec<Value> = state
+        .registry
+        .status()
+        .into_iter()
+        .map(|s| {
+            let mut o = json!({
+                "name": s.name,
+                "transport": s.transport,
+                "health": s.health.as_str(),
+                "tools": s.tools,
+            });
+            match &s.health {
+                crate::mcp_registry::ServerHealth::Retrying { attempts, last_error } => {
+                    o["attempts"] = json!(attempts);
+                    o["last_error"] = json!(last_error);
+                }
+                crate::mcp_registry::ServerHealth::Failed { reason } => o["reason"] = json!(reason),
+                crate::mcp_registry::ServerHealth::Connected => {}
+            }
+            o
+        })
+        .collect();
+    axum::Json(json!({"tools": tools, "data": data, "servers": servers})).into_response()
+}
+
 /// The axum app (shared by the binary and the integration tests). Mounts woollama's own
 /// MCP surface at `/mcp` (Streamable-HTTP) on the same port — the per-session factory
 /// shares the one `AppState` (and thus the one downstream registry).
@@ -293,6 +337,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     );
     let mut router = Router::new()
         .route("/v1/models", get(list_models))
+        .route("/v1/tools", get(list_tools))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/embeddings", post(embeddings))
