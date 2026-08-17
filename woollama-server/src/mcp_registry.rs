@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::RoleClient;
+use rmcp::transport::streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{Peer, ServiceExt};
 use serde_json::{json, Value};
 
 use woollama_engine::{EngineError, ToolProvider};
 
-use crate::config::McpServerSpec;
+use crate::config::{HttpSpec, McpServerSpec};
 
 struct ServerConn {
     peer: Peer<RoleClient>,
@@ -50,6 +51,25 @@ fn merged_env(spec_env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut env = scrubbed_env();
     env.extend(spec_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     env
+}
+
+/// Build the Streamable-HTTP client transport for a `url`-form downstream server.
+///
+/// `reqwest::Client` is rmcp's own HTTP client impl (Cargo.toml pins reqwest 0.13 to match), and
+/// `axum::http` re-exports the same `http` types rmcp expects — no new dependency for either.
+fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwest::Client>, String> {
+    use axum::http::{HeaderName, HeaderValue};
+
+    let mut headers = HashMap::new();
+    for (k, v) in &spec.headers {
+        let name = HeaderName::try_from(k.as_str()).map_err(|e| format!("invalid header name '{k}': {e}"))?;
+        // `InvalidHeaderValue`'s Display does not include the offending value, which is what we
+        // want — these carry bearer tokens. Do not add the value to this message.
+        let value = HeaderValue::from_str(v).map_err(|e| format!("invalid header value for '{k}': {e}"))?;
+        headers.insert(name, value);
+    }
+    let config = StreamableHttpClientTransportConfig::with_uri(spec.url.clone()).custom_headers(headers);
+    Ok(StreamableHttpClientTransport::with_client(reqwest::Client::new(), config))
 }
 
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
@@ -145,6 +165,12 @@ impl McpRegistry {
                 // and the Python MCP SDK's default-scrubbed stdio environment.
                 cmd.args(&s.args).env_clear().envs(merged_env(&s.env));
                 let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
+                ().serve(transport).await.map_err(|e| e.to_string())?
+            }
+            McpServerSpec::Http(h) => {
+                // No child process, so no env scrub applies. Everything after `.serve()` is
+                // transport-agnostic and shared with the stdio path.
+                let transport = http_transport(h)?;
                 ().serve(transport).await.map_err(|e| e.to_string())?
             }
         };

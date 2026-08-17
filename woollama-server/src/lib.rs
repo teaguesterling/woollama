@@ -544,6 +544,20 @@ fn referenced_mcp_servers(
             config::McpServerSpec::Stdio(s) => {
                 json!({"command": s.command, "args": s.args, "env": s.env})
             }
+            // Refused rather than translated. Claude Code's mcp.json CAN express an HTTP server,
+            // but emitting one would (a) have the child connect to the downstream directly,
+            // outside woollama's allow-list boundary, and (b) write its bearer token into a temp
+            // config file for another process. Neither is in scope for issue #19.
+            config::McpServerSpec::Http(_) => {
+                return Err(EngineError::new(
+                    format!(
+                        "recipe references MCP server '{server}', which is a 'url' (HTTP) server — \
+                         claude-code delegation cannot hand an HTTP downstream to the child process"
+                    ),
+                    "invalid_request_error",
+                    400,
+                ))
+            }
         };
         servers.insert(server.to_string(), entry);
     }
