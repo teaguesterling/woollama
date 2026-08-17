@@ -160,9 +160,16 @@ pub fn scan_vars(system: &str) -> Vec<String> {
     out
 }
 
-/// A downstream MCP server to spawn (stdio). Matches Claude Code's mcp.json shape.
+/// A downstream MCP server. Matches Claude Code's mcp.json shape, extended with a `url` form
+/// (issue #19) for a Streamable-HTTP endpoint instead of a spawned subprocess.
 #[derive(Clone)]
-pub struct McpServerSpec {
+pub enum McpServerSpec {
+    Stdio(StdioSpec),
+}
+
+/// A downstream MCP server spawned as a child process, speaking MCP over stdio.
+#[derive(Clone)]
+pub struct StdioSpec {
     pub command: String,
     pub args: Vec<String>,
     /// Extra environment for the spawned server, merged OVER the scrubbed base env
@@ -408,8 +415,15 @@ pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
 }
 
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
-    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
+    parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))
+}
+
+/// Parse already-`${VAR}`-expanded mcp.json text. Split out from `load_mcp_servers` so tests
+/// exercise the parsing without touching `WOOLLAMA_CONFIG_DIR` — that env var is
+/// process-global, so a test that sets it races every other test that does (see the
+/// `load_patterns` test, which owns it).
+fn parse_mcp_servers(text: &str) -> Result<HashMap<String, McpServerSpec>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     let mut out = HashMap::new();
     if let Some(servers) = v.get("mcpServers").and_then(Value::as_object) {
         for (name, s) in servers {
@@ -432,7 +446,7 @@ pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.insert(name.clone(), McpServerSpec { command, args, env });
+            out.insert(name.clone(), McpServerSpec::Stdio(StdioSpec { command, args, env }));
         }
     }
     Ok(out)
@@ -584,15 +598,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&none);
     }
 
-    /// Load `mcp.json` from a throwaway config dir. `WOOLLAMA_CONFIG_DIR` is process-global,
-    /// so callers must run their cases sequentially inside ONE `#[test]` (see `load_patterns`).
+    /// Parse mcp.json text through the same `${VAR}` expansion `load_mcp_servers` applies,
+    /// but WITHOUT `WOOLLAMA_CONFIG_DIR` — that var is process-global, so setting it here
+    /// would race the `load_patterns` test that owns it.
     fn servers_from(json: &str) -> Result<HashMap<String, McpServerSpec>, String> {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mcp.json"), json).unwrap();
-        std::env::set_var("WOOLLAMA_CONFIG_DIR", dir.path());
-        let out = load_mcp_servers();
-        std::env::remove_var("WOOLLAMA_CONFIG_DIR");
-        out
+        parse_mcp_servers(&engine::expand_env(json))
     }
 
     #[test]
@@ -604,11 +614,13 @@ mod tests {
             r#"{"mcpServers": {"git": {"command": "git-mcp", "env": {"GIT_AUTHOR_NAME": "woollama"}}}}"#,
         )
         .unwrap();
-        assert_eq!(servers["git"].env.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
+        let McpServerSpec::Stdio(s) = &servers["git"];
+        assert_eq!(s.env.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
 
         // Case 2 (SAME test fn — `WOOLLAMA_CONFIG_DIR` is process-global): an absent `env` is
         // an empty map, not an error.
         let servers = servers_from(r#"{"mcpServers": {"hello": {"command": "hi"}}}"#).unwrap();
-        assert!(servers["hello"].env.is_empty(), "absent 'env' is an empty map, not an error");
+        let McpServerSpec::Stdio(s) = &servers["hello"];
+        assert!(s.env.is_empty(), "absent 'env' is an empty map, not an error");
     }
 }

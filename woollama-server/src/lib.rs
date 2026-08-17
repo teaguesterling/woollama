@@ -517,23 +517,35 @@ async fn responses_stream(mut source: BoxStream<'static, Result<String, EngineEr
 
 // --- orchestration (shared by chat-completions + responses) -------------------
 
-/// The mcp.json `{command, args}` for the servers a recipe's tools reference (the subset
-/// claude-code delegation hands the child). Errors if a referenced server isn't configured.
-fn referenced_mcp_servers(state: &AppState, tools: &[String]) -> Result<HashMap<String, Value>, EngineError> {
+/// The mcp.json entry for each server a recipe's tools reference — the subset claude-code
+/// delegation hands the child as its `--mcp-config`. Errors if a referenced server isn't
+/// configured.
+///
+/// `env` is forwarded so a server behaves identically in woollama's own loop and under
+/// delegation; omitting it would make a tool work one way and silently misbehave the other.
+fn referenced_mcp_servers(
+    specs: &HashMap<String, config::McpServerSpec>,
+    tools: &[String],
+) -> Result<HashMap<String, Value>, EngineError> {
     let mut servers = HashMap::new();
     for t in tools {
         let server = t.split_once('.').map(|(s, _)| s).unwrap_or(t.as_str());
         if servers.contains_key(server) {
             continue;
         }
-        let Some(spec) = state.mcp_specs.get(server) else {
+        let Some(spec) = specs.get(server) else {
             return Err(EngineError::new(
                 format!("recipe references MCP server '{server}' not in mcp.json config"),
                 "invalid_request_error",
                 400,
             ));
         };
-        servers.insert(server.to_string(), json!({"command": spec.command, "args": spec.args}));
+        let entry = match spec {
+            config::McpServerSpec::Stdio(s) => {
+                json!({"command": s.command, "args": s.args, "env": s.env})
+            }
+        };
+        servers.insert(server.to_string(), entry);
     }
     Ok(servers)
 }
@@ -550,7 +562,7 @@ async fn run_claude_recipe(
     if recipe.tools.is_empty() {
         claude_code::run_completion(&recipe.system, messages, model).await.map_err(cc_err)
     } else {
-        let servers = referenced_mcp_servers(state, &recipe.tools)?;
+        let servers = referenced_mcp_servers(&state.mcp_specs, &recipe.tools)?;
         claude_code::run_delegated(&recipe.system, messages, model, &recipe.tools, &servers, 8)
             .await
             .map_err(cc_err)
@@ -1513,6 +1525,40 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
         t.remove(&conv_id);
     }
     Json(json!({"id": conv_id, "object": "conversation.deleted", "deleted": true})).into_response()
+}
+
+#[cfg(test)]
+mod delegate_config_tests {
+    use super::*;
+    use crate::config::{McpServerSpec, StdioSpec};
+
+    fn specs_with(name: &str, spec: McpServerSpec) -> HashMap<String, McpServerSpec> {
+        let mut specs = HashMap::new();
+        specs.insert(name.to_string(), spec);
+        specs
+    }
+
+    #[test]
+    fn delegate_config_forwards_the_env_block() {
+        // A stdio server needing `env` must behave the same in-loop and under claude-code
+        // delegation. Dropping it here would make the tool work through woollama's own loop
+        // and silently misbehave when Claude runs it — the worst kind of divergence, because
+        // both paths report success.
+        let mut env = HashMap::new();
+        env.insert("GIT_AUTHOR_NAME".to_string(), "woollama".to_string());
+        let specs =
+            specs_with("git", McpServerSpec::Stdio(StdioSpec { command: "git-mcp".into(), args: vec![], env }));
+        let out = referenced_mcp_servers(&specs, &["git.log".to_string()]).unwrap();
+        assert_eq!(out["git"]["env"]["GIT_AUTHOR_NAME"], "woollama");
+        assert_eq!(out["git"]["command"], "git-mcp");
+    }
+
+    #[test]
+    fn an_unconfigured_server_is_still_an_error() {
+        let specs = specs_with("git", McpServerSpec::Stdio(StdioSpec { command: "g".into(), args: vec![], env: HashMap::new() }));
+        let err = referenced_mcp_servers(&specs, &["other.tool".to_string()]).unwrap_err();
+        assert!(err.message.contains("other"), "must name the missing server: {}", err.message);
+    }
 }
 
 #[cfg(test)]

@@ -135,13 +135,19 @@ impl McpRegistry {
     }
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
-        let mut cmd = tokio::process::Command::new(&spec.command);
-        // Scrub the child env: a downstream tool server must NOT inherit the daemon's
-        // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
-        // and the Python MCP SDK's default-scrubbed stdio environment.
-        cmd.args(&spec.args).env_clear().envs(merged_env(&spec.env));
-        let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
-        let running = ().serve(transport).await.map_err(|e| e.to_string())?;
+        // Only the transport construction is variant-specific; everything from here on —
+        // peer handling, list_all_tools, the wire_index — is transport-agnostic.
+        let running = match spec {
+            McpServerSpec::Stdio(s) => {
+                let mut cmd = tokio::process::Command::new(&s.command);
+                // Scrub the child env: a downstream tool server must NOT inherit the daemon's
+                // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
+                // and the Python MCP SDK's default-scrubbed stdio environment.
+                cmd.args(&s.args).env_clear().envs(merged_env(&s.env));
+                let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
+                ().serve(transport).await.map_err(|e| e.to_string())?
+            }
+        };
         let peer = running.peer().clone();
         let tools = peer.list_all_tools().await.map_err(|e| e.to_string())?;
         // Keep the connection alive for the process lifetime: dropping the
@@ -278,6 +284,7 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::StdioSpec;
 
     #[test]
     #[cfg(unix)]
@@ -306,12 +313,12 @@ mod tests {
         // `sleep` spawns but never speaks MCP -> the initialize handshake hangs -> timed out.
         specs.insert(
             "hung".to_string(),
-            McpServerSpec { command: "sleep".into(), args: vec!["30".into()], env: HashMap::new() },
+            McpServerSpec::Stdio(StdioSpec { command: "sleep".into(), args: vec!["30".into()], env: HashMap::new() }),
         );
         // `false` exits immediately -> connect_one errors -> skipped.
         specs.insert(
             "dead".to_string(),
-            McpServerSpec { command: "false".into(), args: vec![], env: HashMap::new() },
+            McpServerSpec::Stdio(StdioSpec { command: "false".into(), args: vec![], env: HashMap::new() }),
         );
         let start = std::time::Instant::now();
         let reg = McpRegistry::connect(specs).await;
