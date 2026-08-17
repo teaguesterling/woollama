@@ -202,11 +202,33 @@ fn wire_name(server: &str, tool: &str) -> String {
     if full.len() <= 64 {
         full
     } else {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        full.hash(&mut h);
-        format!("mcp__{:016x}", h.finish())
+        format!("mcp__{:016x}", fnv1a64(full.as_bytes()))
     }
+}
+
+/// FNV-1a, 64-bit. Pinned deliberately: this hash names a tool **on the wire**, so it must be
+/// reproducible across Rust versions, machines and processes.
+///
+/// It previously used `std::collections::hash_map::DefaultHasher`, whose algorithm std explicitly
+/// does not guarantee between releases — so a `rustup update` could silently rename a tool, and a
+/// renamed tool is one that stops resolving: a recipe's `tools` allow-list entry no longer
+/// matches, and a client that cached the advertised name calls something that no longer exists.
+/// The failure is silent on both sides.
+///
+/// Dormant while almost nothing exceeded 64 characters. Federation is what pushes names onto this
+/// path — a consumed router's tools are already `mcp__X__Y`, so one hop of nesting adds ~12
+/// characters — and in a mutual topology names gain a level per refresh. At that point a hashed
+/// name stops being a cosmetic fallback and becomes a load-bearing identity.
+///
+/// FNV-1a rather than a crypto hash: this is a naming function, not a security boundary, and it
+/// needs no dependency. Collisions resolve through `wire_index` the same way any name does.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Per-call timeout for a downstream tool invocation. `WOOLLAMA_MCP_CALL_TIMEOUT_SECS`,
@@ -797,6 +819,23 @@ mod tests {
         assert_eq!(nesting_depth("count_to"), 0, "a plain downstream tool");
         assert_eq!(nesting_depth("mcp__fix__count_to"), 1, "one hop of federation");
         assert_eq!(nesting_depth("mcp__b__mcp__a__count_to"), 2, "two hops");
+    }
+
+    #[test]
+    fn hashed_wire_names_are_pinned_across_toolchains() {
+        // LITERAL expected values, deliberately. This hash names a tool ON THE WIRE, so the
+        // property that matters is not "it hashes" but "it hashes to the same thing it did
+        // yesterday" — which a property-based test cannot express. The previous implementation
+        // used std's DefaultHasher, whose algorithm is explicitly not guaranteed between
+        // releases, so a toolchain upgrade could silently rename a tool. These assertions fail
+        // instead.
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325, "FNV-1a offset basis");
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8, "published FNV-1a test vector");
+
+        // And the same, end to end through the naming function.
+        let long = wire_name(&"s".repeat(50), &"t".repeat(50));
+        assert_eq!(long, "mcp__c251c716388ed55d", "an over-long name must hash to a STABLE form");
     }
 
     #[test]

@@ -1169,6 +1169,23 @@ async fn passthrough_stream(
         .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
 }
 
+/// Warn once per inferencer that `default` resolution has fallen open. Once, not per request:
+/// this sits on the request path, and the condition persists until either the config or the
+/// device's residency changes.
+fn warn_fail_open(name: &str) {
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    let mut guard = WARNED.lock().expect("warn set poisoned");
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    if seen.insert(name.to_string()) {
+        eprintln!(
+            "woollamad: inferencer '{name}': none of its configured `models` is loaded on the \
+             device, so `{name}/default` is falling back to ANY resident model — which may be one \
+             that cannot serve this endpoint (an embedding or rerank model will fail the chat \
+             path). Add the model you expect to serve `default` to this inferencer's `models`."
+        );
+    }
+}
+
 /// Which residents may satisfy `<provider>/default`, best first.
 ///
 /// A device's residency is device-wide, not per-inferencer: it lists everything loaded, including
@@ -1198,7 +1215,18 @@ fn default_candidates(inf: &engine::Inferencer, residency: Vec<String>) -> Vec<S
         // If nothing resident is a configured model, fall back to the unfiltered set rather than
         // reporting "nothing loaded": the caller's own `virtual.default` fallback and the
         // load-on-demand path both handle that better than an empty list does.
-        if filtered.is_empty() { residency } else { filtered }
+        //
+        // But SAY SO. In this state `default` can only pick a model this route never declared —
+        // possibly one that cannot serve the endpoint at all — and rule 2 makes that choice
+        // deterministic, so the route fails the same way every time rather than intermittently.
+        // Reliably wrong is easier to diagnose than usually wrong, but only if it is announced;
+        // silently it just looks like the router is broken.
+        if filtered.is_empty() {
+            warn_fail_open(&inf.name);
+            residency
+        } else {
+            filtered
+        }
     };
     candidates.sort();
     if let Some(preferred) = inf.virtual_models.get("default") {
@@ -1772,6 +1800,23 @@ mod default_candidate_tests {
             residency(),
         );
         assert_eq!(got[0], "Qwen/Qwen3.6-35B-A3B-turbo", "a configured default that IS resident wins");
+    }
+
+    #[test]
+    fn fail_open_is_deterministic_and_reported() {
+        // A realistic misconfiguration, arrived at honestly: the route declares models, none of
+        // which is resident. Falling open is correct — an empty candidate list would be worse —
+        // but the choice is then lexicographic among models this route never declared, which on a
+        // mixed-residency device means a hard failure EVERY time rather than intermittently.
+        // Determinism makes it diagnosable; the warning makes it discoverable.
+        let i = inf(&["Qwen/Qwen3-30B-A3B-Instruct"], Some("Qwen/Qwen3-30B-A3B-Instruct"));
+        let got = default_candidates(&i, residency());
+        assert_eq!(got.len(), 3, "falls open to every resident rather than reporting none loaded");
+        assert_eq!(got, {
+            let mut r = residency();
+            r.sort();
+            r
+        }, "and does so deterministically — same input, same order, every process");
     }
 
     #[test]
