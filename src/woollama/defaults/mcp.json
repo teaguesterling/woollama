@@ -1,6 +1,6 @@
 {
   "_doc": "woollama's default MCP server configuration — Claude-Code-shaped.",
-  "_doc2": "Override by writing your own to $XDG_CONFIG_HOME/woollama/mcp.json. Env var substitution: ${VAR} is expanded at load time. ${WOOLLAMA_EXAMPLES_DIR} resolves to the package's examples/ directory; useful only in these bundled defaults. The ':-' form gives a fallback when a variable is unset or empty (POSIX semantics) -- used below so a binary-only install, which has no examples/, declares that absence deliberately rather than looking like a missing-variable mistake.",
+  "_doc2": "Override by writing your own to $XDG_CONFIG_HOME/woollama/mcp.json. Env var substitution: ${VAR} is expanded at load time. ${WOOLLAMA_EXAMPLES_DIR} resolves to the package's examples/ directory; useful only in these bundled defaults. The ':-' form gives a fallback when a variable is unset or empty (POSIX semantics); it is used below to declare that a missing examples/ directory is expected rather than a configuration mistake. NOTE: the two implementations differ in when it applies -- the Python loader always sets WOOLLAMA_EXAMPLES_DIR (to a path that may not exist), so the fallback is reachable only under woollamad. Either way these two example servers simply fail to start and are skipped.",
 
   "mcpServers": {
     "hello": {

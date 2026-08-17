@@ -423,6 +423,16 @@ pub fn config_dir() -> std::path::PathBuf {
 /// config file is read by both, and a divergence here is a config that behaves differently
 /// depending on which implementation loaded it.
 pub fn expand_env(text: &str) -> String {
+    expand_env_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`expand_env`] with the environment injected.
+///
+/// Tests use this rather than `set_var`: mutating process-wide environment from a `#[test]`
+/// thread races every concurrently-running test that reads it, and on glibc `setenv` may realloc
+/// `environ` while another thread walks it — undefined behaviour, not merely flakiness. The same
+/// seam exists in the server's warning scanner for the same reason.
+pub fn expand_env_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
@@ -433,10 +443,10 @@ pub fn expand_env(text: &str) -> String {
                 let token = &after[..end];
                 match token.split_once(":-") {
                     Some((name, fallback)) => {
-                        let value = std::env::var(name).unwrap_or_default();
+                        let value = lookup(name).unwrap_or_default();
                         out.push_str(if value.is_empty() { fallback } else { &value });
                     }
-                    None => out.push_str(&std::env::var(token).unwrap_or_default()),
+                    None => out.push_str(&lookup(token).unwrap_or_default()),
                 }
                 rest = &after[end + 1..];
             }
@@ -1222,30 +1232,32 @@ mod tests {
     /// two test lists are the only thing that catches that, since nothing compiles them together.
     #[test]
     fn expand_env_bare_and_defaulted_forms() {
-        std::env::set_var("WOOLLAMA_T_SET", "yes");
-        std::env::set_var("WOOLLAMA_T_EMPTY", "");
-        std::env::remove_var("WOOLLAMA_T_UNSET");
+        // Injected environment: no `set_var`, so this races nothing. (`expand_env` is a thin
+        // wrapper over this, so testing here covers both.)
+        let env = |name: &str| match name {
+            "SET" => Some("yes".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let e = |t: &str| expand_env_with(t, env);
 
         // Bare form: unset expands to EMPTY. Load-bearing — the bundled default relies on it.
-        assert_eq!(expand_env("${WOOLLAMA_T_UNSET}"), "");
-        assert_eq!(expand_env("${WOOLLAMA_T_SET}"), "yes");
+        assert_eq!(e("${UNSET}"), "");
+        assert_eq!(e("${SET}"), "yes");
 
         // POSIX `:-`: unset OR empty takes the fallback.
-        assert_eq!(expand_env("${WOOLLAMA_T_UNSET:-fb}"), "fb");
-        assert_eq!(expand_env("${WOOLLAMA_T_EMPTY:-fb}"), "fb");
-        assert_eq!(expand_env("${WOOLLAMA_T_SET:-fb}"), "yes");
+        assert_eq!(e("${UNSET:-fb}"), "fb");
+        assert_eq!(e("${EMPTY:-fb}"), "fb");
+        assert_eq!(e("${SET:-fb}"), "yes");
 
-        // Surrounding text, an empty fallback, and a fallback containing separators.
-        assert_eq!(expand_env("a${WOOLLAMA_T_UNSET:-b}c"), "abc");
-        assert_eq!(expand_env("${WOOLLAMA_T_UNSET:-}"), "");
-        assert_eq!(expand_env("${WOOLLAMA_T_UNSET:-/opt/x:-y}"), "/opt/x:-y");
+        // Surrounding text, an empty fallback, and a fallback containing the separator.
+        assert_eq!(e("a${UNSET:-b}c"), "abc");
+        assert_eq!(e("${UNSET:-}"), "");
+        assert_eq!(e("${UNSET:-/opt/x:-y}"), "/opt/x:-y");
 
-        // Unchanged edge cases: unclosed brace emits the remainder verbatim and stops.
-        assert_eq!(expand_env("${unclosed"), "${unclosed");
-        assert_eq!(expand_env("no vars here"), "no vars here");
-
-        std::env::remove_var("WOOLLAMA_T_SET");
-        std::env::remove_var("WOOLLAMA_T_EMPTY");
+        // Unchanged edge cases: an unclosed brace emits the remainder verbatim and stops.
+        assert_eq!(e("${unclosed"), "${unclosed");
+        assert_eq!(e("no vars here"), "no vars here");
     }
 
     use super::*;
