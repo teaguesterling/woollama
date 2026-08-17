@@ -1169,6 +1169,47 @@ async fn passthrough_stream(
         .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
 }
 
+/// Which residents may satisfy `<provider>/default`, best first.
+///
+/// A device's residency is device-wide, not per-inferencer: it lists everything loaded, including
+/// models this route was never configured to serve. Handing that raw to the resolver let `default`
+/// pick an embedder for a chat request — which the backend then rejects, since it is loaded but not
+/// servable on that endpoint.
+///
+/// Two rules, both deliberately vendor-neutral (no capability metadata required — that is issue
+/// #20, and it will refine this rather than replace it):
+///
+/// 1. **If the inferencer declares `models`, only those are candidates.** A model the operator
+///    never listed for this route is not a legitimate answer for that route's `default`.
+/// 2. **Order deterministically:** a configured `virtual.default` first if it is resident, then
+///    lexicographic. Previously the order came from `HashMap` iteration — `reconcile` stamps every
+///    newly-discovered resident with the SAME `last_used`, so `snapshot`'s sort is a no-op and the
+///    winner was decided by Rust's per-process hash seed. That made `default` **nondeterministic
+///    across restarts**: stable within one process, different in the next.
+///
+/// Fails open: with no `models` configured, every resident stays a candidate, so a backend that
+/// never declares a catalog behaves as before.
+fn default_candidates(inf: &engine::Inferencer, residency: Vec<String>) -> Vec<String> {
+    let mut candidates: Vec<String> = if inf.models.is_empty() {
+        residency
+    } else {
+        let allowed: std::collections::HashSet<&str> = inf.models.iter().map(String::as_str).collect();
+        let filtered: Vec<String> = residency.iter().filter(|m| allowed.contains(m.as_str())).cloned().collect();
+        // If nothing resident is a configured model, fall back to the unfiltered set rather than
+        // reporting "nothing loaded": the caller's own `virtual.default` fallback and the
+        // load-on-demand path both handle that better than an empty list does.
+        if filtered.is_empty() { residency } else { filtered }
+    };
+    candidates.sort();
+    if let Some(preferred) = inf.virtual_models.get("default") {
+        if let Some(i) = candidates.iter().position(|m| m == preferred) {
+            candidates.swap(0, i);
+            candidates[1..].sort();
+        }
+    }
+    candidates
+}
+
 /// Resolve → load-on-demand → gate → dispatch, for a management-capable inferencer.
 /// `Backpressure` => 503 + `Retry-After`; device errors => 502. A direct port of
 /// `router.py::_passthrough_pooled`.
@@ -1185,8 +1226,11 @@ async fn passthrough_pooled(
     // model to load its entry (issue #26). So read through to the device here and let it
     // arbitrate — woollama is not the only consumer of its management API, so our view is a cache,
     // never a ledger. A concrete model id or an alias needs no device round trip.
-    let loaded =
-        if bare == "default" { manager.residency().await } else { manager.snapshot() };
+    let loaded = if bare == "default" {
+        default_candidates(inf, manager.residency().await)
+    } else {
+        manager.snapshot()
+    };
     let default = inf.virtual_models.get("default").map(String::as_str);
     let real = match engine::resolver::resolve(bare, &inf.virtual_models, &loaded, default) {
         Ok(r) => r,
@@ -1661,6 +1705,83 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
         t.remove(&conv_id);
     }
     Json(json!({"id": conv_id, "object": "conversation.deleted", "deleted": true})).into_response()
+}
+
+#[cfg(test)]
+mod default_candidate_tests {
+    use super::*;
+
+    fn inf(models: &[&str], virtual_default: Option<&str>) -> engine::Inferencer {
+        let mut virtual_models = std::collections::BTreeMap::new();
+        if let Some(d) = virtual_default {
+            virtual_models.insert("default".to_string(), d.to_string());
+        }
+        engine::Inferencer {
+            name: "dev".into(),
+            base_url: "http://x/v1".into(),
+            api_key_env: None,
+            extra_body: serde_json::json!({}),
+            models: models.iter().map(|s| s.to_string()).collect(),
+            discover: false,
+            model_patterns: Vec::new(),
+            management_url: Some("http://x".into()),
+            management_protocol: None,
+            parallel: 1,
+            pool_max: None,
+            queue_max: None,
+            queue_timeout: 30.0,
+            virtual_models,
+        }
+    }
+
+    fn residency() -> Vec<String> {
+        // Device-wide residency, as a real device reports it: a chat model plus two that cannot
+        // serve chat at all.
+        ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Reranker-0.6B", "Qwen/Qwen3.6-35B-A3B-turbo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_model_this_route_never_declared_is_not_a_candidate() {
+        // The reported failure: `default` picked the embedder, which was never in this
+        // inferencer's `models` list, and the backend rejected it as "not loaded" — it IS loaded,
+        // just not servable on the chat endpoint.
+        let got = default_candidates(&inf(&["Qwen/Qwen3.6-35B-A3B-turbo"], None), residency());
+        assert_eq!(got, vec!["Qwen/Qwen3.6-35B-A3B-turbo".to_string()]);
+    }
+
+    #[test]
+    fn selection_is_deterministic_not_hash_ordered() {
+        // `reconcile` stamps every newly-discovered resident with the SAME last_used, so
+        // `snapshot`'s sort was a no-op and the winner came from HashMap iteration order — i.e.
+        // Rust's per-process hash seed. `default` was therefore stable within a process and
+        // different in the next one.
+        let i = inf(&[], None);
+        let first = default_candidates(&i, residency());
+        let mut shuffled = residency();
+        shuffled.reverse();
+        assert_eq!(first, default_candidates(&i, shuffled), "same residency ⇒ same choice, any input order");
+    }
+
+    #[test]
+    fn a_resident_virtual_default_wins_the_tiebreak() {
+        let got = default_candidates(
+            &inf(&[], Some("Qwen/Qwen3.6-35B-A3B-turbo")),
+            residency(),
+        );
+        assert_eq!(got[0], "Qwen/Qwen3.6-35B-A3B-turbo", "a configured default that IS resident wins");
+    }
+
+    #[test]
+    fn no_configured_models_keeps_every_resident_a_candidate() {
+        // Fail open: a backend that declares no catalog must behave as before.
+        assert_eq!(default_candidates(&inf(&[], None), residency()).len(), 3);
+        // And if nothing resident is a configured model, don't report an empty set — let the
+        // caller's virtual.default / load-on-demand path handle it.
+        assert_eq!(default_candidates(&inf(&["Not/Resident"], None), residency()).len(), 3);
+    }
 }
 
 #[cfg(test)]
