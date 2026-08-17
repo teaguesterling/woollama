@@ -510,8 +510,9 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
 pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
     let raw = read_user_or_default("mcp.json", DEFAULT_MCP);
     let (specs, errors, mut warnings) = parse_mcp_servers(&engine::expand_env(&raw))?;
-    // Prepend rather than append: an unset variable usually EXPLAINS the errors below it, and an
-    // operator reading top-down should meet the cause before the symptoms.
+    // Unset-variable lines first WITHIN the warnings, since they usually explain the rest. (They
+    // still print after errors — both consumers drain errors first — so this orders warnings
+    // relative to each other, nothing more.)
     let mut all = unset_var_warnings(&raw);
     all.append(&mut warnings);
     Ok((specs, errors, all))
@@ -588,60 +589,91 @@ fn parse_capabilities(text: &str) -> Result<HashMap<String, CapabilityMap>, Stri
     Ok(out)
 }
 
-/// Every `${VAR}` referenced in `text` whose variable is unset, in first-seen order.
-///
-/// Scans the RAW text, before expansion — afterwards an unset variable is indistinguishable from
-/// one that was legitimately empty, which is the whole problem.
-fn referenced_unset_vars(text: &str) -> Vec<String> {
-    referenced_vars_where(text, |v| v.is_none())
+/// One `${VAR}` reference found in mcp.json, with enough context to be actionable.
+#[derive(Debug, PartialEq)]
+struct VarRef {
+    var: String,
+    /// The `mcpServers` entry it appeared under, when it appeared under one.
+    server: Option<String>,
+    /// The `env` key it is the value of. `Some` ⇒ this is the credential case.
+    env_key: Option<String>,
 }
 
-/// `${VAR}` names in `text` whose current value satisfies `want`, in first-seen order.
-/// `None` is passed for an unset variable, `Some(value)` otherwise.
-fn referenced_vars_where(text: &str, want: impl Fn(Option<&str>) -> bool) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Extract `${VAR}` names from one string value.
+fn vars_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
         let after = &rest[pos + 2..];
         let Some(end) = after.find('}') else { break };
-        let name = &after[..end];
-        let value = std::env::var(name).ok();
-        if !name.is_empty() && want(value.as_deref()) && !out.iter().any(|n| n == name) {
-            out.push(name.to_string());
+        if !after[..end].is_empty() {
+            out.push(after[..end].to_string());
         }
         rest = &after[end + 1..];
     }
     out
 }
 
-/// The `${VAR}` names referenced inside any server's `env` block, from the RAW mcp.json.
+/// Every `${VAR}` reference in the config the LOADER will actually consume.
 ///
-/// These are called out separately because they are the one position where the credential risk is
-/// real and **no in-process consumer can catch it**: the consumer is a child process, and
-/// woollama cannot know whether an empty `API_KEY=` means "auth disabled", "anonymous mode", or
-/// "this child will talk to a remote service unauthenticated". The child often cannot tell either
-/// — plenty of servers treat empty-string as absent and proceed. Elsewhere woollama IS the
-/// consumer and can fail closed (see `validate_header_value`); here it can only warn.
-fn env_referenced_vars(raw: &str) -> Vec<String> {
-    // Unparseable raw text degrades to "no env-block variables", so those references fall back to
-    // the generic warning. Acceptable: text that is not valid JSON before expansion is not valid
-    // after it either, so `parse_mcp_servers` reports a parse error and the warning wording is
-    // the least of the operator's problems.
-    let Ok(v) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
-    let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else { return Vec::new() };
-    let mut out: Vec<String> = Vec::new();
-    for (_, spec) in servers {
-        let Some(env) = spec.get("env").and_then(Value::as_object) else { continue };
-        for (_, val) in env {
-            let Some(text) = val.as_str() else { continue };
-            // Unset OR explicitly empty. Both expand to nothing and carry the identical risk —
-            // `FOO=` in a unit file and a missing `FOO` are indistinguishable to the child. The
-            // generic case stays unset-only, where an empty value is more likely to be deliberate.
-            for name in referenced_vars_where(text, |v| v.unwrap_or("").is_empty()) {
-                if !out.iter().any(|n| n == &name) {
-                    out.push(name);
+/// Walks the parsed structure rather than scanning raw text, for two reasons that both bit:
+/// a raw scan reads **documentation strings** — the bundled default's `_doc2` explains
+/// `${VAR}` in prose, so every out-of-the-box install warned about a variable named `VAR` — and
+/// it cannot say *which* server or key a reference belongs to, which is what makes a warning
+/// actionable. Keys beginning `_` are documentation by convention and are skipped everywhere.
+fn referenced_vars(raw: &str) -> Vec<VarRef> {
+    fn walk(v: &Value, server: Option<&str>, env_key: Option<&str>, out: &mut Vec<VarRef>) {
+        match v {
+            Value::String(s) => {
+                for var in vars_in(s) {
+                    out.push(VarRef {
+                        var,
+                        server: server.map(str::to_string),
+                        env_key: env_key.map(str::to_string),
+                    });
                 }
             }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, server, env_key, out);
+                }
+            }
+            Value::Object(map) => {
+                for (k, val) in map {
+                    if k.starts_with('_') {
+                        continue; // documentation, not configuration
+                    }
+                    walk(val, server, env_key, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(v) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (k, val) in v.as_object().into_iter().flatten() {
+        if k.starts_with('_') {
+            continue;
+        }
+        if k == "mcpServers" {
+            for (name, spec) in val.as_object().into_iter().flatten() {
+                let Some(spec) = spec.as_object() else { continue };
+                for (field, fv) in spec {
+                    if field.starts_with('_') {
+                        continue;
+                    }
+                    if field == "env" {
+                        for (env_key, ev) in fv.as_object().into_iter().flatten() {
+                            walk(ev, Some(name), Some(env_key), &mut out);
+                        }
+                    } else {
+                        walk(fv, Some(name), None, &mut out);
+                    }
+                }
+            }
+        } else {
+            walk(val, None, None, &mut out);
         }
     }
     out
@@ -651,36 +683,57 @@ fn env_referenced_vars(raw: &str) -> Vec<String> {
 ///
 /// Not an error, deliberately. Expansion runs over the WHOLE file before parsing, so failing here
 /// would take every unrelated server down with the one that referenced a missing variable — and
-/// the bundled default config depends on `${WOOLLAMA_EXAMPLES_DIR}` being unset on a
-/// binary-only install. A warning changes nothing about what loads and closes the real gap:
-/// today an operator gets no signal at all unless a consumer happens to check.
-fn unset_var_warnings(raw: &str) -> Vec<String> {
-    let in_env = env_referenced_vars(raw);
-    // Union: an env-block variable that is set-but-empty would not appear in the unset scan, and
-    // it is precisely the case with no other guard.
-    let mut names = referenced_unset_vars(raw);
-    for n in &in_env {
-        if !names.contains(n) {
-            names.push(n.clone());
+/// the bundled default config depends on `${WOOLLAMA_EXAMPLES_DIR}` being unset on a binary-only
+/// install. A warning changes nothing about what loads and closes the real gap: today an operator
+/// gets no signal at all unless a consumer happens to check.
+///
+/// `lookup` is injected so tests need no ambient environment — `set_var` from a `#[test]` thread
+/// races every concurrently-running test that reads the environment, and on glibc `setenv`
+/// alongside `environ` iteration is a genuine data race, not merely flaky.
+fn unset_var_warnings_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    for r in referenced_vars(raw) {
+        let value = lookup(&r.var);
+        let empty = value.as_deref().unwrap_or("").is_empty();
+        // Outside an `env` block only a genuinely UNSET variable is worth a line: an empty value
+        // there is far more likely deliberate. Inside one, unset and empty are indistinguishable
+        // to the child and carry the same risk.
+        let report = if r.env_key.is_some() { empty } else { value.is_none() };
+        if !report {
+            continue;
         }
+        // Dedup per (variable, server) so one shared variable across a dozen servers names each
+        // affected child once, rather than collapsing to a single anonymous line.
+        let key = (r.var.clone(), r.server.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(match (&r.server, &r.env_key) {
+            (Some(server), Some(env_key)) => format!(
+                "mcp.json: server '{server}' env '{env_key}' uses ${{{}}}, which is unset or \
+                 empty — the child will receive an EMPTY value, which it may treat as absent and \
+                 proceed without it. woollama cannot check this on the child's behalf.",
+                r.var
+            ),
+            (Some(server), None) => format!(
+                "mcp.json: server '{server}' uses ${{{}}}, which is unset; it expands to nothing \
+                 (intended for optional paths — see docs/configuration.md)",
+                r.var
+            ),
+            _ => format!(
+                "mcp.json: ${{{}}} is unset; it expands to nothing (intended for optional paths \
+                 — see docs/configuration.md)",
+                r.var
+            ),
+        });
     }
-    names
-        .into_iter()
-        .map(|name| {
-            if in_env.contains(&name) {
-                format!(
-                    "mcp.json: ${{{name}}} is unset and is used in a server's `env` — the child \
-                     will receive an EMPTY value, which it may treat as absent and proceed \
-                     without it. woollama cannot check this on the child's behalf."
-                )
-            } else {
-                format!(
-                    "mcp.json: ${{{name}}} is unset; it expands to nothing (intended for optional \
-                     paths — see docs/configuration.md)"
-                )
-            }
-        })
-        .collect()
+    out
+}
+
+fn unset_var_warnings(raw: &str) -> Vec<String> {
+    unset_var_warnings_with(raw, |name| std::env::var(name).ok())
 }
 
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
@@ -1031,63 +1084,78 @@ mod tests {
         assert!(err.contains("device") && err.contains("embedding"), "{err}");
     }
 
+    /// Fake environment, so these tests mutate nothing. `set_var` from a `#[test]` thread races
+    /// every concurrently-running test that reads the environment — and on glibc `setenv`
+    /// alongside `environ` iteration is a data race, not just flakiness.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+
     #[test]
-    fn unset_vars_are_found_in_the_raw_text() {
-        std::env::remove_var("WOOLLAMA_TEST_UNSET_A");
-        std::env::set_var("WOOLLAMA_TEST_SET_B", "x");
-        let found = referenced_unset_vars(
-            "a=${WOOLLAMA_TEST_UNSET_A} b=${WOOLLAMA_TEST_SET_B} again=${WOOLLAMA_TEST_UNSET_A}",
+    fn documentation_strings_are_not_scanned_for_variables() {
+        // The bundled default's `_doc2` EXPLAINS `${VAR}` in prose. A raw text scan extracted a
+        // variable named `VAR` from it, so every out-of-the-box install led with a warning about
+        // something that does not exist — from the feature whose whole purpose is to make
+        // warnings trustworthy.
+        let warnings = unset_var_warnings_with(DEFAULT_MCP, |_| None);
+        assert!(
+            !warnings.iter().any(|w| w.contains("${VAR}")),
+            "documentation must not be mistaken for configuration: {warnings:?}"
         );
-        std::env::remove_var("WOOLLAMA_TEST_SET_B");
-        assert_eq!(found, vec!["WOOLLAMA_TEST_UNSET_A".to_string()], "unset only, deduped");
+        // The real reference in the same file is still found.
+        assert!(
+            warnings.iter().any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
+            "the genuinely-referenced variable must still be reported: {warnings:?}"
+        );
     }
 
     #[test]
-    fn env_block_vars_are_distinguished_from_the_rest() {
-        // The one position where the credential risk is real and no in-process consumer can catch
-        // it: the consumer is a child process, and an empty value may be silently treated as
-        // absent by a server that then proceeds unauthenticated.
-        std::env::remove_var("WOOLLAMA_TEST_ENV_TOKEN");
-        std::env::remove_var("WOOLLAMA_TEST_PLAIN_PATH");
+    fn an_env_reference_names_the_server_and_key() {
+        // `validate_header_value` names the server and header; this must match that convention,
+        // or an operator with a dozen servers sharing ${API_KEY} gets one anonymous line.
         let raw = r#"{"mcpServers": {
-            "a": {"command": "x", "args": ["${WOOLLAMA_TEST_PLAIN_PATH}/s.py"],
-                  "env": {"API_KEY": "${WOOLLAMA_TEST_ENV_TOKEN}"}}
+            "git": {"command": "x", "env": {"API_KEY": "${TOK}"}},
+            "fs":  {"command": "y", "env": {"API_KEY": "${TOK}"}}
         }}"#;
-        let in_env = env_referenced_vars(raw);
-        assert_eq!(in_env, vec!["WOOLLAMA_TEST_ENV_TOKEN".to_string()]);
-        // The path variable is unset too, but it is NOT an env-block credential concern — an
-        // optional path expanding to nothing is the documented, intended behaviour.
-        assert!(!in_env.contains(&"WOOLLAMA_TEST_PLAIN_PATH".to_string()));
-        assert!(referenced_unset_vars(raw).contains(&"WOOLLAMA_TEST_PLAIN_PATH".to_string()));
+        let w = unset_var_warnings_with(raw, |_| None);
+        assert_eq!(w.len(), 2, "one line per affected server, not one for the variable: {w:?}");
+        assert!(w.iter().any(|l| l.contains("'git'") && l.contains("'API_KEY'")), "{w:?}");
+        assert!(w.iter().any(|l| l.contains("'fs'")), "{w:?}");
     }
 
     #[test]
-    fn an_env_var_set_to_empty_is_treated_like_an_unset_one() {
-        // `FOO=` in a unit file and a missing `FOO` are indistinguishable to the child, and carry
-        // the identical risk. The unset scan alone would miss this: env::var returns Ok("").
-        std::env::set_var("WOOLLAMA_TEST_EMPTY_TOKEN", "");
-        let raw = r#"{"mcpServers": {"a": {"command": "x",
-            "env": {"API_KEY": "${WOOLLAMA_TEST_EMPTY_TOKEN}"}}}}"#;
-        let warnings = unset_var_warnings(raw);
-        std::env::remove_var("WOOLLAMA_TEST_EMPTY_TOKEN");
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("`env`"), "must use the credential wording: {}", warnings[0]);
+    fn env_and_non_env_references_differ_in_wording_and_in_threshold() {
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${P}/s.py"],
+            "env": {"API_KEY": "${T}"}}}}"#;
 
-        // The generic case stays unset-only: an empty value outside an env block is far more
-        // likely to be deliberate, and warning on it every start would be noise.
-        std::env::set_var("WOOLLAMA_TEST_EMPTY_PATH", "");
-        let plain = r#"{"mcpServers": {"a": {"command": "x", "args": ["${WOOLLAMA_TEST_EMPTY_PATH}/s"]}}}"#;
-        let warnings = unset_var_warnings(plain);
-        std::env::remove_var("WOOLLAMA_TEST_EMPTY_PATH");
-        assert!(warnings.is_empty(), "{warnings:?}");
+        // Both unset: both reported, with different wording.
+        let w = unset_var_warnings_with(raw, |_| None);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w.iter().any(|l| l.contains("env 'API_KEY'") && l.contains("unset or empty")));
+        assert!(w.iter().any(|l| l.contains("${P}") && l.contains("optional paths")));
+
+        // Both set-but-EMPTY: only the env one is reported. `FOO=` in a unit file is
+        // indistinguishable from missing to a child; an empty optional path is likely deliberate.
+        let w = unset_var_warnings_with(raw, env_of(&[("P", ""), ("T", "")]));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("env 'API_KEY'"), "{}", w[0]);
+        assert!(w[0].contains("unset or empty"), "must not claim 'unset' about a set variable: {}", w[0]);
+
+        // Both populated: silence.
+        assert!(unset_var_warnings_with(raw, env_of(&[("P", "/opt"), ("T", "sk-1")])).is_empty());
     }
 
     #[test]
-    fn the_bundled_default_is_not_treated_as_broken() {
-        // defaults/mcp.json DEPENDS on ${WOOLLAMA_EXAMPLES_DIR} being unset on a binary-only
-        // install. It must warn at most — never error — or a `cargo install` loads no MCP
-        // servers at all.
-        assert!(parse_mcp_servers(&engine::expand_env(DEFAULT_MCP)).is_ok());
+    fn the_bundled_default_loads_its_servers_and_only_warns() {
+        // The invariant a fail-closed change would break, asserted properly. `parse_mcp_servers`
+        // returns Ok even when every entry lands in the per-server error vec, so `is_ok()` alone
+        // would still pass with ZERO servers loaded — which is exactly the outcome being guarded
+        // against.
+        let (specs, errors, _) = parse_mcp_servers(&engine::expand_env(DEFAULT_MCP)).unwrap();
+        assert_eq!(specs.len(), 2, "the bundled default must yield both example servers");
+        assert!(errors.is_empty(), "and none of them may be skipped: {errors:?}");
+        // With the examples dir absent it warns, and warning is all it may do.
+        assert!(!unset_var_warnings_with(DEFAULT_MCP, |_| None).is_empty());
     }
 
     #[test]
