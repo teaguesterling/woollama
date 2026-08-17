@@ -56,6 +56,7 @@ inference or tools.
 | Fabric backend: managed/routed `fabric --serve` behind woollama; its library on `/w1/`, a transparent fabric REST proxy; behind a pluggable `PatternBackend` trait (the model for new backends) | `fabric.rs`, `pattern_backend.rs` | w1-fabric |
 | **Image + embedding pass-through** — `POST /v1/images/generations` and `POST /v1/embeddings` forward a `<provider>/<model>` request to that inferencer's own OpenAI-compatible endpoints, mirroring chat pass-through (non-streaming; unknown namespace → 400) | `router.py` (Python); ported to `woollama-server` for parity | v0.9.0 |
 | **Model pooling / device-aware inferencers** — an inferencer declaring `management_url` gets on-demand model load (`/api/v1/models/{running,start,stop}`), virtual model names (`<provider>/default`, config `virtual` aliases), and per-model request queuing/backpressure (`503` + `Retry-After`) with queue-aware LRU eviction to fit `pool_max`. Fully additive; covers `/v1/chat/completions` only (`/v1/responses` not pooled yet). Shipped in **both** `woollama` (Python) and `woollamad` (Rust) | `resolver.py`, `pool.py`, `router.py`; Rust twin `resolver`/`pool` modules | v0.10.0 |
+| **HTTP downstream MCP transport** — `mcp.json` gains a `url` form (Streamable HTTP) alongside `command`, so one woollamad can consume another's `/mcp`. Credentials via `${VAR}` in `headers`, validated fail-closed at load. Also restores the `env` key the Rust port silently dropped, and forwards it through claude-code delegation. **Rust-only** (`woollamad` is canonical; the Python oracle requires `command`) | `config.rs`, `mcp_registry.rs`, `lib.rs` | #19 |
 | Lint-clean (`ruff check .`); Rust suite + `clippy -D warnings` | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
@@ -74,6 +75,68 @@ loading, virtual model names, and per-model request queuing (`/v1/chat/completio
 only — see v0.10.0 above).
 
 ## Open tracks (recommended order)
+
+0. **Downstream reconnect/retry for `url`-form MCP servers** (follows #19). A
+   remote peer can come back where a failed `exec` won't, so retrying past
+   startup is worth having. **Three obligations belong to this slice
+   specifically, and all three look like they belong somewhere else** — that is
+   exactly why they'd be orphaned:
+   - **Structure.** `McpRegistry` holds plain `HashMap`s behind an `Arc` with no
+     interior mutability, so reconnect needs an `RwLock` through
+     `resolve`/`tool`/`reexport_tools`/`call_server`/`call_raw`. A hot-path
+     structural change, not an addition — which is why #19 left it out.
+   - **The federation hop cap.** Tool federation is safe today *because rosters
+     are cached at connect and served from cache* (`mcp_registry.rs`
+     `connect_one`, `mcp_surface.rs` `list_tools`) — nothing recurses at request
+     time. Dynamic roster refresh is precisely what removes that property: a
+     refresh can cascade across routers at request time, making live recursion
+     reachable for the first time. **Design the hop cap here or not at all.**
+   - **Loop protection generally — currently DEFERRED, NOT SOLVED.** Mutual
+     cycles (A→B→A) are reachable today through ordinary restarts: A starts (B
+     down, skipped), B starts and connects to A, A restarts and connects to B.
+     No self-reference, no ordering violation, and nothing guards it. Only the
+     degenerate A→A case is prevented, and only incidentally — `build_state()`
+     connects downstreams before `axum::serve` opens the listener, so an
+     instance naming its own address gets connection-refused. *That is not loop
+     protection.* Dispatch does terminate (`resolve()` hands each peer the name
+     it advertised, one namespace prefix shorter, so a finite name shrinks
+     monotonically), but **tool names gain a nesting level per mutual restart
+     cycle** and degrade silently to hashed forms at the 64-char limit. An
+     inbound self-identity check would not help — in A→B→A neither side ever
+     sees its own id; the mechanism is the instance-id `Via` chain plus hop cap.
+   - **Retry must stay observable.** Never present a reconnecting server as
+     present-with-zero-tools: distinct connected / degraded-retrying /
+     never-connected states, with last error and attempt count. The test that
+     matters is *"while down, the degraded state is visible"* — a test that only
+     asserts eventual success also passes on a router permanently hiding a dead
+     downstream.
+
+### Latent issues surfaced by #19 (not yet filed as issues)
+
+Found while building the HTTP transport; each is out of that change's scope and
+none is fixed. Recorded here so they aren't lost.
+
+- **`engine::expand_env` fails open.** It resolves an unset `${VAR}` with
+  `unwrap_or_default()`, so a missing variable silently becomes the empty string
+  across **both** `mcp.json` and `inferencers.toml`. #19 guards only the case it
+  introduced (MCP headers, validated at load); the general behaviour needs its
+  own decision about whether unset-is-empty is intended, and the fix would land
+  in the parity-locked engine.
+- **`wire_name`'s >64-char fallback uses `DefaultHasher`.** `std`'s
+  `DefaultHasher` explicitly does not guarantee its algorithm across Rust
+  releases, so a hashed tool name can **change under a toolchain upgrade** —
+  silently breaking any recipe allow-list entry or client-cached name on the
+  hashed path. Dormant today because almost nothing exceeds 64 chars, but
+  federation is what pushes names over the line
+  (`mcp__mcp-suite__mcp__reader__parse_structured` is 45 chars at two levels),
+  and in a mutual-cycle topology names gain a level per restart. At that point a
+  hashed name stops being a cosmetic fallback and becomes a **load-bearing
+  identity that must stay stable across restarts.** Fix: a pinned hash (FNV or
+  truncated SHA-256), no behaviour change for names that already fit.
+- **`/v1/tools` exists only in the Python reference** (`router.py`).
+  `woollamad` has no such route, though `README.md` lists it under "What works
+  today" for the router generally. Federation makes tool introspection more
+  valuable, not less — either port it or correct the README.
 
 1. ~~**Streaming**~~ — ✅ DONE (all three slices). OpenAI SSE out + MCP progress
    events. Reshaped `orchestrate` into one async generator without forking the

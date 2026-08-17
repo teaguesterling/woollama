@@ -31,24 +31,75 @@ Shape matches Claude Code's `mcpServers` block:
 }
 ```
 
+A server is **either** a stdio subprocess (`command`) **or** a Streamable-HTTP
+endpoint (`url`). Setting both is an error, as is setting neither.
+
 | Field | Required | Description |
 |---|---|---|
-| `command` | ✅ | Executable to launch the server (stdio MCP). |
-| `args` | — | Argument list (default `[]`). |
-| `env` | — | Extra environment for the server process (default `{}`). |
+| `command` | one of | Executable to launch the server (stdio MCP). |
+| `args` | — | Argument list (default `[]`). Stdio only. |
+| `env` | — | Extra environment for the server process (default `{}`). Stdio only. |
+| `url` | one of | Streamable-HTTP MCP endpoint, e.g. another woollamad's `/mcp`. |
+| `headers` | — | Headers sent with every request to `url` (default `{}`). HTTP only. |
 
 woollama starts one long-lived connection per server and aggregates their tools
 (namespaced `<server>.<tool>`).
+
+#### The `url` form — consuming a remote MCP server
+
+```json
+{
+  "mcpServers": {
+    "shelf": {
+      "url": "http://mcp.example.lan:9200/mcp",
+      "headers": { "Authorization": "Bearer ${SHELF_TOKEN}" }
+    }
+  }
+}
+```
+
+Because woollama also *serves* Streamable HTTP at `/mcp`, the `url` form is how
+one woollamad consumes another — an inference-holding instance reaching a
+tools-only instance's namespace without either spawning the other's servers.
+
+**Credentials go in `headers` as `${VAR}`, never inline.** There is no separate
+secrets mechanism: `${VAR}` expansion already applies to `mcp.json`, the same
+shape as `api_key_env` for inferencers.
+
+Header values are validated at load — an empty value, or a bare auth scheme with
+nothing after it, is a startup error naming the server and header. This is
+deliberate: `${VAR}` expansion resolves an **unset** variable to the empty
+string, so `"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset would otherwise
+produce the literal header `Bearer ` — a well-formed request carrying no
+credential, which a permissive downstream accepts while everything reports
+healthy.
+
+`env` has no meaning for a `url` server (there is no child process), and the
+child-env scrub below likewise applies only to the stdio form. A `url` server
+also cannot be handed to **claude-code delegation**: a recipe whose tools
+reference one is rejected with a 400 naming the server, rather than having the
+child `claude` process connect to the downstream directly, outside woollama's
+allow-list boundary.
+
+> **The `url` form is `woollamad`-only.** The Python reference server (the
+> differential-test oracle) requires `command` and will fail to load a config
+> containing a `url` server. If you share one config dir between the two, keep
+> `url` entries out of it.
 
 > **Interpreter & `PATH`.** `command` is resolved against woollama's *own*
 > environment when the server is spawned. A bare name (`python`, `uvx`, `node` —
 > including in the `conversationStore` examples below) picks whatever is first on
 > `PATH` at spawn time, which need not be the interpreter that has the server's
 > dependencies when woollama runs **outside its virtualenv** (launched by an
-> absolute path, or as a `systemd` unit with a minimal `PATH`). Because a
-> downstream server that fails to start **aborts woollama startup**, pin `command`
-> to an absolute interpreter (e.g. your venv's `python`) if startup is sensitive
-> to which environment launched it.
+> absolute path, or as a `systemd` unit with a minimal `PATH`). Pin `command` to an
+> absolute interpreter (e.g. your venv's `python`) if startup is sensitive to
+> which environment launched it.
+
+> **On a downstream server that fails to start, the two implementations
+> differ.** `woollamad` (the canonical router) logs a warning and skips it, so
+> the router comes up in a known-degraded state with that server's tools absent.
+> The Python reference server aborts startup instead. Don't design around either
+> behaviour without checking which one you're running.
 
 ### Selecting a conversation store
 
