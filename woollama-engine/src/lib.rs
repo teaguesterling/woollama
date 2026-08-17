@@ -434,6 +434,11 @@ pub fn expand_env(text: &str) -> String {
 /// misconfiguration. An unparseable document yields nothing here; its parse error surfaces next
 /// and is the better message anyway.
 pub fn missing_vars_in_toml(text: &str) -> Vec<String> {
+    missing_vars_in_toml_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`missing_vars_in_toml`] with the environment injected (see [`expand_env_with`]).
+pub fn missing_vars_in_toml_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
     fn walk(v: &toml::Value, out: &mut Vec<String>, lookup: &dyn Fn(&str) -> Option<String>) {
         match v {
             toml::Value::String(s) => {
@@ -444,13 +449,19 @@ pub fn missing_vars_in_toml(text: &str) -> Vec<String> {
                 }
             }
             toml::Value::Array(items) => items.iter().for_each(|i| walk(i, out, lookup)),
-            toml::Value::Table(t) => t.values().for_each(|i| walk(i, out, lookup)),
+            // Skip `_`-prefixed keys: documentation by convention, matching the JSON walker and
+            // the Python mirror. Without this the same file loads under one implementation and is
+            // refused by the other.
+            toml::Value::Table(t) => t
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .for_each(|(_, i)| walk(i, out, lookup)),
             _ => {}
         }
     }
     let Ok(doc) = toml::from_str::<toml::Value>(text) else { return Vec::new() };
     let mut out = Vec::new();
-    walk(&doc, &mut out, &|name| std::env::var(name).ok());
+    walk(&doc, &mut out, &lookup);
     out
 }
 

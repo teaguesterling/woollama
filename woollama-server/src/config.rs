@@ -506,22 +506,30 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
     Ok(())
 }
 
-/// `load_mcp_servers`, but returning the per-server diagnostics it would otherwise log and
-/// discard. For `woollamad check-config`, which exists because those diagnostics are otherwise
-/// visible only in the boot log: a *connection* failure may self-heal on the next request, but a
-/// malformed entry stays malformed until a human edits the file, and the only evidence it was
-/// ever configured is a startup line nobody re-reads.
 /// Refuse a config referencing variables that do not exist. Checked BEFORE expansion, because
 /// afterwards a missing variable is an empty string — indistinguishable from an intentionally
 /// empty one, which is precisely what `${VAR:-default}` exists to let an author say.
 fn reject_missing_vars(raw: &str) -> Result<(), String> {
+    reject_missing_vars_with(raw, |name| std::env::var(name).ok())
+}
+
+fn reject_missing_vars_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
     // Via the structural walker, which skips `_`-prefixed documentation keys. A raw-text scan
     // reads the bundled default's own `_doc2` — which EXPLAINS `${VAR}` in prose — and made
     // woollamad refuse to load its own config. Only values the loader consumes can be wrong.
     let mut missing: Vec<String> = Vec::new();
     for r in referenced_vars(raw) {
+        // A malformed reference is not a missing variable, and telling someone to export
+        // `${${HOME}` is advice they cannot follow. Report what is actually wrong.
+        if r.var.is_malformed() {
+            return Err(format!(
+                "mcp.json: `${{{}}}` looks malformed — `${{VAR:-default}}` does not nest, so a \
+                 `${{...}}` inside a reference is not expanded. Check this reference.",
+                r.var.name
+            ));
+        }
         if r.var.fallback.is_none()
-            && std::env::var(&r.var.name).is_err()
+            && lookup(&r.var.name).is_none()
             && !missing.contains(&r.var.name)
         {
             missing.push(r.var.name.clone());
@@ -534,6 +542,11 @@ fn reject_missing_vars(raw: &str) -> Result<(), String> {
     }
 }
 
+/// `load_mcp_servers`, but returning the per-server diagnostics it would otherwise log and
+/// discard. For `woollamad check-config`, which exists because those diagnostics are otherwise
+/// visible only in the boot log: a *connection* failure may self-heal on the next request, but a
+/// malformed entry stays malformed until a human edits the file, and the only evidence it was
+/// ever configured is a startup line nobody re-reads.
 pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
     let raw = read_user_or_default("mcp.json", DEFAULT_MCP);
     reject_missing_vars(&raw)?;
@@ -1184,12 +1197,14 @@ mod tests {
         // must not both claim the same case: the structural walker is what makes the error safe,
         // and a raw-text version of it made woollamad refuse its own bundled config.
         let bare = DEFAULT_MCP.replace(":-/nonexistent", "");
+        // Injected lookup: this module documents why tests must not depend on ambient env, and
+        // an exported WOOLLAMA_EXAMPLES_DIR made an earlier version of this assertion fail.
         assert!(
-            reject_missing_vars(&bare).is_err(),
+            reject_missing_vars_with(&bare, |_| None).is_err(),
             "a bare unset reference must be refused, not merely reported"
         );
         assert!(
-            reject_missing_vars(DEFAULT_MCP).is_ok(),
+            reject_missing_vars_with(DEFAULT_MCP, |_| None).is_ok(),
             "and the shipped default, whose only reference declares a fallback, must load"
         );
     }
@@ -1227,6 +1242,27 @@ mod tests {
         // "absent is intended" is the whole point of the syntax.
         let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${P:-/opt}/s"]}}}"#;
         assert!(unset_var_warnings_with(raw, |_| None).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_reference_is_refused_with_actionable_advice() {
+        // `${${HOME}}` has no fallback, so the missing-variable path would have refused it with
+        // "export ${${HOME}" — advice nobody can follow. Report what is actually wrong.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${${HOME}}"]}}}"#;
+        let err = reject_missing_vars_with(raw, |_| None).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+        assert!(!err.contains("Export it"), "must not advise exporting an unexportable name: {err}");
+    }
+
+    #[test]
+    fn a_server_name_is_not_a_documentation_key() {
+        // `_` marks a documentation KEY, not a namespace. Applying it to server names would let
+        // `_disabled` skip the check and then LOAD with a silently-empty command.
+        let raw = r#"{"mcpServers": {"_disabled": {"command": "${NOPE}/x"}}}"#;
+        assert!(
+            reject_missing_vars_with(raw, |_| None).is_err(),
+            "a server named `_disabled` is still a server"
+        );
     }
 
     #[test]

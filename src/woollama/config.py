@@ -91,7 +91,7 @@ def _expand_env(text: str) -> str:
     A config file is read by BOTH implementations, so a divergence here is a
     config that behaves differently depending on which one loaded it. Change
     the two together or not at all."""
-    os.environ["WOOLLAMA_EXAMPLES_DIR"] = str(_examples_dir())
+    _ensure_examples_dir()
     out: list[str] = []
     rest = text
     while True:
@@ -114,6 +114,18 @@ def _expand_env(text: str) -> str:
         rest = after[end + 1:]
     out.append(rest)
     return "".join(out)
+
+
+def _ensure_examples_dir() -> None:
+    """Publish WOOLLAMA_EXAMPLES_DIR so the bundled defaults resolve.
+
+    Called by BOTH `_expand_env` and `_reject_missing_vars`. It used to be set
+    only inside `_expand_env`, which runs AFTER the rejection check -- so an
+    identical config was refused on a fresh process and accepted once anything
+    else had expanded first. Rust avoids this by calling `ensure_examples_dir`
+    before any load; this is the same hoist.
+    """
+    os.environ["WOOLLAMA_EXAMPLES_DIR"] = str(_examples_dir())
 
 
 def _missing_vars(text: str) -> list[str]:
@@ -159,21 +171,43 @@ def _missing_vars_in(parsed: object) -> list[str]:
     """
     out: list[str] = []
 
-    def walk(node: object) -> None:
+    def collect(text: str) -> None:
+        for name in _missing_vars(text):
+            if name not in out:
+                out.append(name)
+
+    def walk(node: object, *, skip_underscore: bool) -> None:
+        """`skip_underscore` is False for maps whose KEYS are user-chosen names.
+
+        `_` marks a documentation key, not a namespace. Applying it at every
+        depth also skipped MCP server NAMES, so `{"mcpServers": {"_disabled":
+        {"command": "${NOPE}/x"}}}` passed the check and then LOADED with a
+        silently-empty command -- and Rust, which does not skip server names,
+        refused the same file.
+        """
         if isinstance(node, str):
-            for name in _missing_vars(node):
-                if name not in out:
-                    out.append(name)
+            collect(node)
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, skip_underscore=skip_underscore)
         elif isinstance(node, dict):
             for key, value in node.items():
-                if isinstance(key, str) and key.startswith("_"):
+                if skip_underscore and isinstance(key, str) and key.startswith("_"):
                     continue
-                walk(value)
+                walk(value, skip_underscore=True)
 
-    walk(parsed)
+    if isinstance(parsed, dict):
+        for key, value in parsed.items():
+            if isinstance(key, str) and key.startswith("_"):
+                continue
+            if key == "mcpServers" and isinstance(value, dict):
+                # Server names are user-chosen; only their FIELDS follow the `_` convention.
+                for server in value.values():
+                    walk(server, skip_underscore=True)
+            else:
+                walk(value, skip_underscore=True)
+    else:
+        walk(parsed, skip_underscore=True)
     return out
 
 
@@ -190,6 +224,7 @@ def _reject_missing_vars(source: str, text: str) -> None:
     except (json.JSONDecodeError, tomllib.TOMLDecodeError):
         # Unparseable: its own parse error surfaces next and is the better message.
         return
+    _ensure_examples_dir()
     missing = _missing_vars_in(parsed)
     if not missing:
         return

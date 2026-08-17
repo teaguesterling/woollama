@@ -17,6 +17,15 @@ async fn main() {
         std::process::exit(woollama_server::check_config());
     }
 
+    // Refuse a config the operator must fix, rather than starting degraded. Starting with zero
+    // MCP servers and silently-restored statelessness while reporting healthy is worse than not
+    // starting: the failure is invisible until something downstream misbehaves.
+    if let Some(e) = woollama_server::fatal_config_error() {
+        eprintln!("woollamad: {e}");
+        eprintln!("woollamad: refusing to start. Run `woollamad check-config` to verify a fix.");
+        std::process::exit(1);
+    }
+
     let state = Arc::new(woollama_server::build_state().await);
 
     // `woollamad mcp` → serve the MCP surface over stdio (for an MCP client's
