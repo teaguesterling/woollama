@@ -113,6 +113,15 @@ fn truncate(s: &str, n: usize) -> String {
 #[async_trait::async_trait]
 pub trait DeviceBackend: Send + Sync {
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError>;
+
+    /// Loaded ids PLUS whatever the backend says each one can do, in ONE call.
+    ///
+    /// Default: ids only, no capabilities — a backend that publishes nothing is simply "unknown"
+    /// everywhere, which callers must treat as eligible. Backends that do publish override this
+    /// so discovery costs no extra round trip.
+    async fn list_loaded_detailed(&self) -> Result<(HashSet<String>, ModelCapabilities), PoolError> {
+        Ok((self.list_loaded().await?, ModelCapabilities::new()))
+    }
     async fn load(&self, id: &str) -> Result<(), PoolError>;
     async fn unload(&self, id: &str) -> Result<(), PoolError>;
 }
@@ -221,8 +230,24 @@ pub struct RestBackend {
     /// When the running array holds objects rather than bare id strings, the field
     /// to pluck from each element.
     running_id_field: Option<String>,
+    /// Optional sibling array of per-model detail objects in the SAME running response, and the
+    /// fields within it carrying the model id and its capability list. Vendor-specific by nature,
+    /// so it is a per-backend detail rather than an assumption: absent ⇒ no discovery, which means
+    /// "unknown" and therefore no behaviour change.
+    detail: Option<DetailSpec>,
     poll_interval: f64,
     load_timeout: f64,
+}
+
+/// Where a backend publishes per-model capabilities inside its running response.
+#[derive(Clone)]
+pub struct DetailSpec {
+    /// Dotted path to the array of detail objects.
+    pub path: String,
+    /// Field on each object holding the model id.
+    pub id_field: String,
+    /// Field holding the capability list.
+    pub capabilities_field: String,
 }
 
 impl RestBackend {
@@ -252,9 +277,19 @@ impl RestBackend {
             stop: compile_endpoint(base, default_headers, stop, reqwest::Method::POST),
             running_path: running.path.clone(),
             running_id_field: running.id_field.clone(),
+            // Config-declared REST protocols get no discovery: a `[management_protocols.*]` block
+            // describes endpoints, not payload semantics, and guessing where a stranger's backend
+            // puts capability data is exactly the inference this design refuses to make.
+            detail: None,
             poll_interval,
             load_timeout,
         }
+    }
+
+    /// Declare where this backend publishes per-model capabilities within its running response.
+    pub fn with_detail(mut self, detail: DetailSpec) -> RestBackend {
+        self.detail = Some(detail);
+        self
     }
 
     /// The built-in device-management REST shape (`GET {base}/api/v1/models/running`,
@@ -288,10 +323,60 @@ impl RestBackend {
             path: None,
             id_field: None,
         };
+        // The device publishes per-model capabilities in `instances.running[]`, a SIBLING of the
+        // bare-string `running` array in the same response — so discovery costs no extra call.
+        // Verified against a live device payload rather than inferred.
         RestBackend::from_spec(&management_url, &headers, &running, &start, &stop, poll_interval, load_timeout)
+            .with_detail(DetailSpec {
+                path: "instances.running".to_string(),
+                id_field: "model_id".to_string(),
+                capabilities_field: "capabilities".to_string(),
+            })
     }
 
     /// Issue one templated call: apply `endpoint.render(id)`'s method/url/body/headers
+    /// Fetch and parse the running response body once.
+    async fn running_body(&self) -> Result<Value, PoolError> {
+        let (status, r) = self
+            .call(&self.running, None)
+            .await
+            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
+        if !ok(status) {
+            let text = r.text().await.unwrap_or_default();
+            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
+        }
+        r.json().await.map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))
+    }
+
+    /// The loaded-model ids from a running response.
+    ///
+    /// `get_dotted` returning `None` (key/path absent) is normal and means "no running models" —
+    /// the back-compat case where a device response has no `running` key at all must still resolve
+    /// to an empty set, not an error. But a path that IS present and resolves to something other
+    /// than an array is a config-typo signal, and gets a loud error naming the path and what it
+    /// found, rather than silently becoming "no models" and surfacing later as a much more
+    /// confusing load-timeout "not running".
+    fn ids_from(&self, v: &Value) -> Result<HashSet<String>, PoolError> {
+        let path = self.running_path.as_deref().unwrap_or("");
+        let arr = match get_dotted(v, path) {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(other) => {
+                return Err(PoolError::Device(format!(
+                    "running query: path '{path}' is present but not an array: {}",
+                    truncate(&other.to_string(), 200)
+                )));
+            }
+        };
+        Ok(arr
+            .iter()
+            .filter_map(|item| match &self.running_id_field {
+                Some(field) => item.get(field).and_then(Value::as_str).map(String::from),
+                None => item.as_str().map(String::from),
+            })
+            .collect())
+    }
+
     /// to `self.client`, send it, and hand back the parsed status + body text/bytes.
     async fn call(&self, endpoint: &CompiledEndpoint, id: Option<&str>) -> Result<(reqwest::StatusCode, reqwest::Response), reqwest::Error> {
         let (method, url, body, headers) = endpoint.render(id);
@@ -310,46 +395,30 @@ impl RestBackend {
 #[async_trait::async_trait]
 impl DeviceBackend for RestBackend {
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
-        let (status, r) = self
-            .call(&self.running, None)
-            .await
-            .map_err(|e| PoolError::Device(format!("device unreachable: {e}")))?;
-        if !ok(status) {
-            let text = r.text().await.unwrap_or_default();
-            return Err(PoolError::Device(format!("running query failed: {status} {}", truncate(&text, 200))));
-        }
-        let v: Value = r
-            .json()
-            .await
-            .map_err(|e| PoolError::Device(format!("running query: bad JSON: {e}")))?;
-        // `get_dotted` returning `None` (key/path absent) is normal and means "no
-        // running models" — this is the device back-compat case: a device response
-        // with no "running" key at all (e.g. `{}`) must still resolve to an empty
-        // set, not an error. But a path that IS present and resolves to something
-        // other than an array is a config-typo signal (the author pointed `path`
-        // at the wrong field/shape) — that case gets a loud `PoolError::Device`
-        // naming the path and the value it actually found, instead of silently
-        // treating it as "no models" and surfacing a much more confusing
-        // `load_timeout`-expiry "not running" error downstream.
-        let path = self.running_path.as_deref().unwrap_or("");
-        let arr = match get_dotted(&v, path) {
-            None => Vec::new(),
-            Some(Value::Array(items)) => items.clone(),
-            Some(other) => {
-                return Err(PoolError::Device(format!(
-                    "running query: path '{path}' is present but not an array: {}",
-                    truncate(&other.to_string(), 200)
-                )));
+        let v = self.running_body().await?;
+        self.ids_from(&v)
+    }
+
+    /// One fetch, both views: the bare-string id array the pool has always used, plus the sibling
+    /// detail array when this backend declares one.
+    async fn list_loaded_detailed(&self) -> Result<(HashSet<String>, ModelCapabilities), PoolError> {
+        let v = self.running_body().await?;
+        let running = self.ids_from(&v)?;
+        let mut caps = ModelCapabilities::new();
+        if let Some(d) = &self.detail {
+            if let Some(Value::Array(items)) = get_dotted(&v, &d.path) {
+                for item in items {
+                    let Some(id) = item.get(&d.id_field).and_then(Value::as_str) else { continue };
+                    let Some(Value::Array(list)) = item.get(&d.capabilities_field) else { continue };
+                    let tokens: Vec<String> =
+                        list.iter().filter_map(|c| c.as_str().map(str::to_lowercase)).collect();
+                    if !tokens.is_empty() {
+                        caps.insert(id.to_string(), tokens);
+                    }
+                }
             }
-        };
-        let running = arr
-            .iter()
-            .filter_map(|item| match &self.running_id_field {
-                Some(field) => item.get(field).and_then(Value::as_str).map(String::from),
-                None => item.as_str().map(String::from),
-            })
-            .collect();
-        Ok(running)
+        }
+        Ok((running, caps))
     }
 
     async fn load(&self, real_id: &str) -> Result<(), PoolError> {
@@ -497,6 +566,10 @@ impl DeviceBackend for OllamaBackend {
     }
 }
 
+/// `model id -> the capability tokens the backend reports for it`, e.g. `["embedding"]`.
+/// Absent means the backend said nothing, NOT that the model can do nothing.
+pub type ModelCapabilities = HashMap<String, Vec<String>>;
+
 /// What the device is running, plus whether we could actually see it.
 ///
 /// The distinction is load-bearing for anything reasoning about an EMPTY set. "The query succeeded
@@ -506,6 +579,8 @@ impl DeviceBackend for OllamaBackend {
 /// misdirects rather than confuses.
 pub struct Residency {
     pub models: Vec<String>,
+    /// What the backend says each resident can do, when it says anything at all (issue #20).
+    pub capabilities: ModelCapabilities,
     /// False when the most recent device query failed. `models` is then a last-known view, and an
     /// empty one means "we could not see", NOT "nothing is loaded".
     pub current: bool,
@@ -527,6 +602,9 @@ pub struct DeviceModelManager {
     /// construction rather than read per call — an env read on the request path is both wasteful
     /// and, because the var is process-global, a race against any concurrently-running test.
     residency_ttl: f64,
+    /// Last-seen per-model capabilities from the backend. Cached alongside residency because it
+    /// arrives in the same payload and changes for the same reasons.
+    discovered_caps: StdMutex<ModelCapabilities>,
     /// Single-flights concurrent read-throughs. Deliberately NOT `load_lock`: residency reads sit
     /// on the request path, and sharing that lock would make every `default` request queue behind
     /// an in-progress model load.
@@ -553,6 +631,7 @@ impl DeviceModelManager {
                 .and_then(|v| v.parse::<f64>().ok())
                 .map(|ms| ms / 1000.0)
                 .unwrap_or(1.0),
+            discovered_caps: StdMutex::new(ModelCapabilities::new()),
             residency_lock: AsyncMutex::new(()),
         }
     }
@@ -760,17 +839,18 @@ impl DeviceModelManager {
     /// the previous view in place and is not latched.
     pub async fn residency(&self) -> Residency {
         if self.fresh_enough() {
-            return Residency { models: self.snapshot(), current: true };
+            return self.residency_from_cache(true);
         }
         let _guard = self.residency_lock.lock().await;
         // Re-check: another request may have refreshed while we waited for the lock.
         if self.fresh_enough() {
-            return Residency { models: self.snapshot(), current: true };
+            return self.residency_from_cache(true);
         }
         let mut current = true;
-        match self.backend.list_loaded().await {
-            Ok(running) => {
+        match self.backend.list_loaded_detailed().await {
+            Ok((running, caps)) => {
                 self.reconcile(&running);
+                *self.discovered_caps.lock().unwrap() = caps;
                 *self.residency_read_at.lock().unwrap() = Some(std::time::Instant::now());
             }
             Err(e) => {
@@ -778,7 +858,15 @@ impl DeviceModelManager {
                 current = false;
             }
         }
-        Residency { models: self.snapshot(), current }
+        self.residency_from_cache(current)
+    }
+
+    fn residency_from_cache(&self, current: bool) -> Residency {
+        Residency {
+            models: self.snapshot(),
+            capabilities: self.discovered_caps.lock().unwrap().clone(),
+            current,
+        }
     }
 
     fn fresh_enough(&self) -> bool {

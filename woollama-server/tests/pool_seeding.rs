@@ -21,6 +21,11 @@ mod common;
 use common::{spawn_rest, IdLoc, RestMockConfig, RunningShape};
 use woollama_server::pool::{DeviceModelManager, RestBackend};
 
+/// Serializes every test in this binary that drives `build_state()`. `WOOLLAMA_CONFIG_DIR` is
+/// process-global, so two concurrent builds read each other's config dir. Same guard as
+/// tests/http_downstream.rs — it belongs anywhere `build_state` is called from more than one test.
+static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn device_cfg() -> RestMockConfig {
     RestMockConfig {
         running_route: "/api/v1/models/running".to_string(),
@@ -112,6 +117,7 @@ async fn a_failed_read_is_reported_as_not_current() {
     let r = unreachable.residency().await;
     assert!(!r.current, "a failed device query must not present its empty result as fact");
     assert!(r.models.is_empty());
+    assert!(r.capabilities.is_empty(), "a failed read reports no capabilities either");
 
     let device = spawn_rest(device_cfg());
     device.set_loaded(&["A"]);
@@ -190,6 +196,7 @@ async fn default_serves_a_resident_model_with_no_virtual_table() {
         format!("[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n"),
     )
     .unwrap();
+    let _env = ENV.lock().await;
     std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
     std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
     let state = Arc::new(woollama_server::build_state().await);
@@ -244,6 +251,9 @@ async fn default_serves_a_resident_model_with_no_virtual_table() {
         ),
     )
     .unwrap();
+    // No ENV lock here: this fn already holds it from Case 1. `let _env = ...` a second time
+    // SHADOWS the binding without dropping the first, so re-acquiring deadlocks on a
+    // non-reentrant mutex — which is exactly what happened when the guard was added mechanically.
     std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
     std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
     let state = Arc::new(woollama_server::build_state().await);
@@ -272,4 +282,159 @@ async fn default_serves_a_resident_model_with_no_virtual_table() {
         vec!["Resident/Model".to_string()],
         "a load seen by one route must be visible to the other"
     );
+}
+
+
+/// End to end against the device's REAL running-payload shape (issue #20): a bare-string
+/// `running` array plus a sibling `instances.running[]` of objects carrying `capabilities`.
+/// Verbatim from a live device, not invented — inferring a vendor's payload is the trap this
+/// whole line of work exists to avoid.
+///
+/// Asserts the WIRING, not the predicate: a capability rule that computed correctly but was never
+/// consulted by `default` resolution would pass a unit test and fail here.
+#[tokio::test]
+async fn default_skips_an_embedder_using_the_devices_own_capability_report() {
+    let state = Arc::new(Mutex::new(()));
+    let _ = state;
+    let router = Router::new()
+        .route(
+            "/api/v1/models/running",
+            get(|| async {
+                Json(json!({
+                    "object": "list",
+                    "running": ["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3.6-35B-A3B-turbo"],
+                    "pending": [],
+                    "instances": {
+                        "running": [
+                            {"model_id": "Qwen/Qwen3-Embedding-0.6B", "status": "running",
+                             "type": "Text Embedding", "capabilities": ["embedding"], "output": "Vector"},
+                            {"model_id": "Qwen/Qwen3.6-35B-A3B-turbo", "status": "running",
+                             "type": "Image-Text-to-Text", "capabilities": ["main"], "output": "Text"}
+                        ],
+                        "pending": []
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|Json(b): Json<Value>| async move {
+                Json(json!({"choices": [{"message": {"role": "assistant",
+                    "content": b["model"].as_str().unwrap_or("?")}}]}))
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    // No `models` list and no `[capabilities]` table — the whole point is that this needs NO
+    // configuration. Alphabetically the embedder sorts first, so without the capability filter
+    // `default` would pick it and the request would fail.
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!("[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n"),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+
+    let r = reqwest::Client::new()
+        .post(format!("http://{raddr}/v1/chat/completions"))
+        .json(&json!({"model": "dev/default", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "Qwen/Qwen3.6-35B-A3B-turbo",
+        "`default` must skip the embedder the device itself labelled `embedding`, with no config"
+    );
+}
+
+
+/// Pre-dispatch validation and `/v1/models` annotation, end to end (issue #20).
+///
+/// Asserts the WIRING: a rule that computes correctly but is never consulted by the endpoint
+/// would pass its unit test and fail here. The backend deliberately answers 200 to anything, so a
+/// request that reaches it proves the check did NOT run.
+#[tokio::test]
+async fn a_declared_embedder_is_refused_on_chat_and_annotated_in_v1_models() {
+    let router = Router::new()
+        .route("/api/v1/models/running", get(|| async { Json(json!({"running": []})) }))
+        .route("/v1/chat/completions", post(|| async { Json(json!({"choices": [{"message": {"role": "assistant", "content": "REACHED BACKEND"}}]})) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!(
+            // No management_url: this exercises the PLAIN pass-through path, proving the check
+            // is not pool-only. It was, initially — the test caught it.
+            "[inferencers.dev]\nbase_url=\"{url}/v1\"\n\
+             models=[\"Qwen/Qwen3-Embedding-0.6B\",\"Qwen/Chat-7B\"]\n\
+             [inferencers.dev.capabilities]\nembedding=[\"*Embedding*\"]\n"
+        ),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+    let c = reqwest::Client::new();
+
+    // The embedder must not reach the backend on the chat path.
+    let r = c
+        .post(format!("http://{raddr}/v1/chat/completions"))
+        .json(&json!({"model": "dev/Qwen/Qwen3-Embedding-0.6B", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(status, 400, "expected a refusal, got {body}");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("embedding"), "the error must say what the model IS: {msg}");
+    assert!(!msg.contains("REACHED BACKEND"));
+
+    // An undeclared model on the same inferencer is unaffected.
+    let r = c
+        .post(format!("http://{raddr}/v1/chat/completions"))
+        .json(&json!({"model": "dev/Qwen/Chat-7B", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "an undeclared model must dispatch exactly as before");
+
+    // /v1/models annotates what is declared, and says nothing about what isn't.
+    let models: Value = c.get(format!("http://{raddr}/v1/models")).send().await.unwrap().json().await.unwrap();
+    let entries = models["data"].as_array().unwrap();
+    let emb = entries.iter().find(|m| m["id"] == "dev/Qwen/Qwen3-Embedding-0.6B").expect("embedder listed");
+    assert_eq!(emb["capabilities"], json!(["embedding"]));
+    let chat = entries.iter().find(|m| m["id"] == "dev/Qwen/Chat-7B").expect("chat model listed");
+    assert!(chat.get("capabilities").is_none(), "undeclared means absent, never 'cannot': {chat}");
 }
