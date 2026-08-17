@@ -56,7 +56,7 @@ async fn a_model_resident_but_not_loaded_by_us_is_visible() {
     );
 
     assert_eq!(
-        mgr.residency().await,
+        mgr.residency().await.models,
         vec!["Qwen/Qwen3.6-35B-A3B-turbo".to_string()],
         "the device's actual residency is what `default` resolves against"
     );
@@ -70,11 +70,11 @@ async fn residency_tracks_a_change_made_by_someone_else_after_we_started() {
     device.set_loaded(&["First"]);
     let mgr = manager(&device.base_url);
     let mgr = mgr.with_residency_ttl(0.0); // no coalescing: read every time
-    assert_eq!(mgr.residency().await, vec!["First".to_string()]);
+    assert_eq!(mgr.residency().await.models, vec!["First".to_string()]);
 
     // The desktop app / a direct `tiiny image` call swaps the device out from under us.
     device.set_loaded(&["Second"]);
-    let seen = mgr.residency().await;
+    let seen = mgr.residency().await.models;
     assert_eq!(
         seen,
         vec!["Second".to_string()],
@@ -100,6 +100,25 @@ async fn concurrent_reads_coalesce_into_one_device_query() {
         1,
         "a burst of reads inside the window must share one query"
     );
+}
+
+#[tokio::test]
+async fn a_failed_read_is_reported_as_not_current() {
+    // An empty set has two causes that justify OPPOSITE advice: the query succeeded and nothing
+    // matched (the operator's expectations are wrong), or the query failed (we are blind).
+    // Conflating them produced a confident "fix your config" while the config was fine and three
+    // models were resident — the caller just had a 401. Reported from a real migration.
+    let unreachable = manager("http://127.0.0.1:1");
+    let r = unreachable.residency().await;
+    assert!(!r.current, "a failed device query must not present its empty result as fact");
+    assert!(r.models.is_empty());
+
+    let device = spawn_rest(device_cfg());
+    device.set_loaded(&["A"]);
+    let ok = manager(&device.base_url);
+    let r = ok.residency().await;
+    assert!(r.current, "a successful query is current");
+    assert_eq!(r.models, vec!["A".to_string()]);
 }
 
 #[tokio::test]
