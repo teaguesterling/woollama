@@ -403,5 +403,116 @@ Pooling applies to `/v1/chat/completions` (in both `woollama` and `woollamad`);
 the `/v1/responses` path is not pooled yet. Raw real model ids remain routable
 alongside virtual names — `virtual` only adds aliases, it doesn't restrict.
 
+### Device-management protocols (`management_protocol`)
+
+`management_url` turns pooling on; **`management_protocol` decides how woollama
+talks to that backend.** Model-management APIs are bespoke per vendor — the
+device's `/api/v1/models/{running,start,stop}` looks nothing like Ollama's
+`/api/ps` + `keep_alive` — so the backend is pluggable, unlike the inference
+surface, which has converged on OpenAI-compatible and needs only a `base_url`.
+
+```toml
+[inferencers.device]
+management_url      = "${DEVICE_URL}:8800"
+management_protocol = "device"   # optional — see resolution order below
+```
+
+Two presets are built in:
+
+| name | how it lists / loads / unloads |
+|---|---|
+| `device` | `GET {base}/api/v1/models/running`, `POST {base}/api/v1/models/{id}/{start,stop}` |
+| `ollama` | `GET {base}/api/ps`; load/unload via `POST {base}/api/generate` with `keep_alive` (`0` unloads) |
+
+**Resolution order**, at startup, per management-capable inferencer:
+
+1. built-in presets (`device`, `ollama`);
+2. config-defined `[management_protocols.<name>]` blocks;
+3. an unknown name is a clear config error — and it skips **only that
+   inferencer**, leaving the rest of the router usable;
+4. **back-compat:** `management_url` with no `management_protocol` ⇒ `device`,
+   so existing configs are unchanged.
+
+A config-defined block may not shadow a built-in name; doing so is warned about
+and ignored.
+
+#### Defining your own (`[management_protocols.<name>]`)
+
+`kind` is **required** (`"rest"` or `"ollama"`). For `kind = "rest"`, one nested
+table per operation — `running`, `start`, `stop`:
+
+```toml
+[management_protocols.mybox]
+kind = "rest"
+  [management_protocols.mybox.endpoints.running]
+  url  = "{base}/api/v1/models/running"
+  path = "running"                 # dotted path to the array of loaded ids
+  # id_field = "id"                # pluck a field from each element; omit ⇒ elements are strings
+  [management_protocols.mybox.endpoints.start]
+  url  = "{base}/api/v1/models/{id}/start"
+  [management_protocols.mybox.endpoints.stop]
+  url  = "{base}/api/v1/models/{id}/stop"
+```
+
+`{base}` is that inferencer's `management_url`; `{id}` is the model id. `${VAR}`
+env-expansion applies as everywhere else in this file.
+
+| field | required | notes |
+|---|---|---|
+| `url` | ✅ | `{base}` / `{id}` substituted. |
+| `method` | — | default `GET` for `running`, `POST` for `start`/`stop`. |
+| `body` | — | raw string, sent verbatim after substitution. Omit ⇒ no body. |
+| `headers` | — | merged **over** the default `Authorization: Bearer <api_key_env>`; a header here wins. Matching is case-insensitive, so `authorization` replaces the default rather than duplicating it. |
+| `path` | ✅ (`running`) | dotted path to the loaded-id array. |
+| `id_field` | — | `running` only. |
+
+If a `body` is set and no `Content-Type` is given, `application/json` is
+assumed. With no `api_key_env` on the inferencer, no Bearer is sent.
+
+A body-shaped backend, and one with non-Bearer auth:
+
+```toml
+[management_protocols.lmstudio]
+kind = "rest"
+  [management_protocols.lmstudio.endpoints.running]
+  url = "{base}/api/v0/models"
+  path = "data"
+  id_field = "id"
+  [management_protocols.lmstudio.endpoints.start]
+  url     = "{base}/api/v0/models/load"
+  body    = '{"model": "{id}"}'
+  headers = { "Content-Type" = "application/json" }
+  [management_protocols.lmstudio.endpoints.stop]
+  url  = "{base}/api/v0/models/unload"
+  body = '{"model": "{id}"}'
+
+[management_protocols.vendorbox]
+kind = "rest"
+  [management_protocols.vendorbox.endpoints.running]
+  url     = "{base}/models"
+  path    = "loaded"
+  headers = { "X-API-Key" = "${VENDOR_KEY}" }
+
+[management_protocols.local-ollama]
+kind = "ollama"
+# keep_alive = "30m"    # optional; passed on load, unload always uses 0
+```
+
+> **A gateway may not expose every protocol's paths.** Reaching a backend
+> through a reverse proxy can make one protocol work and another silently 404,
+> because the two use different path prefixes. Measured on a Tiiny device, whose
+> nginx proxies `/v1/*` and `/api/v1/*` from port 80 but **not** the bare
+> `/api/...` paths:
+>
+> | path | direct to the backend port | via the port-80 gateway |
+> |---|---|---|
+> | `/api/v1/models/*` — used by `device` | 200 | **200** |
+> | `/api/ps`, `/api/generate` — used by `ollama` | 200 | **404** |
+>
+> So a `management_url` pointing at the gateway can drive `device` and cannot
+> drive `ollama`, while one pointing at the backend port drives both. If pooling
+> reports nothing loaded on a backend you know has models, check that the
+> protocol's paths actually survive whatever sits in front of it.
+
 See also: [Pattern templating](patterns.md) · [Extending woollama](extending.md) ·
 [Environment variables](environment.md) · [Security model](security.md).
