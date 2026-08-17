@@ -130,6 +130,9 @@ pub struct AppState {
     /// The mcp.json specs (for claude-code delegation, which writes a per-recipe
     /// --mcp-config from the referenced subset).
     pub mcp_specs: HashMap<String, config::McpServerSpec>,
+    /// Per-inferencer `[inferencers.<name>.capabilities]` declarations (issue #20). Empty for an
+    /// inferencer that declares none, which means "unknown" everywhere and so no behaviour change.
+    pub capabilities: HashMap<String, config::CapabilityMap>,
     /// The durable conversation handle table (stateful /v1/responses + /v1/conversations).
     pub conversations: Arc<conversations::Conversations>,
     /// An external conversation store (issue #2), wired from mcp.json's
@@ -169,6 +172,10 @@ pub async fn build_state() -> AppState {
         }
         Err(e) => eprintln!("woollamad: patterns load error: {e}"),
     }
+    let capabilities = config::load_capabilities().unwrap_or_else(|e| {
+        eprintln!("woollamad: capabilities load error: {e}");
+        HashMap::new()
+    });
     let specs = config::load_mcp_servers().unwrap_or_else(|e| {
         eprintln!("woollamad: mcp.json load error: {e}");
         HashMap::new()
@@ -234,6 +241,7 @@ pub async fn build_state() -> AppState {
         inferencers,
         pools,
         mcp_specs: specs,
+        capabilities,
         conversations,
         store,
         managed_agents,
@@ -795,7 +803,7 @@ async fn discover_models(inf: &engine::Inferencer) -> Result<Vec<String>, ()> {
 }
 
 /// fnmatch-style glob (`*` any run, `?` one char) — mirrors Python's `fnmatch` filtering.
-fn fnmatch(pattern: &str, name: &str) -> bool {
+pub(crate) fn fnmatch(pattern: &str, name: &str) -> bool {
     fn m(p: &[u8], n: &[u8]) -> bool {
         match p.split_first() {
             None => n.is_empty(),
@@ -1028,7 +1036,8 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
     // keeps today's exact stateless-relay path, unchanged.
     if inf.management_url.is_some() {
         if let Some((manager, gate)) = state.pools.get(provider) {
-            return passthrough_pooled(&inf, manager, gate, &body, &bare).await;
+            let caps = state.capabilities.get(provider).cloned().unwrap_or_default();
+            return passthrough_pooled(&inf, &caps, manager, gate, &body, &bare).await;
         }
     }
 
@@ -1186,6 +1195,28 @@ fn warn_fail_open(name: &str) {
     }
 }
 
+/// Capability tokens that positively mean "this model does not serve chat".
+///
+/// Deliberately an exclusion set rather than requiring a positive chat marker. A backend's word
+/// for "chat" is vendor vocabulary that may not be stable across vendors or firmware — this
+/// device says `main` — whereas `embedding` and `rerank` are unambiguous statements of what the
+/// model is FOR. Keying on those keeps the fail-open direction and does not depend on the
+/// positive vocabulary staying put.
+const NON_CHAT_CAPABILITIES: &[&str] = &["embedding", "rerank", "reranking", "tts", "asr", "speech"];
+
+/// What the backend itself said this model can do, mapped onto the capability being asked for.
+/// `None` = it said nothing useful, which means unknown and therefore eligible.
+fn discovered_serves(discovered: &pool::ModelCapabilities, model: &str, capability: &str) -> Option<bool> {
+    let tokens = discovered.get(model)?;
+    if tokens.iter().any(|t| t == capability) {
+        return Some(true);
+    }
+    if capability == "chat" && tokens.iter().any(|t| NON_CHAT_CAPABILITIES.contains(&t.as_str())) {
+        return Some(false);
+    }
+    None
+}
+
 /// Which residents may satisfy `<provider>/default`, best first.
 ///
 /// A device's residency is device-wide, not per-inferencer: it lists everything loaded, including
@@ -1206,8 +1237,28 @@ fn warn_fail_open(name: &str) {
 ///
 /// Fails open: with no `models` configured, every resident stays a candidate, so a backend that
 /// never declares a catalog behaves as before.
-fn default_candidates(inf: &engine::Inferencer, residency: pool::Residency) -> Vec<String> {
-    let pool::Residency { models: residency, current } = residency;
+fn default_candidates(
+    inf: &engine::Inferencer,
+    caps: &config::CapabilityMap,
+    capability: &str,
+    residency: pool::Residency,
+) -> Vec<String> {
+    let pool::Residency { models: residency, capabilities: discovered, current } = residency;
+    // Drop residents POSITIVELY known not to serve this endpoint. `default` is never asked in the
+    // abstract — it is asked at an endpoint — so an embedding or rerank model is not a tied
+    // candidate for a chat request, it is not a candidate at all. Unknown stays eligible, so a
+    // backend that publishes nothing and has no declarations behaves exactly as before.
+    //
+    // Config wins over discovery where both speak: an operator correcting a backend needs the
+    // last word, and a backend's self-report has already been observed wrong in this deployment.
+    let residency: Vec<String> = residency
+        .into_iter()
+        .filter(|m| {
+            config::serves(caps, m, capability)
+                .or_else(|| discovered_serves(&discovered, m, capability))
+                != Some(false)
+        })
+        .collect();
     let mut candidates: Vec<String> = if inf.models.is_empty() {
         residency
     } else {
@@ -1230,6 +1281,9 @@ fn default_candidates(inf: &engine::Inferencer, residency: pool::Residency) -> V
             if current {
                 warn_fail_open(&inf.name);
             }
+            // Note this falls open to the CAPABILITY-filtered set, not to every resident: where a
+            // backend publishes enough for us to know, an unpredicted-but-capable model is served
+            // transparently instead of the request 503ing on an embedder.
             residency
         } else {
             filtered
@@ -1250,6 +1304,7 @@ fn default_candidates(inf: &engine::Inferencer, residency: pool::Residency) -> V
 /// `router.py::_passthrough_pooled`.
 async fn passthrough_pooled(
     inf: &engine::Inferencer,
+    caps: &config::CapabilityMap,
     manager: &Arc<pool::DeviceModelManager>,
     gate: &pool::Gate,
     body: &Value,
@@ -1262,7 +1317,12 @@ async fn passthrough_pooled(
     // arbitrate — woollama is not the only consumer of its management API, so our view is a cache,
     // never a ledger. A concrete model id or an alias needs no device round trip.
     let loaded = if bare == "default" {
-        default_candidates(inf, manager.residency().await)
+        default_candidates(
+            inf,
+            caps,
+            "chat",
+            manager.residency().await,
+        )
     } else {
         manager.snapshot()
     };
@@ -1769,8 +1829,22 @@ mod default_candidate_tests {
         }
     }
 
+    fn no_caps() -> config::CapabilityMap {
+        config::CapabilityMap::new()
+    }
+
     fn current(models: Vec<String>) -> pool::Residency {
-        pool::Residency { models, current: true }
+        pool::Residency { models, capabilities: pool::ModelCapabilities::new(), current: true }
+    }
+
+    /// Residency as the DEVICE describes it — the shape that removes the treadmill entirely,
+    /// because the exclusion set is discovered rather than configured.
+    fn discovered(models: Vec<String>, caps: &[(&str, &[&str])]) -> pool::Residency {
+        let mut capabilities = pool::ModelCapabilities::new();
+        for (id, tokens) in caps {
+            capabilities.insert(id.to_string(), tokens.iter().map(|t| t.to_string()).collect());
+        }
+        pool::Residency { models, capabilities, current: true }
     }
 
     fn residency_models() -> Vec<String> {
@@ -1787,7 +1861,7 @@ mod default_candidate_tests {
         // The reported failure: `default` picked the embedder, which was never in this
         // inferencer's `models` list, and the backend rejected it as "not loaded" — it IS loaded,
         // just not servable on the chat endpoint.
-        let got = default_candidates(&inf(&["Qwen/Qwen3.6-35B-A3B-turbo"], None), current(residency_models()));
+        let got = default_candidates(&inf(&["Qwen/Qwen3.6-35B-A3B-turbo"], None), &no_caps(), "chat", current(residency_models()));
         assert_eq!(got, vec!["Qwen/Qwen3.6-35B-A3B-turbo".to_string()]);
     }
 
@@ -1798,19 +1872,78 @@ mod default_candidate_tests {
         // Rust's per-process hash seed. `default` was therefore stable within a process and
         // different in the next one.
         let i = inf(&[], None);
-        let first = default_candidates(&i, current(residency_models()));
+        let first = default_candidates(&i, &no_caps(), "chat", current(residency_models()));
         let mut shuffled = residency_models();
         shuffled.reverse();
-        assert_eq!(first, default_candidates(&i, current(shuffled)), "same residency ⇒ same choice, any input order");
+        assert_eq!(first, default_candidates(&i, &no_caps(), "chat", current(shuffled)), "same residency ⇒ same choice, any input order");
     }
 
     #[test]
     fn a_resident_virtual_default_wins_the_tiebreak() {
         let got = default_candidates(
             &inf(&[], Some("Qwen/Qwen3.6-35B-A3B-turbo")),
+            &no_caps(),
+            "chat",
             current(residency_models()),
         );
         assert_eq!(got[0], "Qwen/Qwen3.6-35B-A3B-turbo", "a configured default that IS resident wins");
+    }
+
+    #[test]
+    fn a_backends_own_capability_report_excludes_non_chat_residents() {
+        // Zero configuration. The device publishes `capabilities` per resident in the same payload
+        // woollama already fetches, so the exclusion set is DISCOVERED — which is what removes the
+        // treadmill: nobody has to enumerate models a peer might load.
+        let got = default_candidates(
+            &inf(&[], None),
+            &no_caps(),
+            "chat",
+            discovered(
+                residency_models(),
+                &[
+                    ("Qwen/Qwen3-Embedding-0.6B", &["embedding"]),
+                    ("Qwen/Qwen3-Reranker-0.6B", &["rerank"]),
+                    ("Qwen/Qwen3.6-35B-A3B-turbo", &["main"]),
+                ],
+            ),
+        );
+        assert_eq!(got, vec!["Qwen/Qwen3.6-35B-A3B-turbo".to_string()]);
+    }
+
+    #[test]
+    fn an_unpredicted_model_the_backend_calls_chat_is_served() {
+        // The production failure, with discovery: a peer loads a model nobody listed. It is not
+        // excluded (no non-chat token), so it is served transparently instead of the request
+        // 503ing on an embedder.
+        let models = vec!["Qwen/Qwen3-Embedding-0.6B".to_string(), "zai-org/GLM-4.7-Flash".to_string()];
+        let got = default_candidates(
+            &inf(&[], None),
+            &no_caps(),
+            "chat",
+            discovered(
+                models,
+                &[("Qwen/Qwen3-Embedding-0.6B", &["embedding"]), ("zai-org/GLM-4.7-Flash", &["main"])],
+            ),
+        );
+        assert_eq!(got, vec!["zai-org/GLM-4.7-Flash".to_string()]);
+    }
+
+    #[test]
+    fn config_overrides_what_the_backend_says_about_itself() {
+        // An operator correcting a backend needs the last word — this deployment has already
+        // caught a device's self-report wrong by a factor of 26 on eviction cost.
+        let mut caps = config::CapabilityMap::new();
+        caps.insert("chat".into(), vec!["*Embedding*".into()]);
+        let got = default_candidates(
+            &inf(&[], None),
+            &caps,
+            "chat",
+            discovered(
+                vec!["Qwen/Qwen3-Embedding-0.6B".to_string()],
+                &[("Qwen/Qwen3-Embedding-0.6B", &["embedding"])],
+            ),
+        );
+        assert_eq!(got, vec!["Qwen/Qwen3-Embedding-0.6B".to_string()], "config wins over discovery");
     }
 
     #[test]
@@ -1821,7 +1954,7 @@ mod default_candidate_tests {
         // mixed-residency device means a hard failure EVERY time rather than intermittently.
         // Determinism makes it diagnosable; the warning makes it discoverable.
         let i = inf(&["Qwen/Qwen3-30B-A3B-Instruct"], Some("Qwen/Qwen3-30B-A3B-Instruct"));
-        let got = default_candidates(&i, current(residency_models()));
+        let got = default_candidates(&i, &no_caps(), "chat", current(residency_models()));
         assert_eq!(got.len(), 3, "falls open to every resident rather than reporting none loaded");
         assert_eq!(got, {
             let mut r = residency_models();
@@ -1833,10 +1966,10 @@ mod default_candidate_tests {
     #[test]
     fn no_configured_models_keeps_every_resident_a_candidate() {
         // Fail open: a backend that declares no catalog must behave as before.
-        assert_eq!(default_candidates(&inf(&[], None), current(residency_models())).len(), 3);
+        assert_eq!(default_candidates(&inf(&[], None), &no_caps(), "chat", current(residency_models())).len(), 3);
         // And if nothing resident is a configured model, don't report an empty set — let the
         // caller's virtual.default / load-on-demand path handle it.
-        assert_eq!(default_candidates(&inf(&["Not/Resident"], None), current(residency_models())).len(), 3);
+        assert_eq!(default_candidates(&inf(&["Not/Resident"], None), &no_caps(), "chat", current(residency_models())).len(), 3);
     }
 }
 

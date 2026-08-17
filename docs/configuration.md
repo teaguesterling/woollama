@@ -469,6 +469,36 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
+#### Model capabilities — what `default` is allowed to pick
+
+`<provider>/default` is never asked in the abstract; it is asked **at an endpoint**. A device can
+hold an embedding model, a reranker and a chat model at once, and only one of them can serve
+`/v1/chat/completions`. woollama drops residents it *positively knows* cannot serve the endpoint.
+
+**Discovered, where the backend says so.** The `device` protocol's running response carries a
+sibling `instances.running[]` array with a `capabilities` list per model, in the same payload
+woollama already fetches — so this costs no extra call and needs no configuration. A resident the
+backend labels `embedding` or `rerank` is not a candidate for a chat request.
+
+**Declared, for backends that publish nothing:**
+
+```toml
+[inferencers.device.capabilities]
+embedding = ["*Embedding*"]
+rerank    = ["*Reranker*"]
+```
+
+Each key is a capability; each value is a list of glob patterns over model ids. **Declare what a
+model *is*, not what may chat.** A positive allow-list ("these models can chat") looks safer but
+requires naming every model that might ever legitimately serve the endpoint — on a shared device
+that means predicting what other consumers will load, and a model nobody predicted gets refused.
+That failure has been observed in production. Declaring exclusions survives models you did not
+foresee, because a new chat model matches none of them and stays eligible.
+
+Precedence: **config beats discovery beats unknown**, and *unknown always means eligible*. So a
+backend that publishes nothing and has no declarations behaves exactly as it did before, and an
+operator correcting a backend has the last word.
+
 #### woollama is not the device's only consumer
 
 Pool state is a **cache of the backend's state, not a ledger of it**. The vendor's own UI may load

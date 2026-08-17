@@ -511,6 +511,77 @@ pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
     parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))
 }
 
+/// What an inferencer's models can do, declared per capability as glob patterns over model ids.
+///
+/// Read SERVER-SIDE rather than added to `engine::Inferencer`: that struct is parity-locked and
+/// shared with the `woollama-core` wheel, and `docs/extending.md` prescribes a server-side loader
+/// for anything the engine does not need. The engine ignores keys it does not know, so this rides
+/// in `inferencers.toml` beside the entry it describes without the engine seeing it.
+///
+/// ```toml
+/// [inferencers.device.capabilities]
+/// embedding = ["*Embedding*"]
+/// rerank    = ["*Reranker*"]
+/// ```
+pub type CapabilityMap = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Can `model` serve `capability`? `None` means **unknown**, which callers must treat as
+/// eligible.
+///
+/// The rule is *exclude only what is positively known incompatible*, and that direction is
+/// load-bearing rather than stylistic. A positive allow-list ("these models can chat") looks
+/// safer, but it requires naming every model that might ever legitimately serve the capability —
+/// on a shared device that means predicting what other consumers will load, and a model nobody
+/// predicted gets refused. That failure mode was observed in production: a peer session loaded a
+/// chat model nobody had listed, and every route that had an allow-list-shaped config broke.
+///
+/// Declaring what a model *is* (`embedding = ["*Embedding*"]`) survives models you did not
+/// predict, because a new chat model matches none of the exclusions and stays eligible.
+pub fn serves(caps: &CapabilityMap, model: &str, capability: &str) -> Option<bool> {
+    let matches = |patterns: &Vec<String>| patterns.iter().any(|p| crate::fnmatch(p, model));
+    if caps.get(capability).map(matches).unwrap_or(false) {
+        return Some(true);
+    }
+    // Positively something ELSE, and not the thing asked for ⇒ known incompatible.
+    let known_other = caps.iter().any(|(name, patterns)| name != capability && matches(patterns));
+    if known_other {
+        return Some(false);
+    }
+    None
+}
+
+/// Per-inferencer `[inferencers.<name>.capabilities]` tables from `inferencers.toml`.
+/// Missing file, missing section, or a malformed entry ⇒ that inferencer simply has no
+/// declarations, which means "unknown" everywhere and therefore no behaviour change.
+pub fn load_capabilities() -> Result<HashMap<String, CapabilityMap>, String> {
+    let path = engine::config_dir().join("inferencers.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(HashMap::new()) };
+    parse_capabilities(&engine::expand_env(&text))
+}
+
+fn parse_capabilities(text: &str) -> Result<HashMap<String, CapabilityMap>, String> {
+    let doc: toml::Value = toml::from_str(text).map_err(|e| format!("inferencers.toml parse error: {e}"))?;
+    let mut out = HashMap::new();
+    let Some(infs) = doc.get("inferencers").and_then(toml::Value::as_table) else { return Ok(out) };
+    for (name, spec) in infs {
+        let Some(caps) = spec.get("capabilities").and_then(toml::Value::as_table) else { continue };
+        let mut map = CapabilityMap::new();
+        for (cap, pats) in caps {
+            let Some(arr) = pats.as_array() else {
+                return Err(format!(
+                    "inferencers.toml: [inferencers.{name}.capabilities] '{cap}' must be an array of \
+                     glob patterns"
+                ));
+            };
+            map.insert(cap.clone(), arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        }
+        if !map.is_empty() {
+            out.insert(name.clone(), map);
+        }
+    }
+    Ok(out)
+}
+
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
     let (specs, errors, warnings) =
         parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))?;
@@ -794,6 +865,67 @@ mod tests {
             Some(e) => Err(e),
             None => Ok(specs),
         }
+    }
+
+    fn caps() -> CapabilityMap {
+        // Only the EXCLUSIONS declared — the treadmill-free shape. Nothing says what can chat.
+        let mut m = CapabilityMap::new();
+        m.insert("embedding".into(), vec!["*Embedding*".into()]);
+        m.insert("rerank".into(), vec!["*Reranker*".into()]);
+        m
+    }
+
+    #[test]
+    fn a_model_known_to_be_something_else_cannot_serve_chat() {
+        assert_eq!(serves(&caps(), "Qwen/Qwen3-Embedding-0.6B", "chat"), Some(false));
+        assert_eq!(serves(&caps(), "Qwen/Qwen3-Reranker-0.6B", "chat"), Some(false));
+    }
+
+    #[test]
+    fn an_unpredicted_model_stays_eligible() {
+        // THE case that made exclusion the right direction. A peer loaded this on a shared
+        // device; no allow-list anyone had written would have named it, and every route with an
+        // allow-list-shaped config broke. It matches no exclusion, so it stays eligible.
+        assert_eq!(serves(&caps(), "zai-org/GLM-4.7-Flash", "chat"), None);
+        assert_eq!(serves(&caps(), "Qwen/Qwen3.6-35B-A3B-turbo", "chat"), None);
+    }
+
+    #[test]
+    fn a_positively_declared_capability_wins_over_another_match() {
+        // Belt and braces: if a model matches BOTH its own capability and someone else's, the
+        // capability actually asked for wins. Otherwise an over-broad exclusion pattern could
+        // veto a model its own declaration allows.
+        let mut m = caps();
+        m.insert("chat".into(), vec!["*Embedding-Chat*".into()]);
+        assert_eq!(serves(&m, "Weird/Embedding-Chat-7B", "chat"), Some(true));
+    }
+
+    #[test]
+    fn no_declarations_means_unknown_not_ineligible() {
+        // A backend nobody has described must behave exactly as before.
+        assert_eq!(serves(&CapabilityMap::new(), "anything", "chat"), None);
+    }
+
+    #[test]
+    fn capabilities_parse_from_an_inferencer_entry() {
+        let got = parse_capabilities(
+            "[inferencers.device]\nbase_url = \"http://x/v1\"\n\
+             [inferencers.device.capabilities]\nembedding = [\"*Embedding*\"]\n\
+             [inferencers.plain]\nbase_url = \"http://y/v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(got["device"]["embedding"], vec!["*Embedding*".to_string()]);
+        assert!(!got.contains_key("plain"), "an inferencer with no declarations is simply absent");
+    }
+
+    #[test]
+    fn a_malformed_capability_entry_is_an_error_not_a_silent_drop() {
+        let err = parse_capabilities(
+            "[inferencers.device]\nbase_url = \"http://x/v1\"\n\
+             [inferencers.device.capabilities]\nembedding = \"not-an-array\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("device") && err.contains("embedding"), "{err}");
     }
 
     #[test]
