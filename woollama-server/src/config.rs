@@ -593,16 +593,20 @@ fn parse_capabilities(text: &str) -> Result<HashMap<String, CapabilityMap>, Stri
 /// Scans the RAW text, before expansion — afterwards an unset variable is indistinguishable from
 /// one that was legitimately empty, which is the whole problem.
 fn referenced_unset_vars(text: &str) -> Vec<String> {
+    referenced_vars_where(text, |v| v.is_none())
+}
+
+/// `${VAR}` names in `text` whose current value satisfies `want`, in first-seen order.
+/// `None` is passed for an unset variable, `Some(value)` otherwise.
+fn referenced_vars_where(text: &str, want: impl Fn(Option<&str>) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
         let after = &rest[pos + 2..];
         let Some(end) = after.find('}') else { break };
         let name = &after[..end];
-        if !name.is_empty()
-            && std::env::var(name).is_err()
-            && !out.iter().any(|n| n == name)
-        {
+        let value = std::env::var(name).ok();
+        if !name.is_empty() && want(value.as_deref()) && !out.iter().any(|n| n == name) {
             out.push(name.to_string());
         }
         rest = &after[end + 1..];
@@ -619,6 +623,10 @@ fn referenced_unset_vars(text: &str) -> Vec<String> {
 /// — plenty of servers treat empty-string as absent and proceed. Elsewhere woollama IS the
 /// consumer and can fail closed (see `validate_header_value`); here it can only warn.
 fn env_referenced_vars(raw: &str) -> Vec<String> {
+    // Unparseable raw text degrades to "no env-block variables", so those references fall back to
+    // the generic warning. Acceptable: text that is not valid JSON before expansion is not valid
+    // after it either, so `parse_mcp_servers` reports a parse error and the warning wording is
+    // the least of the operator's problems.
     let Ok(v) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
     let Some(servers) = v.get("mcpServers").and_then(Value::as_object) else { return Vec::new() };
     let mut out: Vec<String> = Vec::new();
@@ -626,7 +634,10 @@ fn env_referenced_vars(raw: &str) -> Vec<String> {
         let Some(env) = spec.get("env").and_then(Value::as_object) else { continue };
         for (_, val) in env {
             let Some(text) = val.as_str() else { continue };
-            for name in referenced_unset_vars(text) {
+            // Unset OR explicitly empty. Both expand to nothing and carry the identical risk —
+            // `FOO=` in a unit file and a missing `FOO` are indistinguishable to the child. The
+            // generic case stays unset-only, where an empty value is more likely to be deliberate.
+            for name in referenced_vars_where(text, |v| v.unwrap_or("").is_empty()) {
                 if !out.iter().any(|n| n == &name) {
                     out.push(name);
                 }
@@ -645,7 +656,15 @@ fn env_referenced_vars(raw: &str) -> Vec<String> {
 /// today an operator gets no signal at all unless a consumer happens to check.
 fn unset_var_warnings(raw: &str) -> Vec<String> {
     let in_env = env_referenced_vars(raw);
-    referenced_unset_vars(raw)
+    // Union: an env-block variable that is set-but-empty would not appear in the unset scan, and
+    // it is precisely the case with no other guard.
+    let mut names = referenced_unset_vars(raw);
+    for n in &in_env {
+        if !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+    names
         .into_iter()
         .map(|name| {
             if in_env.contains(&name) {
@@ -1040,6 +1059,27 @@ mod tests {
         // optional path expanding to nothing is the documented, intended behaviour.
         assert!(!in_env.contains(&"WOOLLAMA_TEST_PLAIN_PATH".to_string()));
         assert!(referenced_unset_vars(raw).contains(&"WOOLLAMA_TEST_PLAIN_PATH".to_string()));
+    }
+
+    #[test]
+    fn an_env_var_set_to_empty_is_treated_like_an_unset_one() {
+        // `FOO=` in a unit file and a missing `FOO` are indistinguishable to the child, and carry
+        // the identical risk. The unset scan alone would miss this: env::var returns Ok("").
+        std::env::set_var("WOOLLAMA_TEST_EMPTY_TOKEN", "");
+        let raw = r#"{"mcpServers": {"a": {"command": "x",
+            "env": {"API_KEY": "${WOOLLAMA_TEST_EMPTY_TOKEN}"}}}}"#;
+        let warnings = unset_var_warnings(raw);
+        std::env::remove_var("WOOLLAMA_TEST_EMPTY_TOKEN");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`env`"), "must use the credential wording: {}", warnings[0]);
+
+        // The generic case stays unset-only: an empty value outside an env block is far more
+        // likely to be deliberate, and warning on it every start would be noise.
+        std::env::set_var("WOOLLAMA_TEST_EMPTY_PATH", "");
+        let plain = r#"{"mcpServers": {"a": {"command": "x", "args": ["${WOOLLAMA_TEST_EMPTY_PATH}/s"]}}}"#;
+        let warnings = unset_var_warnings(plain);
+        std::env::remove_var("WOOLLAMA_TEST_EMPTY_PATH");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
