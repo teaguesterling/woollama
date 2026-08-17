@@ -31,24 +31,104 @@ Shape matches Claude Code's `mcpServers` block:
 }
 ```
 
+A server is **either** a stdio subprocess (`command`) **or** a Streamable-HTTP
+endpoint (`url`). Setting both is an error, as is setting neither.
+
 | Field | Required | Description |
 |---|---|---|
-| `command` | ✅ | Executable to launch the server (stdio MCP). |
-| `args` | — | Argument list (default `[]`). |
-| `env` | — | Extra environment for the server process (default `{}`). |
+| `command` | one of | Executable to launch the server (stdio MCP). |
+| `args` | — | Argument list (default `[]`). Stdio only. |
+| `env` | — | Extra environment for the server process (default `{}`). Stdio only. |
+| `url` | one of | Streamable-HTTP MCP endpoint, e.g. another woollamad's `/mcp`. |
+| `headers` | — | Headers sent with every request to `url` (default `{}`). HTTP only. |
 
 woollama starts one long-lived connection per server and aggregates their tools
 (namespaced `<server>.<tool>`).
+
+#### The `url` form — consuming a remote MCP server
+
+```json
+{
+  "mcpServers": {
+    "shelf": {
+      "url": "http://mcp.example.lan:9200/mcp",
+      "headers": { "Authorization": "Bearer ${SHELF_TOKEN}" }
+    }
+  }
+}
+```
+
+Because woollama also *serves* Streamable HTTP at `/mcp`, the `url` form is how
+one woollamad consumes another — an inference-holding instance reaching a
+tools-only instance's namespace without either spawning the other's servers.
+
+**Credentials go in `headers` as `${VAR}`, never inline.** There is no separate
+secrets mechanism: `${VAR}` expansion already applies to `mcp.json`, the same
+shape as `api_key_env` for inferencers.
+
+Header values are validated at load. An empty value, or a bare `Authorization`
+scheme with nothing after it, makes **that server** invalid: it is logged and
+skipped, and the rest of `mcp.json` loads normally. This is deliberate: `${VAR}`
+expansion resolves an **unset** variable to the empty string, so
+`"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset would otherwise produce the
+literal header `Bearer ` — a well-formed request carrying no credential, which a
+permissive downstream accepts while everything reports healthy.
+
+The same per-server scoping applies to every other invalid entry (setting both
+`command` and `url`, setting neither, a non-string `env`/`headers` value): the
+bad server is skipped with a warning naming it, never taking its siblings with
+it. Only `mcp.json` being unparseable JSON — where nothing is recoverable —
+leaves woollama with no servers at all.
+
+> **Check your config before a reload.** Because a bad entry is skipped rather
+> than fatal, the only trace at runtime is a line in the boot log. Run
+> `woollamad check-config` to make that actionable — it validates `mcp.json`,
+> `recipes.toml` and `inferencers.toml`, reports which servers are usable and
+> which were skipped and why, and **exits non-zero if anything is wrong**. It
+> connects to nothing and binds nothing, so it is safe to run against a live
+> deployment's config dir, and it is the thing to gate a `systemctl reload` (or
+> a CI job) on.
+>
+> ```console
+> $ woollamad check-config
+> error: mcp.json: server 'bad' header 'Authorization' is the bare auth scheme
+>        'Bearer' with no credential — an unset ${VAR} expands to nothing
+> mcp.json: 1 server(s) usable (good), 1 skipped
+> recipes.toml: 4 recipe(s)
+> inferencers.toml: OK
+> 1 problem(s) found
+> ```
+
+woollama also warns when a server sends `headers` to a plain `http://` URL that
+isn't loopback, since that puts the credential on the network in cleartext on
+every request.
+
+`env` has no meaning for a `url` server (there is no child process), and the
+child-env scrub below likewise applies only to the stdio form. A `url` server
+also cannot be handed to **claude-code delegation**: a recipe whose tools
+reference one is rejected with a 400 naming the server, rather than having the
+child `claude` process connect to the downstream directly, outside woollama's
+allow-list boundary.
+
+> **The `url` form is `woollamad`-only.** The Python reference server (the
+> differential-test oracle) requires `command` and will fail to load a config
+> containing a `url` server. If you share one config dir between the two, keep
+> `url` entries out of it.
 
 > **Interpreter & `PATH`.** `command` is resolved against woollama's *own*
 > environment when the server is spawned. A bare name (`python`, `uvx`, `node` —
 > including in the `conversationStore` examples below) picks whatever is first on
 > `PATH` at spawn time, which need not be the interpreter that has the server's
 > dependencies when woollama runs **outside its virtualenv** (launched by an
-> absolute path, or as a `systemd` unit with a minimal `PATH`). Because a
-> downstream server that fails to start **aborts woollama startup**, pin `command`
-> to an absolute interpreter (e.g. your venv's `python`) if startup is sensitive
-> to which environment launched it.
+> absolute path, or as a `systemd` unit with a minimal `PATH`). Pin `command` to an
+> absolute interpreter (e.g. your venv's `python`) if startup is sensitive to
+> which environment launched it.
+
+> **On a downstream server that fails to start, the two implementations
+> differ.** `woollamad` (the canonical router) logs a warning and skips it, so
+> the router comes up in a known-degraded state with that server's tools absent.
+> The Python reference server aborts startup instead. Don't design around either
+> behaviour without checking which one you're running.
 
 ### Selecting a conversation store
 

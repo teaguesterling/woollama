@@ -10,6 +10,13 @@ use woollama_server::binding;
 
 #[tokio::main]
 async fn main() {
+    // `woollamad check-config` → validate config, report, exit. Runs BEFORE build_state: it must
+    // not connect downstreams or bind anything, so it is safe to run against a live deployment's
+    // config dir before a reload.
+    if std::env::args().nth(1).as_deref() == Some("check-config") {
+        std::process::exit(woollama_server::check_config());
+    }
+
     let state = Arc::new(woollama_server::build_state().await);
 
     // `woollamad mcp` → serve the MCP surface over stdio (for an MCP client's

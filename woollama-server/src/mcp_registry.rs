@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::RoleClient;
+use rmcp::transport::streamable_http_client::{StreamableHttpClientTransport, StreamableHttpClientTransportConfig};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{Peer, ServiceExt};
 use serde_json::{json, Value};
 
 use woollama_engine::{EngineError, ToolProvider};
 
-use crate::config::McpServerSpec;
+use crate::config::{HttpSpec, McpServerSpec};
 
 struct ServerConn {
     peer: Peer<RoleClient>,
@@ -40,6 +41,43 @@ fn scrubbed_env() -> HashMap<String, String> {
     std::env::vars()
         .filter(|(k, _)| crate::claude_code::CHILD_ENV_ALLOW.contains(&k.as_str()) || k.starts_with("LC_"))
         .collect()
+}
+
+/// The scrubbed base env with the spec's `env` block merged OVER it — explicit entries win.
+/// The scrub stays a floor: nothing reaches a tool server by inheritance, but an operator can
+/// deliberately name a var (including a provider key) in mcp.json. Mirrors the Python
+/// reference, where `StdioServerParameters.env` merges over the SDK's safe default env.
+fn merged_env(spec_env: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = scrubbed_env();
+    env.extend(spec_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env
+}
+
+/// Build the Streamable-HTTP client transport for a `url`-form downstream server.
+///
+/// `reqwest::Client` is rmcp's own HTTP client impl (Cargo.toml pins reqwest 0.13 to match), and
+/// `axum::http` re-exports the same `http` types rmcp expects — no new dependency for either.
+fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwest::Client>, String> {
+    use axum::http::{HeaderName, HeaderValue};
+
+    let mut headers = HashMap::new();
+    for (k, v) in &spec.headers {
+        let name = HeaderName::try_from(k.as_str()).map_err(|e| format!("invalid header name '{k}': {e}"))?;
+        // `InvalidHeaderValue`'s Display does not include the offending value, which is what we
+        // want — these carry bearer tokens. Do not add the value to this message.
+        let value = HeaderValue::from_str(v).map_err(|e| format!("invalid header value for '{k}': {e}"))?;
+        headers.insert(name, value);
+    }
+    let config = StreamableHttpClientTransportConfig::with_uri(spec.url.clone()).custom_headers(headers);
+    // `Client::new()` PANICS if a TLS backend or the system resolver config can't be initialized
+    // (a minimal container with no CA bundle or a broken /etc/resolv.conf). connect_one runs as a
+    // plain future inside build_state, not a spawned task, so that panic would unwind into main
+    // and the daemon would never start — defeating the logged-and-skipped contract every other
+    // downstream failure honours. Build fallibly and let it be one skipped server.
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("could not build the HTTP client for this downstream: {e}"))?;
+    Ok(StreamableHttpClientTransport::with_client(client, config))
 }
 
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
@@ -125,13 +163,25 @@ impl McpRegistry {
     }
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
-        let mut cmd = tokio::process::Command::new(&spec.command);
-        // Scrub the child env: a downstream tool server must NOT inherit the daemon's
-        // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
-        // and the Python MCP SDK's default-scrubbed stdio environment.
-        cmd.args(&spec.args).env_clear().envs(scrubbed_env());
-        let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
-        let running = ().serve(transport).await.map_err(|e| e.to_string())?;
+        // Only the transport construction is variant-specific; everything from here on —
+        // peer handling, list_all_tools, the wire_index — is transport-agnostic.
+        let running = match spec {
+            McpServerSpec::Stdio(s) => {
+                let mut cmd = tokio::process::Command::new(&s.command);
+                // Scrub the child env: a downstream tool server must NOT inherit the daemon's
+                // provider secrets (ANTHROPIC_API_KEY etc.). Mirrors the claude-code child scrub
+                // and the Python MCP SDK's default-scrubbed stdio environment.
+                cmd.args(&s.args).env_clear().envs(merged_env(&s.env));
+                let transport = TokioChildProcess::new(cmd).map_err(|e| e.to_string())?;
+                ().serve(transport).await.map_err(|e| e.to_string())?
+            }
+            McpServerSpec::Http(h) => {
+                // No child process, so no env scrub applies. Everything after `.serve()` is
+                // transport-agnostic and shared with the stdio path.
+                let transport = http_transport(h)?;
+                ().serve(transport).await.map_err(|e| e.to_string())?
+            }
+        };
         let peer = running.peer().clone();
         let tools = peer.list_all_tools().await.map_err(|e| e.to_string())?;
         // Keep the connection alive for the process lifetime: dropping the
@@ -268,6 +318,7 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{HttpSpec, StdioSpec};
 
     #[test]
     #[cfg(unix)]
@@ -294,9 +345,15 @@ mod tests {
         std::env::set_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS", "1");
         let mut specs = HashMap::new();
         // `sleep` spawns but never speaks MCP -> the initialize handshake hangs -> timed out.
-        specs.insert("hung".to_string(), McpServerSpec { command: "sleep".into(), args: vec!["30".into()] });
+        specs.insert(
+            "hung".to_string(),
+            McpServerSpec::Stdio(StdioSpec { command: "sleep".into(), args: vec!["30".into()], env: HashMap::new() }),
+        );
         // `false` exits immediately -> connect_one errors -> skipped.
-        specs.insert("dead".to_string(), McpServerSpec { command: "false".into(), args: vec![] });
+        specs.insert(
+            "dead".to_string(),
+            McpServerSpec::Stdio(StdioSpec { command: "false".into(), args: vec![], env: HashMap::new() }),
+        );
         let start = std::time::Instant::now();
         let reg = McpRegistry::connect(specs).await;
         let elapsed = start.elapsed();
@@ -306,6 +363,55 @@ mod tests {
         );
         assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
         std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spec_env_merges_over_the_scrub_without_reopening_it() {
+        std::env::set_var("ANTHROPIC_API_KEY", "leak-me");
+        let mut spec_env = HashMap::new();
+        spec_env.insert("GIT_AUTHOR_NAME".to_string(), "woollama".to_string());
+        let merged = merged_env(&spec_env);
+        // The half that makes the feature work.
+        assert_eq!(merged.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
+        // The half that rots if nobody pins it: the scrub is still a floor. Nothing reaches a
+        // tool server by inheritance just because the spec has an `env` block.
+        assert!(
+            !merged.contains_key("ANTHROPIC_API_KEY"),
+            "a non-allow-listed var must not reach the server just because `env` exists"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spec_env_can_deliberately_reinject_a_provider_key() {
+        let mut spec_env = HashMap::new();
+        spec_env.insert("ANTHROPIC_API_KEY".to_string(), "on-purpose".to_string());
+        // Explicit, in the operator's config, greppable — categorically different from
+        // inheriting one silently. Pinned so nobody later "hardens" it into a surprise.
+        assert_eq!(
+            merged_env(&spec_env).get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("on-purpose")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_that_cannot_be_built_is_skipped_not_fatal() {
+        // `http_transport` has two construction failures that are not connection failures:
+        // an unusable header, and `reqwest::Client::builder().build()` erroring when TLS or the
+        // system resolver can't initialize. The latter is not reproducible in-process (it needs a
+        // broken CA store or /etc/resolv.conf), but both return through the SAME `?` path, so
+        // this pins that the path degrades to a skipped server rather than taking the daemon
+        // down — connect_one runs unspawned inside build_state, where a panic would reach main.
+        let mut headers = HashMap::new();
+        headers.insert("Invalid Header Name".to_string(), "x".to_string());
+        let mut specs = HashMap::new();
+        specs.insert(
+            "bad".to_string(),
+            McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers }),
+        );
+        let reg = McpRegistry::connect(specs).await;
+        assert!(reg.servers.is_empty(), "an unbuildable transport is skipped, not registered");
     }
 
     #[test]

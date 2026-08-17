@@ -160,11 +160,65 @@ pub fn scan_vars(system: &str) -> Vec<String> {
     out
 }
 
-/// A downstream MCP server to spawn (stdio). Matches Claude Code's mcp.json shape.
+/// A parsed `mcp.json`: the usable servers, the per-server errors (entries that were skipped —
+/// a bad entry never costs its siblings), and operator warnings that don't invalidate an entry.
+pub type McpConfigLoad = (HashMap<String, McpServerSpec>, Vec<String>, Vec<String>);
+
+/// A downstream MCP server. Matches Claude Code's mcp.json shape, extended with a `url` form
+/// (issue #19) for a Streamable-HTTP endpoint instead of a spawned subprocess.
+#[derive(Clone, Debug)]
+pub enum McpServerSpec {
+    Stdio(StdioSpec),
+    Http(HttpSpec),
+}
+
+/// A downstream MCP server reached over Streamable HTTP at `url` (issue #19) — the form that lets
+/// one woollamad consume another's `/mcp` surface. No child process, so the stdio env scrub has
+/// no meaning here; credentials ride `headers` via the existing `${VAR}` expansion.
 #[derive(Clone)]
-pub struct McpServerSpec {
+pub struct HttpSpec {
+    pub url: String,
+    pub headers: HashMap<String, String>,
+}
+
+/// Hand-written so header VALUES never reach a log line, a panic message, or a `{:?}`.
+/// They carry bearer tokens; the names are enough to debug a misconfiguration. The URL keeps only
+/// its scheme+authority+path — a query string can itself carry a credential (`?token=…`).
+impl std::fmt::Debug for HttpSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.headers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let url = self.url.split(['?', '#']).next().unwrap_or("");
+        f.debug_struct("HttpSpec").field("url", &url).field("headers", &names).finish()
+    }
+}
+
+/// A downstream MCP server spawned as a child process, speaking MCP over stdio.
+#[derive(Clone)]
+pub struct StdioSpec {
     pub command: String,
     pub args: Vec<String>,
+    /// Extra environment for the spawned server, merged OVER the scrubbed base env
+    /// (`mcp_registry::merged_env`) — explicit entries win, but nothing arrives by
+    /// inheritance. Restores parity with the Python reference, which parses this key
+    /// (`config.py:136`) and hands it to `StdioServerParameters.env` (`manager.py:89`)
+    /// rather than argv, where a secret would show up in `ps`.
+    pub env: HashMap<String, String>,
+}
+
+/// Hand-written for the same reason as [`HttpSpec`]'s: `env` is a documented, deliberate home for
+/// a provider key (see `mcp_registry::merged_env` and the test that pins it), so a derived
+/// `Debug` would print secrets into any `{:?}`, log line, or panic message. Names only.
+impl std::fmt::Debug for StdioSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        f.debug_struct("StdioSpec")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &names)
+            .finish()
+    }
 }
 
 fn read_user_or_default(filename: &str, default: &str) -> String {
@@ -401,26 +455,176 @@ pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
     }
 }
 
+/// Auth schemes whose bare form (scheme, no credential) means an unset `${VAR}` ate the secret.
+/// Lowercase; compared case-insensitively per RFC 7235.
+const BARE_AUTH_SCHEMES: &[&str] = &["bearer", "basic", "digest", "token"];
+
+/// Reject a header value that carries no credential.
+///
+/// `engine::expand_env` resolves an unset `${VAR}` to the empty string
+/// (`woollama-engine/src/lib.rs:417`), so `"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset
+/// becomes the literal `"Bearer "` — a well-formed request carrying no credential. Against a
+/// downstream that requires auth you get a 401 and notice; against a permissive one, or one whose
+/// auth is enforced by a proxy that isn't deployed yet, you connect unauthenticated and everything
+/// reports healthy. Fail closed here rather than in `expand_env`, which is parity-locked and also
+/// feeds `inferencers.toml`.
+///
+/// NEVER include `value` in the returned message — these carry bearer tokens.
+fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!(
+            "mcp.json: server '{server}' header '{name}' is empty — an unset ${{VAR}} expands to \
+             nothing, so this would send no credential"
+        ));
+    }
+    // Gated on the header NAME: a lone `basic` or `token` is a plausible real value for an
+    // unrelated header (`X-Cache-Mode: basic`), and rejecting it would be both wrong and
+    // misleadingly worded.
+    let is_auth = name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("proxy-authorization");
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next().unwrap_or_default();
+    if is_auth && parts.next().is_none() && BARE_AUTH_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) {
+        return Err(format!(
+            "mcp.json: server '{server}' header '{name}' is the bare auth scheme '{scheme}' with no \
+             credential — an unset ${{VAR}} expands to nothing"
+        ));
+    }
+    Ok(())
+}
+
+/// `load_mcp_servers`, but returning the per-server diagnostics it would otherwise log and
+/// discard. For `woollamad check-config`, which exists because those diagnostics are otherwise
+/// visible only in the boot log: a *connection* failure may self-heal on the next request, but a
+/// malformed entry stays malformed until a human edits the file, and the only evidence it was
+/// ever configured is a startup line nobody re-reads.
+pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
+    parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))
+}
+
 pub fn load_mcp_servers() -> Result<HashMap<String, McpServerSpec>, String> {
-    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
-    let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
+    let (specs, errors, warnings) =
+        parse_mcp_servers(&engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP)))?;
+    for e in errors {
+        eprintln!("woollamad: {e}, skipping");
+    }
+    for w in warnings {
+        eprintln!("woollamad: {w}");
+    }
+    Ok(specs)
+}
+
+/// Parse already-`${VAR}`-expanded mcp.json text into `(specs, per-server errors)`.
+///
+/// A malformed *entry* is skipped and reported, never fatal to its siblings — `build_state`
+/// degrades a load error to an EMPTY registry, so a whole-file abort would mean the daemon comes
+/// up "healthy" with zero MCP servers, silently dropping every unrelated stdio tool. The blast
+/// radius of a bad entry is that entry. Only unparseable JSON (nothing is recoverable) is `Err`.
+/// Mirrors `McpRegistry::connect`'s own logged-and-skipped posture for a server that won't start.
+///
+/// Split out from `load_mcp_servers` so tests exercise parsing without touching
+/// `WOOLLAMA_CONFIG_DIR` — that env var is process-global, so a test that sets it races every
+/// other test that does (see the `load_patterns` test, which owns it).
+fn parse_mcp_servers(text: &str) -> Result<McpConfigLoad, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     let mut out = HashMap::new();
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
     if let Some(servers) = v.get("mcpServers").and_then(Value::as_object) {
         for (name, s) in servers {
-            let command = s
-                .get("command")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("mcp.json: server '{name}' is missing 'command'"))?
-                .to_string();
-            let args = s
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            out.insert(name.clone(), McpServerSpec { command, args });
+            let url = s.get("url").and_then(Value::as_str).filter(|u| !u.is_empty());
+            let command = s.get("command").and_then(Value::as_str).filter(|c| !c.is_empty());
+            let spec = match (command, url) {
+                (Some(_), Some(_)) => Err(format!(
+                    "mcp.json: server '{name}' sets both 'command' and 'url' — a server is \
+                     either a stdio subprocess or an HTTP endpoint, not both"
+                )),
+                (None, None) => Err(format!(
+                    "mcp.json: server '{name}' needs either 'command' (stdio) or 'url' (HTTP)"
+                )),
+                (Some(command), None) => parse_stdio(name, s, command).map(McpServerSpec::Stdio),
+                (None, Some(url)) => parse_http(name, s, url).map(|(h, warn)| {
+                    warnings.extend(warn);
+                    McpServerSpec::Http(h)
+                }),
+            };
+            match spec {
+                Ok(spec) => {
+                    out.insert(name.clone(), spec);
+                }
+                // Collected, not returned: one bad entry must not cost the operator every other
+                // server in the file (see this function's doc comment).
+                Err(e) => errors.push(e),
+            }
         }
     }
-    Ok(out)
+    Ok((out, errors, warnings))
+}
+
+fn parse_stdio(name: &str, s: &Value, command: &str) -> Result<StdioSpec, String> {
+    let args = s
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut env = HashMap::new();
+    if let Some(o) = s.get("env").and_then(Value::as_object) {
+        for (k, v) in o {
+            // Erroring rather than dropping: a silently discarded `"PORT": 8080` starts a server
+            // missing a var the operator believes they set — the same "works one way, misbehaves
+            // the other, everything reports healthy" divergence the delegation test exists to
+            // prevent. `headers` already errors on this shape; `env` now matches.
+            let Some(v) = v.as_str() else {
+                return Err(format!(
+                    "mcp.json: server '{name}' env '{k}' must be a string (JSON numbers and \
+                     booleans are not environment values — quote it)"
+                ));
+            };
+            env.insert(k.clone(), v.to_string());
+        }
+    }
+    Ok(StdioSpec { command: command.to_string(), args, env })
+}
+
+/// Returns the spec plus an optional operator warning — returned rather than printed so the
+/// WIRING is testable. A warning that is merely `eprintln`'d can be silently disconnected from
+/// its trigger, and the predicate's own unit test would still pass.
+fn parse_http(name: &str, s: &Value, url: &str) -> Result<(HttpSpec, Option<String>), String> {
+    let mut headers = HashMap::new();
+    if let Some(o) = s.get("headers").and_then(Value::as_object) {
+        for (k, v) in o {
+            let Some(v) = v.as_str() else {
+                return Err(format!("mcp.json: server '{name}' header '{k}' must be a string"));
+            };
+            validate_header_value(name, k, v)?;
+            headers.insert(k.clone(), v.to_string());
+        }
+    }
+    // Credentials in cleartext on every request, forever. Loopback is exempt (it never leaves the
+    // host); anything else carrying a header over plain http is worth saying out loud, since the
+    // config that does it looks entirely healthy.
+    let warning = (!headers.is_empty() && !is_encrypted_or_local(url)).then(|| {
+        format!(
+            "MCP server '{name}' sends {} header(s) over plaintext http — credentials will \
+             cross the network in the clear; prefer https",
+            headers.len()
+        )
+    });
+    Ok((HttpSpec { url: url.to_string(), headers }, warning))
+}
+
+/// `https`, or a loopback host where plaintext never leaves the machine.
+fn is_encrypted_or_local(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    let host = lower.strip_prefix("http://").unwrap_or(&lower);
+    let host = host.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    let host = host.strip_prefix('[').and_then(|h| h.split_once(']')).map(|(h, _)| h).unwrap_or_else(|| {
+        host.split_once(':').map(|(h, _)| h).unwrap_or(host)
+    });
+    host == "localhost" || host == "::1" || host.starts_with("127.")
 }
 
 #[cfg(test)]
@@ -567,5 +771,190 @@ mod tests {
         std::env::remove_var("WOOLLAMA_CONFIG_DIR");
         assert!(out.is_empty(), "no [patterns] block → no patterns");
         let _ = std::fs::remove_dir_all(&none);
+    }
+
+    /// Parse mcp.json text through the same `${VAR}` expansion `load_mcp_servers` applies,
+    /// but WITHOUT `WOOLLAMA_CONFIG_DIR` — that var is process-global, so setting it here
+    /// would race the `load_patterns` test that owns it.
+    fn servers_from(json: &str) -> Result<HashMap<String, McpServerSpec>, String> {
+        let (specs, errors, _warnings) = parse_mcp_servers(&engine::expand_env(json))?;
+        // Tests that expect a rejection assert on the per-server error; a bad entry is skipped
+        // rather than fatal (see `one_bad_entry_does_not_discard_the_healthy_servers`).
+        match errors.into_iter().next() {
+            Some(e) => Err(e),
+            None => Ok(specs),
+        }
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_discard_the_healthy_servers() {
+        // The blast radius of a bad entry must be that ENTRY, not the file. `build_state` maps a
+        // load error to an empty registry, so a whole-file abort means the daemon comes up
+        // "healthy" with zero MCP servers — every pre-existing stdio tool gone and every recipe
+        // referencing them failing. That is a far worse failure than the misconfiguration.
+        let (specs, errors, _warnings) = parse_mcp_servers(&engine::expand_env(
+            r#"{"mcpServers": {
+                 "good": {"command": "hi"},
+                 "bad": {"url": "http://h/mcp", "headers": {"Authorization": "Bearer "}}
+               }}"#,
+        ))
+        .unwrap();
+        assert!(specs.contains_key("good"), "a healthy server must survive a sibling's error");
+        assert!(!specs.contains_key("bad"), "the invalid server must be skipped");
+        assert_eq!(errors.len(), 1, "the operator must still be told, per server: {errors:?}");
+        assert!(errors[0].contains("bad") && errors[0].contains("Authorization"), "{errors:?}");
+    }
+
+    #[test]
+    fn url_form_parses_with_headers() {
+        let servers = servers_from(
+            r#"{"mcpServers": {"shelf": {"url": "http://127.0.0.1:9200/mcp",
+                 "headers": {"Authorization": "Bearer sk-abc"}}}}"#,
+        )
+        .unwrap();
+        match &servers["shelf"] {
+            McpServerSpec::Http(h) => {
+                assert_eq!(h.url, "http://127.0.0.1:9200/mcp");
+                assert_eq!(h.headers.get("Authorization").map(String::as_str), Some("Bearer sk-abc"));
+            }
+            _ => panic!("expected an Http spec"),
+        }
+    }
+
+    #[test]
+    fn a_server_must_be_exactly_one_of_stdio_or_http() {
+        let err = servers_from(r#"{"mcpServers": {"broken": {"args": ["x"]}}}"#).unwrap_err();
+        assert!(err.contains("broken") && err.contains("url"), "must name the server and both forms: {err}");
+
+        // Ambiguous rather than merely redundant: silently preferring one would make the other
+        // half of the operator's config a lie.
+        let err = servers_from(r#"{"mcpServers": {"both": {"command": "x", "url": "http://h/mcp"}}}"#).unwrap_err();
+        assert!(err.contains("both"), "must name the server: {err}");
+    }
+
+    #[test]
+    fn an_unset_token_in_a_header_fails_the_load() {
+        // End-to-end version of the fail-open: config text -> expand_env -> validation. The var
+        // name is test-specific and never set, so this does not depend on ambient environment.
+        let err = servers_from(
+            r#"{"mcpServers": {"shelf": {"url": "http://h/mcp",
+                 "headers": {"Authorization": "Bearer ${WOOLLAMA_TEST_ABSENT_TOKEN_X9}"}}}}"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("Authorization"), "the unset-var case must fail the load: {err}");
+    }
+
+    #[test]
+    fn header_values_that_carry_no_credential_are_rejected() {
+        // engine::expand_env resolves an UNSET ${VAR} to "" (lib.rs:417, unwrap_or_default), so
+        // a header sourced from a missing env var arrives here empty or as a bare scheme. Fail
+        // closed: a silently credential-less request that a permissive downstream accepts is the
+        // worst outcome, because everything reports healthy.
+        let err = validate_header_value("shelf", "X-Api-Key", "").unwrap_err();
+        assert!(err.contains("shelf") && err.contains("X-Api-Key"), "must name server and header: {err}");
+
+        // "Bearer ${SHELF_TOKEN}" with SHELF_TOKEN unset expands to the literal "Bearer ".
+        let err = validate_header_value("shelf", "Authorization", "Bearer ").unwrap_err();
+        assert!(err.contains("Authorization"), "must name the header: {err}");
+        assert!(validate_header_value("shelf", "Authorization", "Basic").is_err());
+
+        // Error text reaches logs and the operator's terminal; header values carry bearer tokens.
+        assert!(!err.contains("Bearer "), "must not echo the value: {err}");
+    }
+
+    #[test]
+    fn populated_header_values_are_accepted() {
+        assert!(validate_header_value("shelf", "Authorization", "Bearer sk-live-abc").is_ok());
+        // A single-token value is legitimate when it isn't a bare auth scheme.
+        assert!(validate_header_value("shelf", "X-Api-Key", "abc123").is_ok());
+        // The bare-scheme rule is gated on the header NAME: `basic` is a plausible real value for
+        // an unrelated header, and rejecting it would be wrong AND misleadingly worded.
+        assert!(validate_header_value("shelf", "X-Cache-Mode", "basic").is_ok());
+        assert!(validate_header_value("shelf", "Proxy-Authorization", "Basic").is_err());
+    }
+
+    #[test]
+    fn secrets_never_reach_a_debug_rendering() {
+        // Both specs hold credentials — `env` is a documented home for a provider key, `headers`
+        // for a bearer, and a URL query string can carry a token. A derived Debug on any of them
+        // puts the secret into every `{:?}`, log line, and panic message.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), "sk-secret-stdio".to_string());
+        let stdio = format!("{:?}", StdioSpec { command: "x".into(), args: vec![], env });
+        assert!(!stdio.contains("sk-secret-stdio"), "env value leaked into Debug: {stdio}");
+        assert!(stdio.contains("ANTHROPIC_API_KEY"), "the NAME is what makes it debuggable: {stdio}");
+
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer sk-secret-http".to_string());
+        let http = format!("{:?}", HttpSpec { url: "https://h/mcp?token=sk-secret-query".into(), headers });
+        assert!(!http.contains("sk-secret-http"), "header value leaked into Debug: {http}");
+        assert!(!http.contains("sk-secret-query"), "url query credential leaked into Debug: {http}");
+    }
+
+    #[test]
+    fn a_non_string_env_value_is_an_error_not_a_silent_drop() {
+        // Dropping it starts a server missing a var the operator believes they set — the same
+        // silent divergence `headers` already errors on.
+        let err = servers_from(r#"{"mcpServers": {"s": {"command": "x", "env": {"PORT": 8080}}}}"#).unwrap_err();
+        assert!(err.contains("PORT") && err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn a_plaintext_credential_warns_and_still_loads() {
+        // Exercises the WIRING, not just the predicate: a warning that is disconnected from its
+        // trigger would still pass `plaintext_detection_exempts_loopback_only` below.
+        let (specs, errors, warnings) = parse_mcp_servers(&engine::expand_env(
+            r#"{"mcpServers": {"suite": {"url": "http://mcp.dobby.lan:9200/mcp",
+                 "headers": {"Authorization": "Bearer sk-cleartext"}}}}"#,
+        ))
+        .unwrap();
+        assert!(specs.contains_key("suite"), "a plaintext credential warns — it does not block");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("suite") && warnings[0].contains("plaintext"), "{warnings:?}");
+        assert!(!warnings[0].contains("sk-cleartext"), "the warning must not echo the credential");
+    }
+
+    #[test]
+    fn https_and_loopback_and_headerless_do_not_warn() {
+        let quiet = |json: &str| {
+            let (_, errors, warnings) = parse_mcp_servers(&engine::expand_env(json)).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(warnings.is_empty(), "should not warn: {warnings:?}");
+        };
+        quiet(r#"{"mcpServers": {"a": {"url": "https://h/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
+        quiet(r#"{"mcpServers": {"b": {"url": "http://127.0.0.1:9200/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
+        // No credential to expose ⇒ nothing to warn about, even over plaintext.
+        quiet(r#"{"mcpServers": {"c": {"url": "http://mcp.dobby.lan:9200/mcp"}}}"#);
+    }
+
+    #[test]
+    fn plaintext_detection_exempts_loopback_only() {
+        assert!(is_encrypted_or_local("https://mcp.example.lan:9200/mcp"));
+        assert!(is_encrypted_or_local("http://127.0.0.1:9200/mcp"));
+        assert!(is_encrypted_or_local("http://localhost/mcp"));
+        assert!(is_encrypted_or_local("http://[::1]:9200/mcp"));
+        // The case that must warn: a real network hop carrying a credential in the clear.
+        assert!(!is_encrypted_or_local("http://mcp.dobby.lan:9200/mcp"));
+        assert!(!is_encrypted_or_local("http://10.0.0.5/mcp"));
+    }
+
+    #[test]
+    fn mcp_server_env_block_is_parsed() {
+        // The Python reference parses this key (config.py:136) and hands it to the spawned
+        // server via StdioServerParameters.env (manager.py:89). woollamad dropped it in the
+        // Rust port, so a documented key was silently ignored; this pins it restored.
+        let servers = servers_from(
+            r#"{"mcpServers": {"git": {"command": "git-mcp", "env": {"GIT_AUTHOR_NAME": "woollama"}}}}"#,
+        )
+        .unwrap();
+        let McpServerSpec::Stdio(s) = &servers["git"] else { panic!("expected a Stdio spec") };
+        assert_eq!(s.env.get("GIT_AUTHOR_NAME").map(String::as_str), Some("woollama"));
+
+        // Case 2 (SAME test fn — `WOOLLAMA_CONFIG_DIR` is process-global): an absent `env` is
+        // an empty map, not an error.
+        let servers = servers_from(r#"{"mcpServers": {"hello": {"command": "hi"}}}"#).unwrap();
+        let McpServerSpec::Stdio(s) = &servers["hello"] else { panic!("expected a Stdio spec") };
+        assert!(s.env.is_empty(), "absent 'env' is an empty map, not an error");
     }
 }

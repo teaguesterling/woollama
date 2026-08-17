@@ -52,6 +52,67 @@ use pattern_backend::PatternBackend;
 
 pub use config::{load_mcp_servers, load_recipes};
 
+/// `woollamad check-config` — validate the config files and report, without connecting to
+/// anything or binding a port. Returns the process exit code: 0 clean, 1 if anything is wrong.
+///
+/// This exists because a malformed `mcp.json` entry is *skipped*, not fatal (one server's typo
+/// must not cost an operator the other eleven), and a skip is otherwise announced only in the
+/// boot log — one journal line, read approximately never. A connection failure may self-heal on
+/// the next request; a config error will still be there in six weeks. So strictness lives in a
+/// deliberate step the operator runs before a reload, rather than in the daemon's startup path.
+pub fn check_config() -> i32 {
+    config::ensure_examples_dir();
+    let mut errors = 0usize;
+
+    match config::diagnose_mcp_servers() {
+        Err(e) => {
+            eprintln!("error: {e}");
+            errors += 1;
+        }
+        Ok((specs, per_server, warnings)) => {
+            for e in &per_server {
+                eprintln!("error: {e}");
+            }
+            for w in &warnings {
+                eprintln!("warning: {w}");
+            }
+            errors += per_server.len();
+            let mut names: Vec<&str> = specs.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            println!(
+                "mcp.json: {} server(s) usable{}{}",
+                specs.len(),
+                if names.is_empty() { String::new() } else { format!(" ({})", names.join(", ")) },
+                if per_server.is_empty() { String::new() } else { format!(", {} skipped", per_server.len()) },
+            );
+        }
+    }
+
+    match config::load_recipes() {
+        Err(e) => {
+            eprintln!("error: recipes.toml: {e}");
+            errors += 1;
+        }
+        Ok(r) => println!("recipes.toml: {} recipe(s)", r.len()),
+    }
+
+    match engine::Registry::from_config() {
+        Err(e) => {
+            eprintln!("error: inferencers.toml: {e}");
+            errors += 1;
+        }
+        Ok(_) => println!("inferencers.toml: OK"),
+    }
+
+    if errors == 0 {
+        println!("config OK");
+        0
+    } else {
+        eprintln!("{errors} problem(s) found");
+        1
+    }
+}
+
 /// Shared, process-lifetime server state: loaded recipes, the connected downstream MCP
 /// registry, and the inferencer registry. Built once at startup, shared via axum state.
 pub struct AppState {
@@ -517,23 +578,51 @@ async fn responses_stream(mut source: BoxStream<'static, Result<String, EngineEr
 
 // --- orchestration (shared by chat-completions + responses) -------------------
 
-/// The mcp.json `{command, args}` for the servers a recipe's tools reference (the subset
-/// claude-code delegation hands the child). Errors if a referenced server isn't configured.
-fn referenced_mcp_servers(state: &AppState, tools: &[String]) -> Result<HashMap<String, Value>, EngineError> {
+/// The mcp.json entry for each server a recipe's tools reference — the subset claude-code
+/// delegation hands the child as its `--mcp-config`. Errors if a referenced server isn't
+/// configured.
+///
+/// `env` is forwarded so a server behaves identically in woollama's own loop and under
+/// delegation; omitting it would make a tool work one way and silently misbehave the other.
+fn referenced_mcp_servers(
+    specs: &HashMap<String, config::McpServerSpec>,
+    tools: &[String],
+) -> Result<HashMap<String, Value>, EngineError> {
     let mut servers = HashMap::new();
     for t in tools {
         let server = t.split_once('.').map(|(s, _)| s).unwrap_or(t.as_str());
         if servers.contains_key(server) {
             continue;
         }
-        let Some(spec) = state.mcp_specs.get(server) else {
+        let Some(spec) = specs.get(server) else {
             return Err(EngineError::new(
                 format!("recipe references MCP server '{server}' not in mcp.json config"),
                 "invalid_request_error",
                 400,
             ));
         };
-        servers.insert(server.to_string(), json!({"command": spec.command, "args": spec.args}));
+        let entry = match spec {
+            config::McpServerSpec::Stdio(s) => {
+                json!({"command": s.command, "args": s.args, "env": s.env})
+            }
+            // Refused rather than translated. Claude Code's mcp.json CAN express an HTTP server,
+            // but emitting one would have the child connect to the downstream ITSELF — a network
+            // peer woollama never brokers — putting it outside the allow-list boundary that makes
+            // delegation containable. (Secrets on disk are not the distinction: the stdio arm
+            // above already writes `env` into the same file, which `claude_code` creates under a
+            // 0700 `tempfile::tempdir()` that unlinks on drop.) Out of scope for issue #19.
+            config::McpServerSpec::Http(_) => {
+                return Err(EngineError::new(
+                    format!(
+                        "recipe references MCP server '{server}', which is a 'url' (HTTP) server — \
+                         claude-code delegation cannot hand an HTTP downstream to the child process"
+                    ),
+                    "invalid_request_error",
+                    400,
+                ))
+            }
+        };
+        servers.insert(server.to_string(), entry);
     }
     Ok(servers)
 }
@@ -550,7 +639,7 @@ async fn run_claude_recipe(
     if recipe.tools.is_empty() {
         claude_code::run_completion(&recipe.system, messages, model).await.map_err(cc_err)
     } else {
-        let servers = referenced_mcp_servers(state, &recipe.tools)?;
+        let servers = referenced_mcp_servers(&state.mcp_specs, &recipe.tools)?;
         claude_code::run_delegated(&recipe.system, messages, model, &recipe.tools, &servers, 8)
             .await
             .map_err(cc_err)
@@ -1513,6 +1602,40 @@ async fn conversations_delete(State(state): State<Arc<AppState>>, Path(conv_id):
         t.remove(&conv_id);
     }
     Json(json!({"id": conv_id, "object": "conversation.deleted", "deleted": true})).into_response()
+}
+
+#[cfg(test)]
+mod delegate_config_tests {
+    use super::*;
+    use crate::config::{McpServerSpec, StdioSpec};
+
+    fn specs_with(name: &str, spec: McpServerSpec) -> HashMap<String, McpServerSpec> {
+        let mut specs = HashMap::new();
+        specs.insert(name.to_string(), spec);
+        specs
+    }
+
+    #[test]
+    fn delegate_config_forwards_the_env_block() {
+        // A stdio server needing `env` must behave the same in-loop and under claude-code
+        // delegation. Dropping it here would make the tool work through woollama's own loop
+        // and silently misbehave when Claude runs it — the worst kind of divergence, because
+        // both paths report success.
+        let mut env = HashMap::new();
+        env.insert("GIT_AUTHOR_NAME".to_string(), "woollama".to_string());
+        let specs =
+            specs_with("git", McpServerSpec::Stdio(StdioSpec { command: "git-mcp".into(), args: vec![], env }));
+        let out = referenced_mcp_servers(&specs, &["git.log".to_string()]).unwrap();
+        assert_eq!(out["git"]["env"]["GIT_AUTHOR_NAME"], "woollama");
+        assert_eq!(out["git"]["command"], "git-mcp");
+    }
+
+    #[test]
+    fn an_unconfigured_server_is_still_an_error() {
+        let specs = specs_with("git", McpServerSpec::Stdio(StdioSpec { command: "g".into(), args: vec![], env: HashMap::new() }));
+        let err = referenced_mcp_servers(&specs, &["other.tool".to_string()]).unwrap_err();
+        assert!(err.message.contains("other"), "must name the missing server: {}", err.message);
+    }
 }
 
 #[cfg(test)]
