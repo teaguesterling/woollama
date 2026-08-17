@@ -77,6 +77,20 @@ only — see v0.10.0 above).
 
 ## Open tracks (recommended order)
 
+### Federation: what has actually been exercised
+
+The `url` transport (#19) has been run end to end with **real tools**, not just
+woollamad's own `chat` verb re-exported: a consumer reaching a downstream over
+`url`, that downstream fronting DuckDB-backed MCP servers over stdio, and a real
+`tools/call` returning real corpus data through the whole chain. Credential
+enforcement is covered in CI by two separate processes, including the
+wrong-credential case (federates nothing, stays running, says so).
+
+What remains unexercised is the *network* shape rather than the protocol: a LAN
+hop, a reverse proxy, TLS, and a containerised consumer — where `127.0.0.1`
+resolves to the container's own namespace and the resulting connection-refused is
+indistinguishable from the downstream being down.
+
 ### Still open after Track 0
 
 - **Federation loop protection remains DEFERRED.** Reconnect bounds the *symptom* — the nesting
