@@ -57,6 +57,7 @@ inference or tools.
 | **Image + embedding pass-through** — `POST /v1/images/generations` and `POST /v1/embeddings` forward a `<provider>/<model>` request to that inferencer's own OpenAI-compatible endpoints, mirroring chat pass-through (non-streaming; unknown namespace → 400) | `router.py` (Python); ported to `woollama-server` for parity | v0.9.0 |
 | **Model pooling / device-aware inferencers** — an inferencer declaring `management_url` gets on-demand model load (`/api/v1/models/{running,start,stop}`), virtual model names (`<provider>/default`, config `virtual` aliases), and per-model request queuing/backpressure (`503` + `Retry-After`) with queue-aware LRU eviction to fit `pool_max`. Fully additive; covers `/v1/chat/completions` only (`/v1/responses` not pooled yet). Shipped in **both** `woollama` (Python) and `woollamad` (Rust) | `resolver.py`, `pool.py`, `router.py`; Rust twin `resolver`/`pool` modules | v0.10.0 |
 | **HTTP downstream MCP transport** — `mcp.json` gains a `url` form (Streamable HTTP) alongside `command`, so one woollamad can consume another's `/mcp`. Credentials via `${VAR}` in `headers`, validated fail-closed at load. Also restores the `env` key the Rust port silently dropped, and forwards it through claude-code delegation. **Rust-only** (`woollamad` is canonical; the Python oracle requires `command`) | `config.rs`, `mcp_registry.rs`, `lib.rs` | #19 |
+| **Downstream reconnect + introspection** — an unreachable `url`/stdio downstream is retried on a per-server backoff (`WOOLLAMA_MCP_RETRY_MAX_SECS`); `McpRegistry` holds a swappable snapshot so health and tools are always read from one instant; per-server `connected`/`retrying`/`failed` state with last error; a federation nesting cap (`WOOLLAMA_MCP_MAX_NESTING`) bounds tool-name growth that refresh would otherwise make unbounded; `GET /v1/tools` surfaces all of it (closes #23) | `mcp_registry.rs`, `lib.rs` | Track 0 |
 | Lint-clean (`ruff check .`); Rust suite + `clippy -D warnings` | tree-wide | — |
 
 Surfaces today: `/v1/chat/completions` (pass-through AND `woollama/<recipe>`
@@ -76,40 +77,23 @@ only — see v0.10.0 above).
 
 ## Open tracks (recommended order)
 
-0. **Downstream reconnect/retry for `url`-form MCP servers** (follows #19). A
-   remote peer can come back where a failed `exec` won't, so retrying past
-   startup is worth having. **Three obligations belong to this slice
-   specifically, and all three look like they belong somewhere else** — that is
-   exactly why they'd be orphaned:
-   - **Structure.** `McpRegistry` holds plain `HashMap`s behind an `Arc` with no
-     interior mutability, so reconnect needs an `RwLock` through
-     `resolve`/`tool`/`reexport_tools`/`call_server`/`call_raw`. A hot-path
-     structural change, not an addition — which is why #19 left it out.
-   - **The federation hop cap.** Tool federation is safe today *because rosters
-     are cached at connect and served from cache* (`mcp_registry.rs`
-     `connect_one`, `mcp_surface.rs` `list_tools`) — nothing recurses at request
-     time. Dynamic roster refresh is precisely what removes that property: a
-     refresh can cascade across routers at request time, making live recursion
-     reachable for the first time. **Design the hop cap here or not at all.**
-   - **Loop protection generally — currently DEFERRED, NOT SOLVED.** Mutual
-     cycles (A→B→A) are reachable today through ordinary restarts: A starts (B
-     down, skipped), B starts and connects to A, A restarts and connects to B.
-     No self-reference, no ordering violation, and nothing guards it. Only the
-     degenerate A→A case is prevented, and only incidentally — `build_state()`
-     connects downstreams before `axum::serve` opens the listener, so an
-     instance naming its own address gets connection-refused. *That is not loop
-     protection.* Dispatch does terminate (`resolve()` hands each peer the name
-     it advertised, one namespace prefix shorter, so a finite name shrinks
-     monotonically), but **tool names gain a nesting level per mutual restart
-     cycle** and degrade silently to hashed forms at the 64-char limit. An
-     inbound self-identity check would not help — in A→B→A neither side ever
-     sees its own id; the mechanism is the instance-id `Via` chain plus hop cap.
-   - **Retry must stay observable.** Never present a reconnecting server as
-     present-with-zero-tools: distinct connected / degraded-retrying /
-     never-connected states, with last error and attempt count. The test that
-     matters is *"while down, the degraded state is visible"* — a test that only
-     asserts eventual success also passes on a router permanently hiding a dead
-     downstream.
+### Still open after Track 0
+
+- **Federation loop protection remains DEFERRED.** Reconnect bounds the *symptom* — the nesting
+  cap stops tool names growing without bound — but it does not detect a cycle. Mutual A→B→A
+  topologies are still reachable through ordinary restarts and are still unguarded; a capped
+  roster in a cycle is bounded and wrong rather than unbounded and wrong. The instance-id `Via`
+  chain is the mechanism that would actually detect one.
+- **Refresh is reconnect-only, and so is liveness.** A server that connected once is never
+  re-polled. Two consequences, and the second is the one that bites: a downstream that *changes*
+  its tool roster while staying up is not picked up until restart; and a downstream that **dies
+  after connecting is never re-detected** — its health stays `connected`, `GET /v1/tools` keeps
+  reporting a stale tool count, and every dispatch through the dead peer fails. Reconnect covers
+  "down at startup, comes up later", not "up at startup, goes away later". The endpoint sold as
+  the incident-time view will show a dead downstream as healthy until woollama restarts.
+  A dispatch failure marking its server degraded (and re-arming its reconnect task) is the
+  event-driven fix; it needs the registry to retain the specs, and is deliberately not bolted on
+  here.
 
 ### Latent issues surfaced by #19 (not yet filed as issues)
 

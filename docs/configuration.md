@@ -111,6 +111,56 @@ bad server is skipped with a warning naming it, never taking its siblings with
 it. Only `mcp.json` being unparseable JSON — where nothing is recoverable —
 leaves woollama with no servers at all.
 
+### Downstream reconnect and introspection
+
+A downstream that is unreachable at startup is retried on a per-server exponential backoff
+(1s doubling to a ceiling), so a peer that comes up later is picked up without restarting
+woollama. A server whose *transport* could not be built — an unusable header, say — is reported
+`failed` and **not** retried: that is a config fault, and retrying it would only produce noise
+until someone edits the file. With retry disabled (`WOOLLAMA_MCP_RETRY_MAX_SECS=0`) an
+unreachable server is likewise reported `failed`, not `retrying` — nothing will try again, and
+saying otherwise would defeat the point of distinguishing the two.
+
+> **Reconnect covers "down at startup, comes up later" — not the reverse.** A downstream that
+> dies *after* connecting is not currently re-detected: its health stays `connected` and
+> `GET /v1/tools` keeps reporting its last known tool count until woollama restarts. Dispatches
+> through it fail in the meantime.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `WOOLLAMA_MCP_RETRY_MAX_SECS` | `60` | Backoff ceiling for downstream reconnect. `0` disables retry entirely. |
+| `WOOLLAMA_MCP_MAX_NESTING` | `2` | Federation levels a re-exported tool may carry. `0` disables the cap. |
+
+Refresh is **background-only** — a request never triggers a downstream fetch. That is
+deliberate: if it did, then in a federated topology one router's `tools/list` would fetch from
+the next, whose `tools/list` would fetch back, recursing at request time. Serving from a cached
+snapshot is what keeps that impossible.
+
+`WOOLLAMA_MCP_MAX_NESTING` exists because reconnect makes unbounded growth reachable. Tool names
+gain one namespace level per federation hop, so in a mutual topology (A consumes B, B consumes A)
+each refresh ingests a roster that already carries the previous round's nesting — one level per
+tick, forever. The cap bounds it; capped tools are logged with a count rather than silently
+dropped.
+
+**`GET /v1/tools`** reports what the router actually has:
+
+```json
+{
+  "tools": ["shelf.search"],
+  "data":  [{"name": "mcp__shelf__search", "server": "shelf", "tool": "search"}],
+  "servers": [
+    {"name": "shelf", "transport": "http", "health": "connected", "tools": 1},
+    {"name": "git", "transport": "stdio", "health": "retrying", "tools": 0,
+     "attempts": 4, "last_error": "No such file or directory (os error 2)"}
+  ]
+}
+```
+
+A downstream that is **down appears here with its reason**, rather than being omitted — absence
+and not-yet-connected are indistinguishable from outside, and a router showing neither would look
+healthy with its tools quietly gone. Each tool names its originating server, which is how to read
+a federated namespace without driving an MCP handshake by hand.
+
 > **Check your config before a reload.** Because a bad entry is skipped rather
 > than fatal, the only trace at runtime is a line in the boot log. Run
 > `woollamad check-config` to make that actionable — it validates `mcp.json`,
@@ -405,7 +455,16 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
+
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` to whichever model is currently loaded on the backend, falling back to this table entry if none is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
+
+> **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
+> The first request for a model that isn't resident waits for the backend to load it, and that
+> is backend- and model-dependent — measured at **33s** for a 30B model on one NPU device, where
+> the 30s default would have returned `503` on first use. The failure looks exactly like
+> pooling being broken: the request that should have triggered the load is the one that times
+> out, so the model never becomes warm and every retry repeats the wait. Measure a cold load on
+> your own hardware and set `queue_timeout` comfortably above it.
 
 Pooling applies to `/v1/chat/completions` (in both `woollama` and `woollamad`);
 the `/v1/responses` path is not pooled yet. Raw real model ids remain routable

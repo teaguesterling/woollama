@@ -51,6 +51,10 @@ use mcp_surface::WoollamaMcp;
 use pattern_backend::PatternBackend;
 
 pub use config::{load_mcp_servers, load_recipes};
+// The reconnect surface is public so an integration test can drive it, and because per-server
+// health is meant to be surfaced rather than kept internal.
+pub use config::{HttpSpec, McpServerSpec, StdioSpec};
+pub use mcp_registry::{spawn_reconnect, McpRegistry, ServerHealth, ServerStatus};
 
 /// `woollamad check-config` — validate the config files and report, without connecting to
 /// anything or binding a port. Returns the process exit code: 0 clean, 1 if anything is wrong.
@@ -170,6 +174,9 @@ pub async fn build_state() -> AppState {
         HashMap::new()
     });
     let registry = Arc::new(mcp_registry::McpRegistry::connect(specs.clone()).await);
+    // Retry anything that didn't come up. Background-only: a request never triggers a fetch, so
+    // `list_tools` keeps serving a cached snapshot and federated topologies can't recurse.
+    mcp_registry::spawn_reconnect(registry.clone(), specs.clone());
     let inferencers = engine::Registry::from_config().unwrap_or_else(|e| {
         eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
@@ -271,6 +278,50 @@ fn parse_tcp_address(addr: &str) -> (String, u16) {
     }
 }
 
+/// `GET /v1/tools` — what tools this router actually has, and the health of every configured
+/// downstream (issue #23).
+///
+/// Two things make this more than a debugging nicety once federation is in play:
+/// a downstream that is retrying appears here **with its last error**, rather than being silently
+/// absent — absence and not-yet-connected are indistinguishable from the outside, and a router
+/// that showed neither would look healthy with its tools quietly gone. And each tool names the
+/// server it came from, which is the only way to read a federated namespace without driving an
+/// MCP handshake by hand.
+///
+/// `tools` keeps the Python reference's shape (`<server>.<tool>` names); `data` and `servers` are
+/// additive.
+async fn list_tools(State(state): State<Arc<AppState>>) -> Response {
+    // ONE snapshot for both halves: two reads would let a reconnect land between them and return
+    // a server reported `retrying` with 0 tools whose tools already appear in `data`.
+    let (listing, statuses) = state.registry.introspect();
+    let tools: Vec<String> = listing.iter().map(|(s, bare, _)| format!("{s}.{bare}")).collect();
+    let data: Vec<Value> = listing
+        .iter()
+        .map(|(server, bare, wire)| json!({"name": wire, "server": server, "tool": bare}))
+        .collect();
+    let servers: Vec<Value> = statuses
+        .into_iter()
+        .map(|s| {
+            let mut o = json!({
+                "name": s.name,
+                "transport": s.transport,
+                "health": s.health.as_str(),
+                "tools": s.tools,
+            });
+            match &s.health {
+                crate::mcp_registry::ServerHealth::Retrying { attempts, last_error } => {
+                    o["attempts"] = json!(attempts);
+                    o["last_error"] = json!(last_error);
+                }
+                crate::mcp_registry::ServerHealth::Failed { reason } => o["reason"] = json!(reason),
+                crate::mcp_registry::ServerHealth::Connected => {}
+            }
+            o
+        })
+        .collect();
+    axum::Json(json!({"tools": tools, "data": data, "servers": servers})).into_response()
+}
+
 /// The axum app (shared by the binary and the integration tests). Mounts woollama's own
 /// MCP surface at `/mcp` (Streamable-HTTP) on the same port — the per-session factory
 /// shares the one `AppState` (and thus the one downstream registry).
@@ -286,6 +337,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     );
     let mut router = Router::new()
         .route("/v1/models", get(list_models))
+        .route("/v1/tools", get(list_tools))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/embeddings", post(embeddings))

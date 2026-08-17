@@ -34,7 +34,11 @@ impl ServerHandler for Fixture {
             }))
             .unwrap(),
         );
-        let tool = Tool::new("count_to", "count to n", schema).with_raw_output_schema(out_schema);
+        // `MCP_FIXTURE_TOOL_NAME` lets a test drive the advertised name — e.g. an already-
+        // federated `mcp__b__mcp__a__count_to`, to exercise the re-export nesting cap against a
+        // real downstream rather than against the predicate alone.
+        let name = std::env::var("MCP_FIXTURE_TOOL_NAME").unwrap_or_else(|_| "count_to".to_string());
+        let tool = Tool::new(name, "count to n", schema).with_raw_output_schema(out_schema);
         Ok(ListToolsResult::with_all_items(vec![tool]))
     }
     async fn call_tool(

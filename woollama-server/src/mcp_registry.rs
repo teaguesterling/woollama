@@ -25,13 +25,83 @@ struct ServerConn {
     tools: Vec<Tool>,
 }
 
-/// All configured downstream MCP servers, connected and tool-listed.
-pub struct McpRegistry {
+/// One consistent view of every connected downstream server. Immutable once published: the
+/// registry swaps a whole `Arc<Snapshot>` rather than mutating in place, so `servers` and
+/// `wire_index` can never be observed disagreeing with each other (a reader that saw a new
+/// `wire_index` against an old `servers` would resolve a name to a peer that no longer holds it).
+#[derive(Default)]
+struct Snapshot {
     servers: HashMap<String, ServerConn>,
+    /// Every configured server's health, including those with no entry in `servers`. Carried in
+    /// the snapshot so a caller sees health and tools from the same instant.
+    health: HashMap<String, (ServerHealth, &'static str)>,
     /// Reverse map: advertised wire name (`mcp__server__tool`) -> (server, bare tool). Built
-    /// once at connect so dispatch resolves the model's tool_call name unambiguously (no
+    /// with the snapshot so dispatch resolves the model's tool_call name unambiguously (no
     /// dot-splitting, and it works for the hashed >64-char fallback too).
     wire_index: HashMap<String, (String, String)>,
+}
+
+impl Snapshot {
+    /// Build the reverse index for a set of connected servers — the one place a wire name is
+    /// derived, so publishing can never disagree with resolving.
+    fn new(
+        servers: HashMap<String, ServerConn>,
+        health: HashMap<String, (ServerHealth, &'static str)>,
+    ) -> Snapshot {
+        let mut wire_index = HashMap::new();
+        for (server, conn) in &servers {
+            for t in &conn.tools {
+                wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
+            }
+        }
+        Snapshot { servers, health, wire_index }
+    }
+}
+
+/// What the router knows about one configured downstream right now.
+///
+/// Distinct states rather than present/absent, because "absent" conflates two things an operator
+/// must act on differently: a peer that is down but will be retried, and one that can never work
+/// until a human edits a file. A router that reported a reconnecting server as simply missing
+/// would look healthy while its tools were quietly gone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerHealth {
+    /// Connected; its tools are in the current snapshot.
+    Connected,
+    /// Unreachable, but retried on a backoff. `last_error` is why the most recent attempt failed.
+    Retrying { attempts: u32, last_error: String },
+    /// Terminal. The transport itself could not be built (an unusable header, an HTTP client that
+    /// won't initialize) — a config fault, not a world fault, so retrying would only produce noise
+    /// until someone edits the file.
+    Failed { reason: String },
+}
+
+impl ServerHealth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServerHealth::Connected => "connected",
+            ServerHealth::Retrying { .. } => "retrying",
+            ServerHealth::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// One configured downstream, as reported by [`McpRegistry::status`].
+#[derive(Clone, Debug)]
+pub struct ServerStatus {
+    pub name: String,
+    pub transport: &'static str,
+    pub health: ServerHealth,
+    /// Tools currently contributed. Always 0 unless `Connected`.
+    pub tools: usize,
+}
+
+/// All configured downstream MCP servers, connected and tool-listed.
+///
+/// Readers clone the `Arc` under a read guard and drop the guard immediately, so no lock is ever
+/// held across an `await` and a slow downstream call cannot block a snapshot swap.
+pub struct McpRegistry {
+    inner: std::sync::RwLock<Arc<Snapshot>>,
 }
 
 /// Allow-listed env for a spawned MCP server. Shares `claude_code::CHILD_ENV_ALLOW` (single
@@ -78,6 +148,39 @@ fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwe
         .build()
         .map_err(|e| format!("could not build the HTTP client for this downstream: {e}"))?;
     Ok(StreamableHttpClientTransport::with_client(client, config))
+}
+
+/// How many levels of `mcp__` namespacing a re-exported tool may carry.
+/// `WOOLLAMA_MCP_MAX_NESTING`, default 2. `0` disables the cap.
+///
+/// This exists because reconnect made unbounded growth reachable. Tool names nest one level per
+/// federation hop, and in a mutual topology (A consumes B, B consumes A) each refresh ingests a
+/// roster that already contains the previous round's nesting:
+///
+/// ```text
+/// t1  A pulls B  ->  A: [chat, mcp__B__chat]
+/// t2  B pulls A  ->  B: [chat, mcp__A__chat, mcp__A__mcp__B__chat]
+/// t3  A pulls B  ->  A: [..., mcp__B__mcp__A__mcp__B__chat]
+/// ```
+///
+/// Before reconnect that cost one level per RESTART. On a refresh timer it is one level per tick,
+/// forever — a roster that grows without bound, with every name past 64 chars falling back to the
+/// hashed form (and so onto issue #22's unstable-hash path). The cap bounds it locally, with no
+/// protocol change and nothing to coordinate between routers.
+fn max_nesting() -> usize {
+    std::env::var("WOOLLAMA_MCP_MAX_NESTING").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+/// How many `mcp__` namespace levels a tool name already carries.
+fn nesting_depth(name: &str) -> usize {
+    name.matches("mcp__").count()
+}
+
+/// Backoff ceiling for downstream reconnect. `WOOLLAMA_MCP_RETRY_MAX_SECS`, default 60s.
+/// **`0` disables retry entirely** — for a deployment that prefers a downstream to stay down
+/// until someone looks at it.
+fn retry_max() -> u64 {
+    std::env::var("WOOLLAMA_MCP_RETRY_MAX_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
 }
 
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
@@ -132,34 +235,151 @@ impl McpRegistry {
     /// (best-effort: a server that fails to start OR hangs on the handshake is logged and
     /// skipped, so a single bad/slow server can neither take the router down nor block its
     /// startup). The timeout is `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS` (default 30s).
+    /// How to report a server that didn't come up: `Failed` (terminal) when the transport itself
+    /// can't be built, or when retry is switched off entirely — in both cases nothing will ever
+    /// try again, and reporting `Retrying` would be the exact conflation `ServerHealth` exists to
+    /// prevent. `Retrying` only when something really will retry.
+    fn initial_health(spec: &McpServerSpec, attempts: u32, last_error: String) -> ServerHealth {
+        if let Some(reason) = Self::transport_fault(spec) {
+            return ServerHealth::Failed { reason };
+        }
+        if retry_max() == 0 {
+            return ServerHealth::Failed { reason: format!("{last_error} (retry disabled)") };
+        }
+        ServerHealth::Retrying { attempts, last_error }
+    }
+
     pub async fn connect(specs: HashMap<String, McpServerSpec>) -> McpRegistry {
+        let specs_by_name = specs.clone();
         let timeout = connect_timeout();
         let results = futures::future::join_all(
             specs
                 .into_iter()
-                .map(|(name, spec)| async move { (name, tokio::time::timeout(timeout, Self::connect_one(&spec)).await) }),
+                .map(|(name, spec)| async move {
+                    let transport = spec.transport_name();
+                    (name, tokio::time::timeout(timeout, Self::connect_one(&spec)).await, transport)
+                }),
         )
         .await;
         let mut servers = HashMap::new();
-        for (name, res) in results {
+        let mut health = HashMap::new();
+        for (name, res, transport) in results {
             match res {
                 Ok(Ok(conn)) => {
-                    servers.insert(name, conn);
+                    Self::capped_count(&name, &conn);
+                    servers.insert(name.clone(), conn);
+                    health.insert(name, (ServerHealth::Connected, transport));
                 }
-                Ok(Err(e)) => eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}"),
-                Err(_) => eprintln!(
-                    "woollamad: MCP server '{name}' timed out after {}s connecting, skipping",
-                    timeout.as_secs()
-                ),
+                Ok(Err(e)) => {
+                    eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}");
+                    let h = Self::initial_health(&specs_by_name[&name], 1, e);
+                    health.insert(name, (h, transport));
+                }
+                Err(_) => {
+                    let e = format!("timed out after {}s connecting", timeout.as_secs());
+                    eprintln!("woollamad: MCP server '{name}' {e}, skipping");
+                    let h = Self::initial_health(&specs_by_name[&name], 1, e);
+                    health.insert(name, (h, transport));
+                }
             }
         }
-        let mut wire_index = HashMap::new();
-        for (server, conn) in &servers {
-            for t in &conn.tools {
-                wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
-            }
+        McpRegistry { inner: std::sync::RwLock::new(Arc::new(Snapshot::new(servers, health))) }
+    }
+
+    /// Swap in a snapshot with `name` connected. Rebuilds the wire index from the new server
+    /// set, so an advertised name and the peer it resolves to are always published together.
+    fn publish_connected(&self, name: String, conn: ServerConn, transport: &'static str) {
+        // Once, here — not per request. The condition is static for a given roster.
+        Self::capped_count(&name, &conn);
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        let mut servers = HashMap::new();
+        // ServerConn isn't Clone (it owns a peer handle), so rebuild by moving out of the old
+        // snapshot where we can and cloning the cheap Peer handle where we can't.
+        for (k, v) in guard.servers.iter() {
+            servers.insert(k.clone(), ServerConn { peer: v.peer.clone(), tools: v.tools.clone() });
         }
-        McpRegistry { servers, wire_index }
+        servers.insert(name.clone(), conn);
+        let mut health = guard.health.clone();
+        health.insert(name, (ServerHealth::Connected, transport));
+        *guard = Arc::new(Snapshot::new(servers, health));
+    }
+
+    /// Record a failed attempt without touching the connected set.
+    fn mark_retrying(&self, name: &str, attempts: u32, last_error: String, transport: &'static str) {
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        let mut servers = HashMap::new();
+        for (k, v) in guard.servers.iter() {
+            servers.insert(k.clone(), ServerConn { peer: v.peer.clone(), tools: v.tools.clone() });
+        }
+        let mut health = guard.health.clone();
+        health.insert(name.to_string(), (ServerHealth::Retrying { attempts, last_error }, transport));
+        *guard = Arc::new(Snapshot::new(servers, health));
+    }
+
+    /// Every configured server with its current health and tool count — the runtime counterpart
+    /// to `check-config`. A `Retrying` server appears here WITH its last error, rather than being
+    /// silently absent: that distinction is the whole point (see [`ServerHealth`]).
+    pub fn status(&self) -> Vec<ServerStatus> {
+        self.introspect().1
+    }
+
+    /// Tool listing and per-server status derived from ONE snapshot.
+    ///
+    /// Two separate reads would let a reconnect land between them and produce an internally
+    /// inconsistent answer — a server reported `retrying` with 0 tools while its tools already
+    /// appear in the listing, or the reverse. Carrying health in the snapshot is pointless if
+    /// callers then read it separately.
+    pub fn introspect(&self) -> (Vec<(String, String, String)>, Vec<ServerStatus>) {
+        let snap = self.snapshot();
+        let exported = Self::exported_from(&snap);
+
+        // `tools` is what this server CONTRIBUTES, i.e. post-cap — not its ingested roster.
+        // Counting ingested tools would report a server as contributing tools that
+        // `/v1/tools` does not list, contradicting the field's own meaning.
+        let mut contributed: HashMap<&str, usize> = HashMap::new();
+        for (server, _) in &exported {
+            *contributed.entry(server.as_str()).or_default() += 1;
+        }
+
+        let listing = exported
+            .iter()
+            .map(|(server, t)| (server.clone(), t.name.to_string(), wire_name(server, &t.name)))
+            .collect();
+
+        let mut status: Vec<ServerStatus> = snap
+            .health
+            .iter()
+            .map(|(name, (health, transport))| ServerStatus {
+                name: name.clone(),
+                transport,
+                health: health.clone(),
+                tools: contributed.get(name.as_str()).copied().unwrap_or(0),
+            })
+            .collect();
+        status.sort_by(|a, b| a.name.cmp(&b.name));
+        (listing, status)
+    }
+
+    /// True once every configured server is `Connected` — used by tests to await convergence
+    /// rather than sleeping a fixed duration.
+    pub fn all_connected(&self) -> bool {
+        self.snapshot().health.values().all(|(h, _)| *h == ServerHealth::Connected)
+    }
+
+    /// The current view. Cloning the `Arc` under the guard keeps the critical section to a
+    /// pointer copy, so callers can `await` freely against a stable snapshot.
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.inner.read().expect("registry lock poisoned").clone()
+    }
+
+    /// Could this spec ever connect, or is it broken until a human edits the file?
+    /// A transport that cannot be BUILT (an unusable header name/value, an HTTP client that will
+    /// not initialize) is a config fault: retrying it forever only produces noise.
+    fn transport_fault(spec: &McpServerSpec) -> Option<String> {
+        match spec {
+            McpServerSpec::Stdio(_) => None,
+            McpServerSpec::Http(h) => http_transport(h).err(),
+        }
     }
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
@@ -195,45 +415,105 @@ impl McpRegistry {
     /// Resolve an advertised wire name (`mcp__server__tool`) to (server peer, bare tool) via
     /// the reverse map built at connect — unambiguous, unlike splitting on a separator.
     fn resolve(&self, wire: &str) -> Option<(Peer<RoleClient>, String)> {
-        let (server, bare) = self.wire_index.get(wire)?;
-        let conn = self.servers.get(server)?;
+        let snap = self.snapshot();
+        let (server, bare) = snap.wire_index.get(wire)?;
+        let conn = snap.servers.get(server)?;
         Some((conn.peer.clone(), bare.clone()))
     }
 
-    fn tool(&self, namespaced: &str) -> Option<&Tool> {
+    /// Returns an OWNED tool: the snapshot it came from may be replaced by a reconnect while
+    /// the caller still holds it, so a borrow tied to `&self` would be a lifetime lie.
+    fn tool(&self, namespaced: &str) -> Option<Tool> {
         let (server, bare) = namespaced.split_once('.')?;
-        self.servers.get(server)?.tools.iter().find(|t| t.name == bare)
+        self.snapshot().servers.get(server)?.tools.iter().find(|t| t.name == bare).cloned()
     }
 
-    /// Every downstream tool, re-exported namespaced `<server>.<tool>` with input +
-    /// output schema MIRRORED — for woollama's own tools/list (the MCP aggregator).
-    pub fn reexport_tools(&self) -> Vec<Tool> {
+    /// Every downstream tool that survives the federation nesting cap, as
+    /// `(server, original tool)`. The single place the cap is applied, so what a client is
+    /// TOLD about and what gets re-exported can never disagree.
+    fn exported(&self) -> Vec<(String, Tool)> {
+        Self::exported_from(&self.snapshot())
+    }
+
+    /// Derive the exported set from ONE snapshot, so callers that need tools and health together
+    /// read them from the same instant.
+    ///
+    /// Deliberately silent: this runs on the request path (per MCP `tools/list`, per
+    /// `GET /v1/tools`), and the capped condition is static, so logging here would emit one line
+    /// per request forever. The cap is reported once at ingest instead.
+    fn exported_from(snap: &Snapshot) -> Vec<(String, Tool)> {
+        let cap = max_nesting();
         let mut out = Vec::new();
-        for (server, conn) in &self.servers {
+        for (server, conn) in &snap.servers {
             for t in &conn.tools {
+                // Re-exporting adds one level, so compare the RESULTING depth against the cap.
+                if cap > 0 && nesting_depth(&t.name) + 1 > cap {
+                    continue;
+                }
+                out.push((server.clone(), t.clone()));
+            }
+        }
+        // Stable order: `snap.servers` is a HashMap, so without this the MCP tools/list roster and
+        // `/v1/tools` come back shuffled on every call — which also churns any upstream cache
+        // keyed on the tool list. `status()` sorts for the same reason.
+        out.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
+        out
+    }
+
+    /// How many of a server's ingested tools the nesting cap drops. Reported once at ingest.
+    fn capped_count(server: &str, conn: &ServerConn) -> usize {
+        let cap = max_nesting();
+        if cap == 0 {
+            return 0;
+        }
+        let n = conn.tools.iter().filter(|t| nesting_depth(&t.name) + 1 > cap).count();
+        if n > 0 {
+            eprintln!(
+                "woollamad: MCP server '{server}': {n} tool(s) already at {cap} levels of \
+                 federation namespacing will not be re-exported (WOOLLAMA_MCP_MAX_NESTING={cap})"
+            );
+        }
+        n
+    }
+
+    /// Every downstream tool, re-exported namespaced with input + output schema MIRRORED —
+    /// for woollama's own tools/list (the MCP aggregator).
+    pub fn reexport_tools(&self) -> Vec<Tool> {
+        self.exported()
+            .into_iter()
+            .map(|(server, t)| {
                 let mut nt = Tool::new(
-                    wire_name(server, &t.name),
+                    wire_name(&server, &t.name),
                     t.description.clone().unwrap_or_default(),
                     t.input_schema.clone(),
                 );
                 if let Some(os) = t.output_schema.clone() {
                     nt = nt.with_raw_output_schema(os);
                 }
-                out.push(nt);
-            }
-        }
-        out
+                nt
+            })
+            .collect()
+    }
+
+    /// `(server, bare name, advertised wire name)` for every re-exported tool — the introspection
+    /// view behind `GET /v1/tools`. Derived from the same `exported()` set as the aggregator, so
+    /// introspection cannot advertise a tool the aggregator drops (or vice versa).
+    pub fn tool_listing(&self) -> Vec<(String, String, String)> {
+        self.introspect().0
     }
 
     /// Call a tool by BARE name on a specific server (for the MCP conversation-store
     /// provider, whose tools — create_thread/etc. — aren't recipe-namespaced).
     pub async fn call_server(&self, server: &str, tool: &str, args: &Value) -> Result<CallToolResult, String> {
-        let conn = self.servers.get(server).ok_or_else(|| format!("unknown server '{server}'"))?;
+        let peer = {
+            let snap = self.snapshot();
+            snap.servers.get(server).ok_or_else(|| format!("unknown server '{server}'"))?.peer.clone()
+        };
         let mut params = CallToolRequestParams::new(tool.to_string());
         if let Some(obj) = args.as_object() {
             params = params.with_arguments(obj.clone());
         }
-        call_with_timeout(&conn.peer, params).await
+        call_with_timeout(&peer, params).await
     }
 
     /// Dispatch a namespaced tool and return the RAW `CallToolResult` (content +
@@ -315,6 +595,50 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
 }
 
 
+/// Retry every downstream that isn't connected, on a per-server exponential backoff (1s doubling
+/// to [`retry_max`]). One task per server; each exits as soon as its server connects.
+///
+/// **Refresh is background-only and never request-triggered.** That is deliberate and
+/// load-bearing: `list_tools` serves the cached snapshot, so a request can never cause a
+/// downstream fetch. If it could, then in a federated topology A's `tools/list` would trigger a
+/// fetch from B, whose `tools/list` would fetch from A — live recursion across routers. Keeping
+/// refresh on a timer preserves the property that makes federation safe today.
+///
+/// A `Failed` server (its transport could not be built) is NOT retried: that is a config fault,
+/// and retrying would produce noise until someone edits a file.
+pub fn spawn_reconnect(reg: Arc<McpRegistry>, specs: HashMap<String, McpServerSpec>) {
+    let max = retry_max();
+    if max == 0 {
+        return; // retry disabled by configuration
+    }
+    for (name, spec) in specs {
+        let health = reg.snapshot().health.get(&name).map(|(h, _)| h.clone());
+        if !matches!(health, Some(ServerHealth::Retrying { .. })) {
+            continue; // already connected, or terminally Failed
+        }
+        let reg = reg.clone();
+        tokio::spawn(async move {
+            let transport = spec.transport_name();
+            let mut attempts = 1u32;
+            let mut delay = 1u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(max);
+                attempts += 1;
+                match tokio::time::timeout(connect_timeout(), McpRegistry::connect_one(&spec)).await {
+                    Ok(Ok(conn)) => {
+                        eprintln!("woollamad: MCP server '{name}' reconnected after {attempts} attempt(s)");
+                        reg.publish_connected(name, conn, transport);
+                        return;
+                    }
+                    Ok(Err(e)) => reg.mark_retrying(&name, attempts, e, transport),
+                    Err(_) => reg.mark_retrying(&name, attempts, "connect timed out".to_string(), transport),
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +685,7 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "a hung downstream server must not block startup (took {elapsed:?})"
         );
-        assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
+        assert!(reg.snapshot().servers.is_empty(), "hung + dead servers are skipped, not registered");
         std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
     }
 
@@ -396,6 +720,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dead_downstream_reports_retrying_with_its_error_not_absence() {
+        // The whole point of ServerHealth. A router that reported an unreachable-but-retryable
+        // server as simply *missing* would look healthy with its tools quietly gone — which is
+        // the failure shape this project keeps finding. Absence is not a status.
+        let mut specs = HashMap::new();
+        specs.insert(
+            "gone".to_string(),
+            McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers: HashMap::new() }),
+        );
+        specs.insert(
+            "dead".to_string(),
+            McpServerSpec::Stdio(StdioSpec { command: "false".into(), args: vec![], env: HashMap::new() }),
+        );
+        let reg = McpRegistry::connect(specs).await;
+
+        let status = reg.status();
+        assert_eq!(status.len(), 2, "every CONFIGURED server must be reported, not just live ones: {status:?}");
+        for s in &status {
+            match &s.health {
+                ServerHealth::Retrying { last_error, .. } => {
+                    assert!(!last_error.is_empty(), "a retrying server must carry WHY: {s:?}")
+                }
+                other => panic!("expected Retrying for '{}', got {other:?}", s.name),
+            }
+            assert_eq!(s.tools, 0, "a server that isn't connected contributes no tools");
+        }
+        assert_eq!(status[0].name, "dead", "status is sorted by name for stable operator output");
+        assert_eq!(status[0].transport, "stdio");
+        assert_eq!(status[1].transport, "http");
+    }
+
+    #[tokio::test]
+    async fn an_unbuildable_transport_is_terminal_not_retried_forever() {
+        // `Failed` existed but was never CONSTRUCTED: every failure folded into `Retrying`, so a
+        // config fault — an unusable header, say — spawned a retry task that hammered a broken
+        // spec forever at the backoff ceiling, contradicting the docs, the enum's own doc comment,
+        // and spawn_reconnect's "terminally Failed" branch.
+        let mut headers = HashMap::new();
+        headers.insert("Invalid Header Name".to_string(), "x".to_string());
+        let mut specs = HashMap::new();
+        specs.insert(
+            "broken".to_string(),
+            McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers }),
+        );
+        let reg = McpRegistry::connect(specs).await;
+        match &reg.status()[0].health {
+            ServerHealth::Failed { reason } => {
+                assert!(!reason.is_empty(), "a terminal failure must say why")
+            }
+            other => panic!("a transport that cannot be built is terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_transport_that_cannot_be_built_is_skipped_not_fatal() {
         // `http_transport` has two construction failures that are not connection failures:
         // an unusable header, and `reqwest::Client::builder().build()` erroring when TLS or the
@@ -411,7 +789,14 @@ mod tests {
             McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers }),
         );
         let reg = McpRegistry::connect(specs).await;
-        assert!(reg.servers.is_empty(), "an unbuildable transport is skipped, not registered");
+        assert!(reg.snapshot().servers.is_empty(), "an unbuildable transport is skipped, not registered");
+    }
+
+    #[test]
+    fn nesting_depth_counts_federation_levels() {
+        assert_eq!(nesting_depth("count_to"), 0, "a plain downstream tool");
+        assert_eq!(nesting_depth("mcp__fix__count_to"), 1, "one hop of federation");
+        assert_eq!(nesting_depth("mcp__b__mcp__a__count_to"), 2, "two hops");
     }
 
     #[test]
