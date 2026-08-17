@@ -85,13 +85,25 @@ Because woollama also *serves* Streamable HTTP at `/mcp`, the `url` form is how
 one woollamad consumes another — an inference-holding instance reaching a
 tools-only instance's namespace without either spawning the other's servers.
 
-> **What this is verified against.** `woollama-server/tests/federation_auth.rs`
-> runs two real `woollamad` processes: a tools-only leaf requiring a bearer on
-> every request (loopback included), and a consumer reaching it over the `url`
-> form with the credential from `${WOOLLAMA_TOKEN}`. It asserts the leaf's tools
-> federate through the enforced credential, and that a consumer holding the
-> *wrong* credential federates nothing, stays running, and says so in its log.
-> **Not** covered: a LAN hop, a reverse proxy, TLS, or a containerised consumer.
+> **What this is verified against.**
+>
+> *In CI:* `woollama-server/tests/federation_auth.rs` runs two real `woollamad`
+> processes — a tools-only leaf requiring a bearer on every request (loopback
+> included), and a consumer reaching it over the `url` form with the credential
+> from `${WOOLLAMA_TOKEN}`. It asserts the leaf's tools federate through the
+> enforced credential, and that a consumer holding the *wrong* credential
+> federates nothing, stays running, and says so.
+>
+> *End to end, with real tools:* two `woollamad` 0.13.0 processes, the downstream
+> fronting DuckDB-backed MCP servers as stdio children and the consumer reaching
+> it over `url`. Eleven tools federated, and a real `tools/call` through
+> consumer → HTTP → downstream → stdio → server → DuckDB → a ZIM archive → back.
+> Longest federated wire name was 42 characters against the 64-char limit, so the
+> hash fallback does not fire at one level of federation with realistic names.
+>
+> **Still not covered:** a LAN hop, a reverse proxy, TLS, or a containerised
+> consumer. Those remain a materially different failure surface — in particular,
+> a consumer *inside* a container resolves `127.0.0.1` to its own namespace.
 
 **Credentials go in `headers` as `${VAR}`, never inline.** There is no separate
 secrets mechanism: `${VAR}` expansion already applies to `mcp.json`, the same
