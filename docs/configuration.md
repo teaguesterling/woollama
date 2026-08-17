@@ -85,6 +85,14 @@ Because woollama also *serves* Streamable HTTP at `/mcp`, the `url` form is how
 one woollamad consumes another — an inference-holding instance reaching a
 tools-only instance's namespace without either spawning the other's servers.
 
+> **What this is verified against.** `woollama-server/tests/federation_auth.rs`
+> runs two real `woollamad` processes: a tools-only leaf requiring a bearer on
+> every request (loopback included), and a consumer reaching it over the `url`
+> form with the credential from `${WOOLLAMA_TOKEN}`. It asserts the leaf's tools
+> federate through the enforced credential, and that a consumer holding the
+> *wrong* credential federates nothing, stays running, and says so in its log.
+> **Not** covered: a LAN hop, a reverse proxy, TLS, or a containerised consumer.
+
 **Credentials go in `headers` as `${VAR}`, never inline.** There is no separate
 secrets mechanism: `${VAR}` expansion already applies to `mcp.json`, the same
 shape as `api_key_env` for inferencers.
