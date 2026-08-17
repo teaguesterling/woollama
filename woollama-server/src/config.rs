@@ -160,6 +160,16 @@ pub fn scan_vars(system: &str) -> Vec<String> {
     out
 }
 
+impl McpServerSpec {
+    /// Which transport this server uses, for operator-facing status.
+    pub fn transport_name(&self) -> &'static str {
+        match self {
+            McpServerSpec::Stdio(_) => "stdio",
+            McpServerSpec::Http(_) => "http",
+        }
+    }
+}
+
 /// A parsed `mcp.json`: the usable servers, the per-server errors (entries that were skipped —
 /// a bad entry never costs its siblings), and operator warnings that don't invalidate an entry.
 pub type McpConfigLoad = (HashMap<String, McpServerSpec>, Vec<String>, Vec<String>);

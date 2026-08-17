@@ -32,6 +32,9 @@ struct ServerConn {
 #[derive(Default)]
 struct Snapshot {
     servers: HashMap<String, ServerConn>,
+    /// Every configured server's health, including those with no entry in `servers`. Carried in
+    /// the snapshot so a caller sees health and tools from the same instant.
+    health: HashMap<String, (ServerHealth, &'static str)>,
     /// Reverse map: advertised wire name (`mcp__server__tool`) -> (server, bare tool). Built
     /// with the snapshot so dispatch resolves the model's tool_call name unambiguously (no
     /// dot-splitting, and it works for the hashed >64-char fallback too).
@@ -41,15 +44,56 @@ struct Snapshot {
 impl Snapshot {
     /// Build the reverse index for a set of connected servers — the one place a wire name is
     /// derived, so publishing can never disagree with resolving.
-    fn new(servers: HashMap<String, ServerConn>) -> Snapshot {
+    fn new(
+        servers: HashMap<String, ServerConn>,
+        health: HashMap<String, (ServerHealth, &'static str)>,
+    ) -> Snapshot {
         let mut wire_index = HashMap::new();
         for (server, conn) in &servers {
             for t in &conn.tools {
                 wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
             }
         }
-        Snapshot { servers, wire_index }
+        Snapshot { servers, health, wire_index }
     }
+}
+
+/// What the router knows about one configured downstream right now.
+///
+/// Distinct states rather than present/absent, because "absent" conflates two things an operator
+/// must act on differently: a peer that is down but will be retried, and one that can never work
+/// until a human edits a file. A router that reported a reconnecting server as simply missing
+/// would look healthy while its tools were quietly gone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerHealth {
+    /// Connected; its tools are in the current snapshot.
+    Connected,
+    /// Unreachable, but retried on a backoff. `last_error` is why the most recent attempt failed.
+    Retrying { attempts: u32, last_error: String },
+    /// Terminal. The transport itself could not be built (an unusable header, an HTTP client that
+    /// won't initialize) — a config fault, not a world fault, so retrying would only produce noise
+    /// until someone edits the file.
+    Failed { reason: String },
+}
+
+impl ServerHealth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServerHealth::Connected => "connected",
+            ServerHealth::Retrying { .. } => "retrying",
+            ServerHealth::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// One configured downstream, as reported by [`McpRegistry::status`].
+#[derive(Clone, Debug)]
+pub struct ServerStatus {
+    pub name: String,
+    pub transport: &'static str,
+    pub health: ServerHealth,
+    /// Tools currently contributed. Always 0 unless `Connected`.
+    pub tools: usize,
 }
 
 /// All configured downstream MCP servers, connected and tool-listed.
@@ -163,23 +207,51 @@ impl McpRegistry {
         let results = futures::future::join_all(
             specs
                 .into_iter()
-                .map(|(name, spec)| async move { (name, tokio::time::timeout(timeout, Self::connect_one(&spec)).await) }),
+                .map(|(name, spec)| async move {
+                    let transport = spec.transport_name();
+                    (name, tokio::time::timeout(timeout, Self::connect_one(&spec)).await, transport)
+                }),
         )
         .await;
         let mut servers = HashMap::new();
-        for (name, res) in results {
+        let mut health = HashMap::new();
+        for (name, res, transport) in results {
             match res {
                 Ok(Ok(conn)) => {
-                    servers.insert(name, conn);
+                    servers.insert(name.clone(), conn);
+                    health.insert(name, (ServerHealth::Connected, transport));
                 }
-                Ok(Err(e)) => eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}"),
-                Err(_) => eprintln!(
-                    "woollamad: MCP server '{name}' timed out after {}s connecting, skipping",
-                    timeout.as_secs()
-                ),
+                Ok(Err(e)) => {
+                    eprintln!("woollamad: MCP server '{name}' failed to start, skipping: {e}");
+                    health.insert(name, (ServerHealth::Retrying { attempts: 1, last_error: e }, transport));
+                }
+                Err(_) => {
+                    let e = format!("timed out after {}s connecting", timeout.as_secs());
+                    eprintln!("woollamad: MCP server '{name}' {e}, skipping");
+                    health.insert(name, (ServerHealth::Retrying { attempts: 1, last_error: e }, transport));
+                }
             }
         }
-        McpRegistry { inner: std::sync::RwLock::new(Arc::new(Snapshot::new(servers))) }
+        McpRegistry { inner: std::sync::RwLock::new(Arc::new(Snapshot::new(servers, health))) }
+    }
+
+    /// Every configured server with its current health and tool count — the runtime counterpart
+    /// to `check-config`. A `Retrying` server appears here WITH its last error, rather than being
+    /// silently absent: that distinction is the whole point (see [`ServerHealth`]).
+    pub fn status(&self) -> Vec<ServerStatus> {
+        let snap = self.snapshot();
+        let mut out: Vec<ServerStatus> = snap
+            .health
+            .iter()
+            .map(|(name, (health, transport))| ServerStatus {
+                name: name.clone(),
+                transport,
+                health: health.clone(),
+                tools: snap.servers.get(name).map(|c| c.tools.len()).unwrap_or(0),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// The current view. Cloning the `Arc` under the guard keeps the critical section to a
@@ -426,6 +498,38 @@ mod tests {
             merged_env(&spec_env).get("ANTHROPIC_API_KEY").map(String::as_str),
             Some("on-purpose")
         );
+    }
+
+    #[tokio::test]
+    async fn a_dead_downstream_reports_retrying_with_its_error_not_absence() {
+        // The whole point of ServerHealth. A router that reported an unreachable-but-retryable
+        // server as simply *missing* would look healthy with its tools quietly gone — which is
+        // the failure shape this project keeps finding. Absence is not a status.
+        let mut specs = HashMap::new();
+        specs.insert(
+            "gone".to_string(),
+            McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers: HashMap::new() }),
+        );
+        specs.insert(
+            "dead".to_string(),
+            McpServerSpec::Stdio(StdioSpec { command: "false".into(), args: vec![], env: HashMap::new() }),
+        );
+        let reg = McpRegistry::connect(specs).await;
+
+        let status = reg.status();
+        assert_eq!(status.len(), 2, "every CONFIGURED server must be reported, not just live ones: {status:?}");
+        for s in &status {
+            match &s.health {
+                ServerHealth::Retrying { last_error, .. } => {
+                    assert!(!last_error.is_empty(), "a retrying server must carry WHY: {s:?}")
+                }
+                other => panic!("expected Retrying for '{}', got {other:?}", s.name),
+            }
+            assert_eq!(s.tools, 0, "a server that isn't connected contributes no tools");
+        }
+        assert_eq!(status[0].name, "dead", "status is sorted by name for stable operator output");
+        assert_eq!(status[0].transport, "stdio");
+        assert_eq!(status[1].transport, "http");
     }
 
     #[tokio::test]
