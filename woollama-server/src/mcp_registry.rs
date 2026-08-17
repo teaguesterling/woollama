@@ -150,6 +150,13 @@ fn http_transport(spec: &HttpSpec) -> Result<StreamableHttpClientTransport<reqwe
     Ok(StreamableHttpClientTransport::with_client(client, config))
 }
 
+/// Backoff ceiling for downstream reconnect. `WOOLLAMA_MCP_RETRY_MAX_SECS`, default 60s.
+/// **`0` disables retry entirely** — for a deployment that prefers a downstream to stay down
+/// until someone looks at it.
+fn retry_max() -> u64 {
+    std::env::var("WOOLLAMA_MCP_RETRY_MAX_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+}
+
 /// Per-server connect timeout (handshake + initial tools/list). `WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS`,
 /// default 30s. Bounds startup so a hung downstream server can't wedge the daemon.
 fn connect_timeout() -> std::time::Duration {
@@ -235,6 +242,34 @@ impl McpRegistry {
         McpRegistry { inner: std::sync::RwLock::new(Arc::new(Snapshot::new(servers, health))) }
     }
 
+    /// Swap in a snapshot with `name` connected. Rebuilds the wire index from the new server
+    /// set, so an advertised name and the peer it resolves to are always published together.
+    fn publish_connected(&self, name: String, conn: ServerConn, transport: &'static str) {
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        let mut servers = HashMap::new();
+        // ServerConn isn't Clone (it owns a peer handle), so rebuild by moving out of the old
+        // snapshot where we can and cloning the cheap Peer handle where we can't.
+        for (k, v) in guard.servers.iter() {
+            servers.insert(k.clone(), ServerConn { peer: v.peer.clone(), tools: v.tools.clone() });
+        }
+        servers.insert(name.clone(), conn);
+        let mut health = guard.health.clone();
+        health.insert(name, (ServerHealth::Connected, transport));
+        *guard = Arc::new(Snapshot::new(servers, health));
+    }
+
+    /// Record a failed attempt without touching the connected set.
+    fn mark_retrying(&self, name: &str, attempts: u32, last_error: String, transport: &'static str) {
+        let mut guard = self.inner.write().expect("registry lock poisoned");
+        let mut servers = HashMap::new();
+        for (k, v) in guard.servers.iter() {
+            servers.insert(k.clone(), ServerConn { peer: v.peer.clone(), tools: v.tools.clone() });
+        }
+        let mut health = guard.health.clone();
+        health.insert(name.to_string(), (ServerHealth::Retrying { attempts, last_error }, transport));
+        *guard = Arc::new(Snapshot::new(servers, health));
+    }
+
     /// Every configured server with its current health and tool count — the runtime counterpart
     /// to `check-config`. A `Retrying` server appears here WITH its last error, rather than being
     /// silently absent: that distinction is the whole point (see [`ServerHealth`]).
@@ -252,6 +287,12 @@ impl McpRegistry {
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// True once every configured server is `Connected` — used by tests to await convergence
+    /// rather than sleeping a fixed duration.
+    pub fn all_connected(&self) -> bool {
+        self.snapshot().health.values().all(|(h, _)| *h == ServerHealth::Connected)
     }
 
     /// The current view. Cloning the `Arc` under the guard keeps the critical section to a
@@ -419,6 +460,50 @@ fn render_result(res: &CallToolResult) -> (String, bool) {
     (body, !is_error)
 }
 
+
+/// Retry every downstream that isn't connected, on a per-server exponential backoff (1s doubling
+/// to [`retry_max`]). One task per server; each exits as soon as its server connects.
+///
+/// **Refresh is background-only and never request-triggered.** That is deliberate and
+/// load-bearing: `list_tools` serves the cached snapshot, so a request can never cause a
+/// downstream fetch. If it could, then in a federated topology A's `tools/list` would trigger a
+/// fetch from B, whose `tools/list` would fetch from A — live recursion across routers. Keeping
+/// refresh on a timer preserves the property that makes federation safe today.
+///
+/// A `Failed` server (its transport could not be built) is NOT retried: that is a config fault,
+/// and retrying would produce noise until someone edits a file.
+pub fn spawn_reconnect(reg: Arc<McpRegistry>, specs: HashMap<String, McpServerSpec>) {
+    let max = retry_max();
+    if max == 0 {
+        return; // retry disabled by configuration
+    }
+    for (name, spec) in specs {
+        let health = reg.snapshot().health.get(&name).map(|(h, _)| h.clone());
+        if !matches!(health, Some(ServerHealth::Retrying { .. })) {
+            continue; // already connected, or terminally Failed
+        }
+        let reg = reg.clone();
+        tokio::spawn(async move {
+            let transport = spec.transport_name();
+            let mut attempts = 1u32;
+            let mut delay = 1u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(max);
+                attempts += 1;
+                match tokio::time::timeout(connect_timeout(), McpRegistry::connect_one(&spec)).await {
+                    Ok(Ok(conn)) => {
+                        eprintln!("woollamad: MCP server '{name}' reconnected after {attempts} attempt(s)");
+                        reg.publish_connected(name, conn, transport);
+                        return;
+                    }
+                    Ok(Err(e)) => reg.mark_retrying(&name, attempts, e, transport),
+                    Err(_) => reg.mark_retrying(&name, attempts, "connect timed out".to_string(), transport),
+                }
+            }
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

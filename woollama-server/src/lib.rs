@@ -51,6 +51,10 @@ use mcp_surface::WoollamaMcp;
 use pattern_backend::PatternBackend;
 
 pub use config::{load_mcp_servers, load_recipes};
+// The reconnect surface is public so an integration test can drive it, and because per-server
+// health is meant to be surfaced rather than kept internal.
+pub use config::{HttpSpec, McpServerSpec, StdioSpec};
+pub use mcp_registry::{spawn_reconnect, McpRegistry, ServerHealth, ServerStatus};
 
 /// `woollamad check-config` — validate the config files and report, without connecting to
 /// anything or binding a port. Returns the process exit code: 0 clean, 1 if anything is wrong.
@@ -170,6 +174,9 @@ pub async fn build_state() -> AppState {
         HashMap::new()
     });
     let registry = Arc::new(mcp_registry::McpRegistry::connect(specs.clone()).await);
+    // Retry anything that didn't come up. Background-only: a request never triggers a fetch, so
+    // `list_tools` keeps serving a cached snapshot and federated topologies can't recurse.
+    mcp_registry::spawn_reconnect(registry.clone(), specs.clone());
     let inferencers = engine::Registry::from_config().unwrap_or_else(|e| {
         eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
