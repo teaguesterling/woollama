@@ -116,6 +116,94 @@ def _expand_env(text: str) -> str:
     return "".join(out)
 
 
+def _missing_vars(text: str) -> list[str]:
+    """Bare `${VAR}` references whose variable is unset, in first-seen order.
+
+    "Bare" means no declared fallback: `${VAR:-x}` is the author saying absence
+    is intended and is never reported. A variable that is SET but empty is not
+    missing either -- `FOO=` is an explicit operator choice, and treating it as
+    an error would make a deliberately-empty value indistinguishable from a
+    typo'd name.
+
+    Mirrors Rust's `missing_vars` (woollama-engine/src/lib.rs) EXACTLY. A config
+    file is read by both implementations, so one that loads here and fails there
+    is the divergence both sides exist to prevent.
+    """
+    out: list[str] = []
+    rest = text
+    while True:
+        pos = rest.find("${")
+        if pos == -1:
+            break
+        after = rest[pos + 2:]
+        end = after.find("}")
+        if end == -1:
+            break
+        token = after[:end]
+        if token and ":-" not in token and os.environ.get(token) is None and token not in out:
+            out.append(token)
+        rest = after[end + 1:]
+    return out
+
+
+def _missing_vars_in(parsed: object) -> list[str]:
+    """`_missing_vars` over a PARSED document's string values only.
+
+    Parses first, deliberately. A raw-text scan reads comments and
+    documentation -- woollama's own bundled `mcp.json` explains `${VAR}` in
+    prose, and scanning raw text made the loader refuse its own default config.
+    Only values the loader will actually consume can be a misconfiguration.
+    Keys beginning `_` are documentation by convention and are skipped.
+
+    Mirrors Rust's `missing_vars_in_toml` / the server's structural walker.
+    """
+    out: list[str] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, str):
+            for name in _missing_vars(node):
+                if name not in out:
+                    out.append(name)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str) and key.startswith("_"):
+                    continue
+                walk(value)
+
+    walk(parsed)
+    return out
+
+
+def _reject_missing_vars(source: str, text: str) -> None:
+    """Refuse a config referencing variables that do not exist.
+
+    Checked BEFORE expansion: afterwards a missing variable is an empty string,
+    indistinguishable from an intentionally empty one -- which is exactly what
+    `${VAR:-default}` exists to let an author say. Safe to refuse only because
+    that form exists; before it, this would have broken the bundled defaults.
+    """
+    try:
+        parsed = json.loads(text) if text.lstrip().startswith("{") else tomllib.loads(text)
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError):
+        # Unparseable: its own parse error surfaces next and is the better message.
+        return
+    missing = _missing_vars_in(parsed)
+    if not missing:
+        return
+    names = ", ".join("${%s}" % n for n in missing)
+    plural = "variables" if len(missing) > 1 else "a variable"
+    verb = "are" if len(missing) > 1 else "is"
+    them = "them" if len(missing) > 1 else "it"
+    raise ValueError(
+        f"{source} references {plural} which {verb} not set: {names}. "
+        f"Export {them}, or declare a fallback with `${{VAR:-default}}` if "
+        f"absence is intended."
+    )
+
+
 def _read_user_or_default(filename: str) -> tuple[str, str]:
     """Return (source_label, text_content). Prefers user config; falls back
     to the packaged default."""
@@ -132,6 +220,7 @@ def load_mcp_servers() -> dict[str, dict]:
     """Return `{name: {command, args, env}}` for every configured MCP server.
     Shape matches Claude Code's mcp.json `mcpServers` block."""
     source, text = _read_user_or_default("mcp.json")
+    _reject_missing_vars(source, text)
     text = _expand_env(text)
     try:
         data = json.loads(text)
@@ -170,6 +259,7 @@ def load_conversation_store() -> dict | None:
     warns + stays stateless if not). Config-driven, not an env var, so the wiring
     lives with the rest of woollama's file config."""
     source, text = _read_user_or_default("mcp.json")
+    _reject_missing_vars(source, text)
     text = _expand_env(text)
     try:
         data = json.loads(text)
@@ -270,7 +360,9 @@ def load_inferencers() -> dict[str, dict]:
     path = config_dir() / "inferencers.toml"
     if not path.is_file():
         return {}
-    text = _expand_env(path.read_text())
+    raw = path.read_text()
+    _reject_missing_vars(str(path), raw)
+    text = _expand_env(raw)
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
@@ -459,7 +551,9 @@ def load_management_protocols() -> dict[str, ProtocolSpec]:
     path = config_dir() / "inferencers.toml"
     if not path.is_file():
         return {}
-    text = _expand_env(path.read_text())
+    raw = path.read_text()
+    _reject_missing_vars(str(path), raw)
+    text = _expand_env(raw)
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
