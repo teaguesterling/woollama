@@ -25,13 +25,39 @@ struct ServerConn {
     tools: Vec<Tool>,
 }
 
-/// All configured downstream MCP servers, connected and tool-listed.
-pub struct McpRegistry {
+/// One consistent view of every connected downstream server. Immutable once published: the
+/// registry swaps a whole `Arc<Snapshot>` rather than mutating in place, so `servers` and
+/// `wire_index` can never be observed disagreeing with each other (a reader that saw a new
+/// `wire_index` against an old `servers` would resolve a name to a peer that no longer holds it).
+#[derive(Default)]
+struct Snapshot {
     servers: HashMap<String, ServerConn>,
     /// Reverse map: advertised wire name (`mcp__server__tool`) -> (server, bare tool). Built
-    /// once at connect so dispatch resolves the model's tool_call name unambiguously (no
+    /// with the snapshot so dispatch resolves the model's tool_call name unambiguously (no
     /// dot-splitting, and it works for the hashed >64-char fallback too).
     wire_index: HashMap<String, (String, String)>,
+}
+
+impl Snapshot {
+    /// Build the reverse index for a set of connected servers — the one place a wire name is
+    /// derived, so publishing can never disagree with resolving.
+    fn new(servers: HashMap<String, ServerConn>) -> Snapshot {
+        let mut wire_index = HashMap::new();
+        for (server, conn) in &servers {
+            for t in &conn.tools {
+                wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
+            }
+        }
+        Snapshot { servers, wire_index }
+    }
+}
+
+/// All configured downstream MCP servers, connected and tool-listed.
+///
+/// Readers clone the `Arc` under a read guard and drop the guard immediately, so no lock is ever
+/// held across an `await` and a slow downstream call cannot block a snapshot swap.
+pub struct McpRegistry {
+    inner: std::sync::RwLock<Arc<Snapshot>>,
 }
 
 /// Allow-listed env for a spawned MCP server. Shares `claude_code::CHILD_ENV_ALLOW` (single
@@ -153,13 +179,13 @@ impl McpRegistry {
                 ),
             }
         }
-        let mut wire_index = HashMap::new();
-        for (server, conn) in &servers {
-            for t in &conn.tools {
-                wire_index.insert(wire_name(server, &t.name), (server.clone(), t.name.to_string()));
-            }
-        }
-        McpRegistry { servers, wire_index }
+        McpRegistry { inner: std::sync::RwLock::new(Arc::new(Snapshot::new(servers))) }
+    }
+
+    /// The current view. Cloning the `Arc` under the guard keeps the critical section to a
+    /// pointer copy, so callers can `await` freely against a stable snapshot.
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.inner.read().expect("registry lock poisoned").clone()
     }
 
     async fn connect_one(spec: &McpServerSpec) -> Result<ServerConn, String> {
@@ -195,21 +221,25 @@ impl McpRegistry {
     /// Resolve an advertised wire name (`mcp__server__tool`) to (server peer, bare tool) via
     /// the reverse map built at connect — unambiguous, unlike splitting on a separator.
     fn resolve(&self, wire: &str) -> Option<(Peer<RoleClient>, String)> {
-        let (server, bare) = self.wire_index.get(wire)?;
-        let conn = self.servers.get(server)?;
+        let snap = self.snapshot();
+        let (server, bare) = snap.wire_index.get(wire)?;
+        let conn = snap.servers.get(server)?;
         Some((conn.peer.clone(), bare.clone()))
     }
 
-    fn tool(&self, namespaced: &str) -> Option<&Tool> {
+    /// Returns an OWNED tool: the snapshot it came from may be replaced by a reconnect while
+    /// the caller still holds it, so a borrow tied to `&self` would be a lifetime lie.
+    fn tool(&self, namespaced: &str) -> Option<Tool> {
         let (server, bare) = namespaced.split_once('.')?;
-        self.servers.get(server)?.tools.iter().find(|t| t.name == bare)
+        self.snapshot().servers.get(server)?.tools.iter().find(|t| t.name == bare).cloned()
     }
 
     /// Every downstream tool, re-exported namespaced `<server>.<tool>` with input +
     /// output schema MIRRORED — for woollama's own tools/list (the MCP aggregator).
     pub fn reexport_tools(&self) -> Vec<Tool> {
         let mut out = Vec::new();
-        for (server, conn) in &self.servers {
+        let snap = self.snapshot();
+        for (server, conn) in &snap.servers {
             for t in &conn.tools {
                 let mut nt = Tool::new(
                     wire_name(server, &t.name),
@@ -228,12 +258,15 @@ impl McpRegistry {
     /// Call a tool by BARE name on a specific server (for the MCP conversation-store
     /// provider, whose tools — create_thread/etc. — aren't recipe-namespaced).
     pub async fn call_server(&self, server: &str, tool: &str, args: &Value) -> Result<CallToolResult, String> {
-        let conn = self.servers.get(server).ok_or_else(|| format!("unknown server '{server}'"))?;
+        let peer = {
+            let snap = self.snapshot();
+            snap.servers.get(server).ok_or_else(|| format!("unknown server '{server}'"))?.peer.clone()
+        };
         let mut params = CallToolRequestParams::new(tool.to_string());
         if let Some(obj) = args.as_object() {
             params = params.with_arguments(obj.clone());
         }
-        call_with_timeout(&conn.peer, params).await
+        call_with_timeout(&peer, params).await
     }
 
     /// Dispatch a namespaced tool and return the RAW `CallToolResult` (content +
@@ -361,7 +394,7 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "a hung downstream server must not block startup (took {elapsed:?})"
         );
-        assert!(reg.servers.is_empty(), "hung + dead servers are skipped, not registered");
+        assert!(reg.snapshot().servers.is_empty(), "hung + dead servers are skipped, not registered");
         std::env::remove_var("WOOLLAMA_MCP_CONNECT_TIMEOUT_SECS");
     }
 
@@ -411,7 +444,7 @@ mod tests {
             McpServerSpec::Http(HttpSpec { url: "http://127.0.0.1:1/mcp".into(), headers }),
         );
         let reg = McpRegistry::connect(specs).await;
-        assert!(reg.servers.is_empty(), "an unbuildable transport is skipped, not registered");
+        assert!(reg.snapshot().servers.is_empty(), "an unbuildable transport is skipped, not registered");
     }
 
     #[test]
