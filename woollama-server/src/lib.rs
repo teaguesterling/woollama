@@ -747,9 +747,23 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
                 ids.extend(found);
             }
         }
+        let caps = state.capabilities.get(&inf.name).cloned().unwrap_or_default();
         for id in ids {
             if seen.insert(id.clone()) {
-                data.push(json!({"id": format!("{}/{id}", inf.name), "object": "model", "owned_by": inf.name}));
+                let mut entry =
+                    json!({"id": format!("{}/{id}", inf.name), "object": "model", "owned_by": inf.name});
+                // Only DECLARED capability is surfaced here: this list includes models that are not
+                // resident, and discovery only describes what is loaded. Absent means undeclared,
+                // never "cannot".
+                let declared: Vec<&str> = caps
+                    .iter()
+                    .filter(|(_, pats)| pats.iter().any(|p| fnmatch(p, &id)))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !declared.is_empty() {
+                    entry["capabilities"] = json!(declared);
+                }
+                data.push(entry);
             }
         }
     }
@@ -1030,13 +1044,24 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
 
     let bare = model.split_once('/').map_or("", |(_, rest)| rest).to_string();
 
+    // Refuse a CONCRETE model the operator declared cannot chat, before either dispatch path.
+    // Deliberately above the pooled/non-pooled split: a pooled inferencer is not the only kind
+    // that can be pointed at an embedder, and a check that only guards one path is worse than
+    // none because it reads as covered. (`default` is not a concrete id — it is resolved against
+    // residency and filtered there.)
+    let caps = state.capabilities.get(provider).cloned().unwrap_or_default();
+    if bare != "default" {
+        if let Some(r) = reject_wrong_capability(&caps, &bare, "chat", provider) {
+            return r;
+        }
+    }
+
     // Management-capable inferencer (declares a `management_url`) with a built pool:
     // resolve virtual models, load-on-demand, and queue/serialize through the Gate.
     // Everything else (incl. a management_url inferencer somehow missing its pool)
     // keeps today's exact stateless-relay path, unchanged.
     if inf.management_url.is_some() {
         if let Some((manager, gate)) = state.pools.get(provider) {
-            let caps = state.capabilities.get(provider).cloned().unwrap_or_default();
             return passthrough_pooled(&inf, &caps, manager, gate, &body, &bare).await;
         }
     }
@@ -1088,6 +1113,14 @@ async fn images_generations(State(state): State<Arc<AppState>>, Json(body): Json
             "invalid_request_error",
         );
     };
+    // Refuse a model the operator has declared cannot serve this endpoint, rather than letting
+    // the backend answer — issue #20's motivating case is a backend that responds to an
+    // unsupported request by taking the whole model service down.
+    let bare = model.split_once('/').map(|(_, b)| b).unwrap_or("");
+    let caps = state.capabilities.get(provider).cloned().unwrap_or_default();
+    if let Some(r) = reject_wrong_capability(&caps, bare, "image", provider) {
+        return r;
+    }
 
     let headers = match inf.auth_headers() {
         Ok(h) => h,
@@ -1123,6 +1156,14 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
             "invalid_request_error",
         );
     };
+    // Refuse a model the operator has declared cannot serve this endpoint, rather than letting
+    // the backend answer — issue #20's motivating case is a backend that responds to an
+    // unsupported request by taking the whole model service down.
+    let bare = model.split_once('/').map(|(_, b)| b).unwrap_or("");
+    let caps = state.capabilities.get(provider).cloned().unwrap_or_default();
+    if let Some(r) = reject_wrong_capability(&caps, bare, "embedding", provider) {
+        return r;
+    }
 
     let headers = match inf.auth_headers() {
         Ok(h) => h,
@@ -1193,6 +1234,40 @@ fn warn_fail_open(name: &str) {
              path). Add the model you expect to serve `default` to this inferencer's `models`."
         );
     }
+}
+
+/// Refuse a request routed to a model the operator has positively declared cannot serve this
+/// endpoint. `None` = allowed.
+///
+/// Only *declared* capability is consulted here, not discovered: discovery describes what is
+/// RESIDENT, and this check runs for concrete model ids that may not be loaded at all. The
+/// point is to turn a class of backend failure into a clear 400 — issue #20's motivating bug is
+/// an unsupported request taking a whole model service down, where the backend's own answer is a
+/// 500 and every later request fails until reload. Unknown stays allowed, so nothing regresses.
+fn reject_wrong_capability(
+    caps: &config::CapabilityMap,
+    model: &str,
+    capability: &str,
+    provider: &str,
+) -> Option<Response> {
+    if config::serves(caps, model, capability) != Some(false) {
+        return None;
+    }
+    let declared: Vec<&str> = caps
+        .iter()
+        .filter(|(name, pats)| name.as_str() != capability && pats.iter().any(|p| fnmatch(p, model)))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    Some(err_response(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "model '{provider}/{model}' is declared as {} for this inferencer, not '{capability}' — \
+             it cannot serve this endpoint. Adjust [inferencers.{provider}.capabilities] if that \
+             is wrong.",
+            declared.join("/")
+        ),
+        "invalid_request_error",
+    ))
 }
 
 /// Capability tokens that positively mean "this model does not serve chat".
@@ -1887,6 +1962,33 @@ mod default_candidate_tests {
             current(residency_models()),
         );
         assert_eq!(got[0], "Qwen/Qwen3.6-35B-A3B-turbo", "a configured default that IS resident wins");
+    }
+
+    #[test]
+    fn a_declared_mismatch_is_refused_before_dispatch() {
+        // #20's motivating bug is a backend that answers an unsupported request by taking the
+        // whole model service down. Where the operator has declared the model's purpose, refuse
+        // it here and return a 400 naming what it IS, rather than letting the backend decide.
+        let mut caps = config::CapabilityMap::new();
+        caps.insert("embedding".into(), vec!["*Embedding*".into()]);
+        assert!(
+            reject_wrong_capability(&caps, "Qwen/Qwen3-Embedding-0.6B", "chat", "dev").is_some(),
+            "an embedder must not reach the chat endpoint"
+        );
+        assert!(
+            reject_wrong_capability(&caps, "Qwen/Qwen3-Embedding-0.6B", "embedding", "dev").is_none(),
+            "and must still serve the endpoint it IS for"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_model_is_never_refused() {
+        // Fail open, everywhere. A model nobody has described must dispatch exactly as before —
+        // this check may only ever turn a KNOWN mismatch into a clear error, never invent one.
+        let mut caps = config::CapabilityMap::new();
+        caps.insert("embedding".into(), vec!["*Embedding*".into()]);
+        assert!(reject_wrong_capability(&caps, "zai-org/GLM-4.7-Flash", "chat", "dev").is_none());
+        assert!(reject_wrong_capability(&config::CapabilityMap::new(), "anything", "chat", "dev").is_none());
     }
 
     #[test]

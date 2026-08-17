@@ -428,7 +428,7 @@ model_patterns = ["anthropic/*", "openai/gpt-4*"]
 |---|---|---|
 | `base_url` | ✅ for a new provider | OpenAI-compatible base, **without** `/chat/completions`. |
 | `api_key_env` | — | **Name** of the env var holding the bearer key (not the key itself). Omit for no-auth (local). |
-| `extra_body` | — | Fields merged into each orchestration request (e.g. `temperature`, ollama's `options`). |
+| `extra_body` | — | Fields merged into each **orchestration** request (e.g. `temperature`, ollama's `options`). **Not applied to pass-through** — a `<provider>/<model>` request is relayed as the client sent it. Set the field client-side for pass-through; it forwards faithfully. |
 | `models` | — | Static model ids to list in `GET /v1/models` as `<provider>/<id>` (no key needed to *list*). |
 | `discover` | — | If `true`, live-query the provider's own `/v1/models` and list those too (needs the key). `ollama` defaults to `true`. |
 | `model_patterns` | — | fnmatch globs that filter `discover` results (e.g. `["claude-*"]`); empty = list all discovered. |
@@ -494,6 +494,18 @@ requires naming every model that might ever legitimately serve the endpoint — 
 that means predicting what other consumers will load, and a model nobody predicted gets refused.
 That failure has been observed in production. Declaring exclusions survives models you did not
 foresee, because a new chat model matches none of them and stays eligible.
+
+Declared capability is also enforced **before dispatch** and surfaced in `GET /v1/models`:
+
+- A request naming a model declared for a different capability is refused with `400`, naming what
+  the model *is*, rather than being sent to the backend. Some backends answer an unsupported
+  request by failing in a way that takes the whole model service down until it is reloaded, so a
+  refusal woollama can make cheaply is worth more than the backend's own answer.
+- `GET /v1/models` carries a `capabilities` array on entries that have declarations. Entries
+  without one are simply undeclared — **absent never means "cannot"**.
+
+Only *declared* capability is used for those two, not discovered: discovery describes what is
+currently **resident**, while both of these concern model ids that may not be loaded at all.
 
 Precedence: **config beats discovery beats unknown**, and *unknown always means eligible*. So a
 backend that publishes nothing and has no declarations behaves exactly as it did before, and an
