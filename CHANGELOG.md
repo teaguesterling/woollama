@@ -22,6 +22,19 @@
 - Precedence is **config → discovery → unknown**, and unknown is always eligible, so a backend
   that publishes nothing and has no declarations behaves exactly as before.
 
+### `/v1/models` says which model will actually answer
+
+- For a **management-capable** inferencer, each entry carries **`loaded`** — read through to the
+  backend, sharing the coalescing window `<provider>/default` uses, so listing costs no extra round
+  trip. Previously `/v1/models` was a catalogue with no readiness signal: it listed a model the
+  backend was not running, and the only way to find out was a request that could `503` after a
+  thirty-second load.
+- A model that is **resident but undeclared** is listed too, flagged `undeclared`. It is routable
+  and it is the one that will answer; omitting it hid the answer from a caller willing to use
+  whatever is up.
+- `loaded` is **omitted**, never `false`, for an inferencer with no pool or when the residency read
+  fails. Not seeing is not the same as not loaded.
+
 ### Config variables (#21)
 
 - **`${VAR:-default}`** — POSIX `:-` semantics (unset *or* empty takes the fallback), in **both**

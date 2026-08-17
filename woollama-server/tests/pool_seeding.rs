@@ -442,3 +442,74 @@ async fn a_declared_embedder_is_refused_on_chat_and_annotated_in_v1_models() {
     let chat = entries.iter().find(|m| m["id"] == "dev/Qwen/Chat-7B").expect("chat model listed");
     assert!(chat.get("capabilities").is_none(), "undeclared means absent, never 'cannot': {chat}");
 }
+
+/// `/v1/models` must answer "which model will respond right now", not just "which exist".
+///
+/// Reported by a caller who was blocked on exactly this: `/v1/models` listed a model, the request
+/// 503'd with "not loaded", and there was no way to tell the two states apart except by sending a
+/// request that may fail after a thirty-second load.
+#[tokio::test]
+async fn v1_models_reports_what_is_actually_loaded() {
+    let router = Router::new()
+        .route(
+            "/api/v1/models/running",
+            // Resident: one DECLARED model, and one the operator never listed.
+            get(|| async {
+                Json(json!({"running": ["Declared/Up", "Surprise/AlsoUp"],
+                            "instances": {"running": []}}))
+            }),
+        )
+        .route("/v1/chat/completions", post(|| async { Json(json!({"choices": []})) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!(
+            "[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n\
+             models=[\"Declared/Up\",\"Declared/Down\"]\n\
+             [inferencers.plain]\nbase_url=\"{url}/v1\"\nmodels=[\"Plain/Model\"]\n"
+        ),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+
+    let body: Value = reqwest::get(format!("http://{raddr}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let find = |id: &str| {
+        body["data"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned()
+    };
+
+    // Declared AND resident -> loaded true. Declared but not resident -> loaded false. That
+    // distinction is the whole point; before it, both looked identical.
+    assert_eq!(find("dev/Declared/Up").expect("listed")["loaded"], json!(true));
+    assert_eq!(find("dev/Declared/Down").expect("listed")["loaded"], json!(false));
+
+    // Resident but never declared: still routable, still the thing that will answer, so it is
+    // listed — flagged, because the operator did not promise it.
+    let surprise = find("dev/Surprise/AlsoUp").expect("a resident model must be discoverable");
+    assert_eq!(surprise["loaded"], json!(true));
+    assert_eq!(surprise["undeclared"], json!(true));
+
+    // An inferencer with NO pool cannot know, so it says nothing. Absent must not read as "no".
+    let plain = find("plain/Plain/Model").expect("listed");
+    assert!(plain.get("loaded").is_none(), "unknown must not be reported as not-loaded: {plain}");
+}

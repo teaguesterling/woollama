@@ -550,6 +550,31 @@ Precedence: **config beats discovery beats unknown**, and *unknown always means 
 backend that publishes nothing and has no declarations behaves exactly as it did before, and an
 operator correcting a backend has the last word.
 
+#### Knowing which model will actually answer
+
+`GET /v1/models` is a catalogue: it lists what an inferencer declares plus whatever discovery
+found. For a **management-capable** inferencer it also reports what is *resident right now*, so a
+caller can tell "this model exists" from "this model will answer" without sending a request that
+may `503` after a thirty-second load:
+
+```json
+{"id": "device/Qwen3-30B-Instruct", "object": "model", "owned_by": "device", "loaded": true}
+{"id": "device/Qwen3-Coder-30B",    "object": "model", "owned_by": "device", "loaded": false}
+{"id": "device/GLM-4.7-Flash",      "object": "model", "owned_by": "device",
+ "loaded": true, "undeclared": true}
+```
+
+- **`loaded`** appears only for inferencers that declare a `management_url`. An inferencer with no
+  pool cannot know, and **absent never means "no"**.
+- A model that is resident but **not** in the inferencer's `models` list is still routable as
+  `<provider>/<id>`, and it is the one that will answer — so it is listed, flagged `undeclared`
+  because the operator did not promise it.
+- If the residency read itself fails, `loaded` is omitted rather than reported as `false`: not
+  seeing is not the same as not loaded.
+
+The read shares the same coalescing window `<provider>/default` uses, so listing models does not
+add a backend round trip per request.
+
 #### woollama is not the device's only consumer
 
 Pool state is a **cache of the backend's state, not a ledger of it**. The vendor's own UI may load
