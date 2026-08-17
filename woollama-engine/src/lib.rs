@@ -403,10 +403,36 @@ pub fn config_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("woollama")
 }
 
-/// Expand `${VAR}` from the environment (unset → empty), matching the braced form of
-/// `os.path.expandvars`. (Braceless `$VAR` is left as-is — a minor divergence.) Public
-/// so the server's `mcp.json` loader can reuse it.
+/// Expand `${VAR}` and `${VAR:-default}` from the environment, matching the braced form of
+/// `os.path.expandvars`. (Braceless `$VAR` is left as-is — a minor divergence.) Public so the
+/// server's `mcp.json` loader can reuse it.
+///
+/// Two forms:
+/// - `${VAR}` — unset expands to **empty**. Load-bearing, not an oversight: the bundled default
+///   `mcp.json` relies on it, and because expansion runs over a whole file before parsing, an
+///   error here would take every unrelated entry down with the one that referenced a missing
+///   variable.
+/// - `${VAR:-default}` — unset **or empty** expands to `default` (POSIX `:-` semantics). Lets an
+///   author say a fallback is deliberate. That distinction is what makes woollama's
+///   unset-variable warning trustworthy: a bare `${VAR}` that resolves to nothing may be a
+///   mistake, whereas a declared fallback never is, so only the former is reported.
+///
+/// The default runs to the first `}`, so it cannot itself contain one; nesting is not supported.
+///
+/// `src/woollama/config.py::_expand_env` mirrors this EXACTLY and must be changed with it — a
+/// config file is read by both, and a divergence here is a config that behaves differently
+/// depending on which implementation loaded it.
 pub fn expand_env(text: &str) -> String {
+    expand_env_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`expand_env`] with the environment injected.
+///
+/// Tests use this rather than `set_var`: mutating process-wide environment from a `#[test]`
+/// thread races every concurrently-running test that reads it, and on glibc `setenv` may realloc
+/// `environ` while another thread walks it — undefined behaviour, not merely flakiness. The same
+/// seam exists in the server's warning scanner for the same reason.
+pub fn expand_env_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
@@ -414,7 +440,14 @@ pub fn expand_env(text: &str) -> String {
         let after = &rest[pos + 2..];
         match after.find('}') {
             Some(end) => {
-                out.push_str(&std::env::var(&after[..end]).unwrap_or_default());
+                let token = &after[..end];
+                match token.split_once(":-") {
+                    Some((name, fallback)) => {
+                        let value = lookup(name).unwrap_or_default();
+                        out.push_str(if value.is_empty() { fallback } else { &value });
+                    }
+                    None => out.push_str(&lookup(token).unwrap_or_default()),
+                }
                 rest = &after[end + 1..];
             }
             None => {
@@ -1191,6 +1224,42 @@ pub fn complete_stream_events(req: Request) -> impl Stream<Item = Result<String,
 
 #[cfg(test)]
 mod tests {
+    /// The `${VAR}` / `${VAR:-default}` contract, pinned as literal cases.
+    ///
+    /// `src/woollama/config.py::_expand_env` mirrors this function and the SAME cases are
+    /// asserted there (`tests/test_config.py`). A config file is read by both implementations, so
+    /// a divergence is a config that behaves differently depending on which one loaded it — the
+    /// two test lists are the only thing that catches that, since nothing compiles them together.
+    #[test]
+    fn expand_env_bare_and_defaulted_forms() {
+        // Injected environment: no `set_var`, so this races nothing. (`expand_env` is a thin
+        // wrapper over this, so testing here covers both.)
+        let env = |name: &str| match name {
+            "SET" => Some("yes".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let e = |t: &str| expand_env_with(t, env);
+
+        // Bare form: unset expands to EMPTY. Load-bearing — the bundled default relies on it.
+        assert_eq!(e("${UNSET}"), "");
+        assert_eq!(e("${SET}"), "yes");
+
+        // POSIX `:-`: unset OR empty takes the fallback.
+        assert_eq!(e("${UNSET:-fb}"), "fb");
+        assert_eq!(e("${EMPTY:-fb}"), "fb");
+        assert_eq!(e("${SET:-fb}"), "yes");
+
+        // Surrounding text, an empty fallback, and a fallback containing the separator.
+        assert_eq!(e("a${UNSET:-b}c"), "abc");
+        assert_eq!(e("${UNSET:-}"), "");
+        assert_eq!(e("${UNSET:-/opt/x:-y}"), "/opt/x:-y");
+
+        // Unchanged edge cases: an unclosed brace emits the remainder verbatim and stops.
+        assert_eq!(e("${unclosed"), "${unclosed");
+        assert_eq!(e("no vars here"), "no vars here");
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;

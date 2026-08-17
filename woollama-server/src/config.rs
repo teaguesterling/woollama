@@ -472,7 +472,7 @@ const BARE_AUTH_SCHEMES: &[&str] = &["bearer", "basic", "digest", "token"];
 /// Reject a header value that carries no credential.
 ///
 /// `engine::expand_env` resolves an unset `${VAR}` to the empty string
-/// (`woollama-engine/src/lib.rs:417`), so `"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset
+/// (`woollama-engine`'s `expand_env`), so `"Bearer ${SHELF_TOKEN}"` with `SHELF_TOKEN` unset
 /// becomes the literal `"Bearer "` — a well-formed request carrying no credential. Against a
 /// downstream that requires auth you get a 401 and notice; against a permissive one, or one whose
 /// auth is enforced by a proxy that isn't deployed yet, you connect unauthenticated and everything
@@ -592,22 +592,46 @@ fn parse_capabilities(text: &str) -> Result<HashMap<String, CapabilityMap>, Stri
 /// One `${VAR}` reference found in mcp.json, with enough context to be actionable.
 #[derive(Debug, PartialEq)]
 struct VarRef {
-    var: String,
+    var: Reference,
     /// The `mcpServers` entry it appeared under, when it appeared under one.
     server: Option<String>,
     /// The `env` key it is the value of. `Some` ⇒ this is the credential case.
     env_key: Option<String>,
 }
 
-/// Extract `${VAR}` names from one string value.
-fn vars_in(text: &str) -> Vec<String> {
+/// One `${...}` reference as written: the variable name, and the fallback if one was declared.
+#[derive(Debug, PartialEq)]
+struct Reference {
+    name: String,
+    fallback: Option<String>,
+}
+
+impl Reference {
+    /// A name that cannot be an environment variable — the author almost certainly meant
+    /// something else. Nesting is not supported, so `${DIR:-${HOME}/fb}` parses as the name
+    /// `DIR` with fallback `${HOME`, silently producing a literal `${HOME` in the output. Worth
+    /// reporting even though a fallback was declared, because the fallback itself is malformed.
+    fn is_malformed(&self) -> bool {
+        let suspicious = |s: &str| s.contains("${") || s.contains(char::is_whitespace);
+        suspicious(&self.name) || self.fallback.as_deref().is_some_and(suspicious)
+    }
+}
+
+/// Every `${...}` reference in one string value, as written.
+fn refs_in(text: &str) -> Vec<Reference> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
         let after = &rest[pos + 2..];
         let Some(end) = after.find('}') else { break };
-        if !after[..end].is_empty() {
-            out.push(after[..end].to_string());
+        let token = &after[..end];
+        if !token.is_empty() {
+            out.push(match token.split_once(":-") {
+                Some((name, fb)) => {
+                    Reference { name: name.to_string(), fallback: Some(fb.to_string()) }
+                }
+                None => Reference { name: token.to_string(), fallback: None },
+            });
         }
         rest = &after[end + 1..];
     }
@@ -625,7 +649,7 @@ fn referenced_vars(raw: &str) -> Vec<VarRef> {
     fn walk(v: &Value, server: Option<&str>, env_key: Option<&str>, out: &mut Vec<VarRef>) {
         match v {
             Value::String(s) => {
-                for var in vars_in(s) {
+                for var in refs_in(s) {
                     out.push(VarRef {
                         var,
                         server: server.map(str::to_string),
@@ -694,39 +718,55 @@ fn unset_var_warnings_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -
     let mut out: Vec<String> = Vec::new();
     let mut seen: Vec<(String, Option<String>)> = Vec::new();
     for r in referenced_vars(raw) {
-        let value = lookup(&r.var);
-        let empty = value.as_deref().unwrap_or("").is_empty();
-        // Outside an `env` block only a genuinely UNSET variable is worth a line: an empty value
-        // there is far more likely deliberate. Inside one, unset and empty are indistinguishable
-        // to the child and carry the same risk.
-        let report = if r.env_key.is_some() { empty } else { value.is_none() };
+        let raw_value = lookup(&r.var.name);
+        // The value that will actually be substituted, fallback included.
+        let resolved = match (&r.var.fallback, raw_value.as_deref().unwrap_or("")) {
+            (Some(fb), "") => fb.clone(),
+            (_, v) => v.to_string(),
+        };
+        let report = if r.env_key.is_some() {
+            // Inside an `env` block the question is what the CHILD receives, not how it was
+            // written. `${API_KEY:-}` is a plausible way to say "optional" and still hands the
+            // child an empty value it may treat as absent — the one case no in-process consumer
+            // can catch, so a declared fallback does not buy silence here.
+            resolved.is_empty()
+        } else {
+            // Elsewhere a declared fallback means the author said absence is intended, which is
+            // the whole point of the syntax; only a bare unset reference is worth a line.
+            r.var.fallback.is_none() && raw_value.is_none()
+        } || r.var.is_malformed();
         if !report {
             continue;
         }
         // Dedup per (variable, server) so one shared variable across a dozen servers names each
         // affected child once, rather than collapsing to a single anonymous line.
-        let key = (r.var.clone(), r.server.clone());
+        let key = (r.var.name.clone(), r.server.clone());
         if seen.contains(&key) {
             continue;
         }
         seen.push(key);
-        out.push(match (&r.server, &r.env_key) {
-            (Some(server), Some(env_key)) => format!(
-                "mcp.json: server '{server}' env '{env_key}' uses ${{{}}}, which is unset or \
-                 empty — the child will receive an EMPTY value, which it may treat as absent and \
-                 proceed without it. woollama cannot check this on the child's behalf.",
-                r.var
-            ),
-            (Some(server), None) => format!(
-                "mcp.json: server '{server}' uses ${{{}}}, which is unset; it expands to nothing \
-                 (intended for optional paths — see docs/configuration.md)",
-                r.var
-            ),
-            _ => format!(
-                "mcp.json: ${{{}}} is unset; it expands to nothing (intended for optional paths \
-                 — see docs/configuration.md)",
-                r.var
-            ),
+        let name = &r.var.name;
+        out.push(if r.var.is_malformed() {
+            format!(
+                "mcp.json: ${{{name}}} looks malformed — `${{VAR:-default}}` does not nest, so a \
+                 `${{...}}` inside a fallback is emitted literally. Check this reference."
+            )
+        } else {
+            match (&r.server, &r.env_key) {
+                (Some(server), Some(env_key)) => format!(
+                    "mcp.json: server '{server}' env '{env_key}' resolves ${{{name}}} to an EMPTY \
+                     value — the child may treat it as absent and proceed without it. woollama \
+                     cannot check this on the child's behalf."
+                ),
+                (Some(server), None) => format!(
+                    "mcp.json: server '{server}' uses ${{{name}}}, which is unset; it expands to \
+                     nothing (declare `${{{name}:-fallback}}` if that is intended)"
+                ),
+                _ => format!(
+                    "mcp.json: ${{{name}}} is unset; it expands to nothing (declare \
+                     `${{{name}:-fallback}}` if that is intended)"
+                ),
+            }
         });
     }
     out
@@ -1102,10 +1142,16 @@ mod tests {
             !warnings.iter().any(|w| w.contains("${VAR}")),
             "documentation must not be mistaken for configuration: {warnings:?}"
         );
-        // The real reference in the same file is still found.
+        // And the bundled default declares a fallback for its one real reference, so with the
+        // examples absent it says nothing at all — which is the point of the `:-` form. A bare
+        // reference in the same position WOULD be reported.
+        assert!(warnings.is_empty(), "a declared fallback is deliberate, not a mistake: {warnings:?}");
+        let bare = DEFAULT_MCP.replace(":-/nonexistent", "");
         assert!(
-            warnings.iter().any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
-            "the genuinely-referenced variable must still be reported: {warnings:?}"
+            unset_var_warnings_with(&bare, |_| None)
+                .iter()
+                .any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
+            "a BARE reference to the same variable must still be reported"
         );
     }
 
@@ -1124,6 +1170,38 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_fallback_does_not_buy_silence_inside_an_env_block() {
+        // `${API_KEY:-}` is a plausible way to write "this key is optional", and it still hands
+        // the child an EMPTY value it may treat as absent. Inside an env block the question is
+        // what the child receives, not how it was written — this is the one position no
+        // in-process consumer can check, so a fallback must not silence it.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "env": {"API_KEY": "${K:-}"}}}}"#;
+        let w = unset_var_warnings_with(raw, |_| None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("EMPTY value"), "{}", w[0]);
+
+        // A fallback that resolves to something real is fine — the child gets a value.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "env": {"API_KEY": "${K:-sk-fallback}"}}}}"#;
+        assert!(unset_var_warnings_with(raw, |_| None).is_empty());
+
+        // Outside an env block a declared fallback DOES buy silence: there the author saying
+        // "absent is intended" is the whole point of the syntax.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${P:-/opt}/s"]}}}"#;
+        assert!(unset_var_warnings_with(raw, |_| None).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_reference_is_still_reported() {
+        // `${VAR:-default}` does not nest. An author writing shell-style `${DIR:-${HOME}/fb}`
+        // gets a literal `${HOME` in a spawn argument. Skipping every token containing `:-`
+        // silently swallowed that — the previous code at least emitted a garbled warning.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${DIR:-${HOME}/fb}/s.py"]}}}"#;
+        let w = unset_var_warnings_with(raw, |_| Some("/set".to_string()));
+        assert_eq!(w.len(), 1, "reported even though DIR resolves and a fallback exists: {w:?}");
+        assert!(w[0].contains("malformed"), "{}", w[0]);
+    }
+
+    #[test]
     fn env_and_non_env_references_differ_in_wording_and_in_threshold() {
         let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${P}/s.py"],
             "env": {"API_KEY": "${T}"}}}}"#;
@@ -1131,22 +1209,28 @@ mod tests {
         // Both unset: both reported, with different wording.
         let w = unset_var_warnings_with(raw, |_| None);
         assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w.iter().any(|l| l.contains("env 'API_KEY'") && l.contains("unset or empty")));
-        assert!(w.iter().any(|l| l.contains("${P}") && l.contains("optional paths")));
+        assert!(w.iter().any(|l| l.contains("env 'API_KEY'") && l.contains("EMPTY value")));
+        // The non-env line now tells the operator how to declare intent, rather than just
+        // observing that something is unset.
+        assert!(w.iter().any(|l| l.contains("${P}") && l.contains("${P:-fallback}")), "{w:?}");
 
         // Both set-but-EMPTY: only the env one is reported. `FOO=` in a unit file is
         // indistinguishable from missing to a child; an empty optional path is likely deliberate.
         let w = unset_var_warnings_with(raw, env_of(&[("P", ""), ("T", "")]));
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("env 'API_KEY'"), "{}", w[0]);
-        assert!(w[0].contains("unset or empty"), "must not claim 'unset' about a set variable: {}", w[0]);
+        assert!(
+            !w[0].contains("is unset"),
+            "must not claim 'unset' about a variable that is set-but-empty: {}",
+            w[0]
+        );
 
         // Both populated: silence.
         assert!(unset_var_warnings_with(raw, env_of(&[("P", "/opt"), ("T", "sk-1")])).is_empty());
     }
 
     #[test]
-    fn the_bundled_default_loads_its_servers_and_only_warns() {
+    fn the_bundled_default_loads_its_servers_and_stays_silent() {
         // The invariant a fail-closed change would break, asserted properly. `parse_mcp_servers`
         // returns Ok even when every entry lands in the per-server error vec, so `is_ok()` alone
         // would still pass with ZERO servers loaded — which is exactly the outcome being guarded
@@ -1154,8 +1238,10 @@ mod tests {
         let (specs, errors, _) = parse_mcp_servers(&engine::expand_env(DEFAULT_MCP)).unwrap();
         assert_eq!(specs.len(), 2, "the bundled default must yield both example servers");
         assert!(errors.is_empty(), "and none of them may be skipped: {errors:?}");
-        // With the examples dir absent it warns, and warning is all it may do.
-        assert!(!unset_var_warnings_with(DEFAULT_MCP, |_| None).is_empty());
+        // And with the examples dir absent it is SILENT, because the default now declares its
+        // fallback with `:-`. That absence is deliberate, so there is nothing to report — the
+        // warning channel stays for references that might actually be mistakes.
+        assert!(unset_var_warnings_with(DEFAULT_MCP, |_| None).is_empty());
     }
 
     #[test]
@@ -1218,7 +1304,7 @@ mod tests {
 
     #[test]
     fn header_values_that_carry_no_credential_are_rejected() {
-        // engine::expand_env resolves an UNSET ${VAR} to "" (lib.rs:417, unwrap_or_default), so
+        // engine::expand_env resolves an UNSET ${VAR} to "" (see its `unwrap_or_default`), so
         // a header sourced from a missing env var arrives here empty or as a bare scheme. Fail
         // closed: a silently credential-less request that a permissive downstream accepts is the
         // worst outcome, because everything reports healthy.

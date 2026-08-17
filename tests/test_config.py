@@ -348,3 +348,38 @@ def test_expand_env_multiple_vars_in_one_string(monkeypatch):
     monkeypatch.setenv("WOOLLAMA_TEST_B", "2")
     from woollama import config
     assert config._expand_env("${WOOLLAMA_TEST_A}-${WOOLLAMA_TEST_B}") == "1-2"
+
+
+def test_expand_env_bare_and_defaulted_forms(monkeypatch):
+    """The `${VAR}` / `${VAR:-default}` contract, pinned as literal cases.
+
+    THE SAME CASES are asserted in Rust (`woollama-engine/src/lib.rs`,
+    `expand_env_bare_and_defaulted_forms`). A config file is read by both
+    implementations, so a divergence is a config that behaves differently
+    depending on which one loaded it. Nothing compiles these two together --
+    the paired test lists are the only thing that catches drift, so change
+    them together or not at all.
+    """
+    from woollama.config import _expand_env
+
+    monkeypatch.setenv("WOOLLAMA_T_SET", "yes")
+    monkeypatch.setenv("WOOLLAMA_T_EMPTY", "")
+    monkeypatch.delenv("WOOLLAMA_T_UNSET", raising=False)
+
+    # Bare form: unset expands to EMPTY. Load-bearing -- the bundled default relies on it.
+    assert _expand_env("${WOOLLAMA_T_UNSET}") == ""
+    assert _expand_env("${WOOLLAMA_T_SET}") == "yes"
+
+    # POSIX `:-`: unset OR empty takes the fallback.
+    assert _expand_env("${WOOLLAMA_T_UNSET:-fb}") == "fb"
+    assert _expand_env("${WOOLLAMA_T_EMPTY:-fb}") == "fb"
+    assert _expand_env("${WOOLLAMA_T_SET:-fb}") == "yes"
+
+    # Surrounding text, an empty fallback, and a fallback containing separators.
+    assert _expand_env("a${WOOLLAMA_T_UNSET:-b}c") == "abc"
+    assert _expand_env("${WOOLLAMA_T_UNSET:-}") == ""
+    assert _expand_env("${WOOLLAMA_T_UNSET:-/opt/x:-y}") == "/opt/x:-y"
+
+    # Unchanged edge cases: unclosed brace emits the remainder verbatim and stops.
+    assert _expand_env("${unclosed") == "${unclosed"
+    assert _expand_env("no vars here") == "no vars here"
