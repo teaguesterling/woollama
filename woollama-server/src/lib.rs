@@ -1179,7 +1179,14 @@ async fn passthrough_pooled(
     body: &Value,
     bare: &str,
 ) -> Response {
-    let loaded = manager.snapshot();
+    // `default` is the ONLY resolution that depends on what the device is running, and it is the
+    // one decision that is expensive to get wrong: resolving it against our own bookkeeping 400s
+    // with a model loaded, or falls through to the `[virtual]` table and evicts a perfectly good
+    // model to load its entry (issue #26). So read through to the device here and let it
+    // arbitrate — woollama is not the only consumer of its management API, so our view is a cache,
+    // never a ledger. A concrete model id or an alias needs no device round trip.
+    let loaded =
+        if bare == "default" { manager.residency().await } else { manager.snapshot() };
     let default = inf.virtual_models.get("default").map(String::as_str);
     let real = match engine::resolver::resolve(bare, &inf.virtual_models, &loaded, default) {
         Ok(r) => r,

@@ -503,6 +503,20 @@ pub struct DeviceModelManager {
     entries: StdMutex<HashMap<String, Entry>>,
     load_lock: AsyncMutex<()>,
     clock: AtomicU64,
+    /// When the device was last asked what it is running. Wall-clock, NOT `tick()` — `tick` is a
+    /// logical counter for LRU ordering and has no time units; comparing it against a duration
+    /// silently disables coalescing (it did, until a test caught 5 queries where 1 was expected).
+    /// Purely a coalescing window for read-through (see `residency`) — never a claim that our view
+    /// is authoritative between reads.
+    residency_read_at: StdMutex<Option<std::time::Instant>>,
+    /// Coalescing window for `residency`, in seconds; `0` reads every time. Captured at
+    /// construction rather than read per call — an env read on the request path is both wasteful
+    /// and, because the var is process-global, a race against any concurrently-running test.
+    residency_ttl: f64,
+    /// Single-flights concurrent read-throughs. Deliberately NOT `load_lock`: residency reads sit
+    /// on the request path, and sharing that lock would make every `default` request queue behind
+    /// an in-progress model load.
+    residency_lock: AsyncMutex<()>,
 }
 
 impl DeviceModelManager {
@@ -519,6 +533,13 @@ impl DeviceModelManager {
             entries: StdMutex::new(HashMap::new()),
             load_lock: AsyncMutex::new(()),
             clock: AtomicU64::new(0),
+            residency_read_at: StdMutex::new(None),
+            residency_ttl: std::env::var("WOOLLAMA_POOL_RESIDENCY_TTL_MS")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|ms| ms / 1000.0)
+                .unwrap_or(1.0),
+            residency_lock: AsyncMutex::new(()),
         }
     }
 
@@ -708,6 +729,58 @@ impl DeviceModelManager {
         e.last_used = tick;
     }
 
+    /// What the DEVICE is running, read through to the device itself.
+    ///
+    /// woollama is not the only consumer of a device's management API — the vendor's own UI loads
+    /// models, and any caller needing endpoints woollama doesn't serve (images, embeddings, ASR)
+    /// must drive the device directly. Exclusivity is therefore not achievable even in principle,
+    /// so our `loaded` flags are a **cache of someone else's state**, never a ledger. Anything
+    /// that would be expensive to get wrong reads through to the device and lets it arbitrate.
+    ///
+    /// The freshness window is a *coalescing* window, not a staleness budget: a burst of requests
+    /// shares one query instead of issuing one each. `WOOLLAMA_POOL_RESIDENCY_TTL_MS`, default
+    /// 1000; `0` queries every time.
+    ///
+    /// Best-effort: it runs on the request path, so a device that is down must not turn into an
+    /// earlier, different error than the one the request itself will produce. A failed read leaves
+    /// the previous view in place and is not latched.
+    pub async fn residency(&self) -> Vec<String> {
+        if self.fresh_enough() {
+            return self.snapshot();
+        }
+        let _guard = self.residency_lock.lock().await;
+        // Re-check: another request may have refreshed while we waited for the lock.
+        if self.fresh_enough() {
+            return self.snapshot();
+        }
+        match self.backend.list_loaded().await {
+            Ok(running) => {
+                self.reconcile(&running);
+                *self.residency_read_at.lock().unwrap() = Some(std::time::Instant::now());
+            }
+            Err(e) => eprintln!("woollamad: could not read device residency (using last known): {e}"),
+        }
+        self.snapshot()
+    }
+
+    fn fresh_enough(&self) -> bool {
+        if self.residency_ttl <= 0.0 {
+            return false;
+        }
+        match *self.residency_read_at.lock().unwrap() {
+            Some(at) => at.elapsed().as_secs_f64() < self.residency_ttl,
+            None => false,
+        }
+    }
+
+    /// Override the residency coalescing window (seconds; `0` reads every time). For tests and
+    /// for callers that want an explicit value rather than the `WOOLLAMA_POOL_RESIDENCY_TTL_MS`
+    /// default.
+    pub fn with_residency_ttl(mut self, secs: f64) -> Self {
+        self.residency_ttl = secs;
+        self
+    }
+
     /// Fold device truth into our state: mark loaded what the device runs; clear the
     /// loaded flag on anything the device dropped from under us (keep counters — a
     /// request may still be accounted against it).
@@ -853,10 +926,12 @@ impl Gate {
 /// One `(DeviceModelManager, Gate)` pair per management-capable inferencer, keyed by
 /// inferencer name. Built once at startup from the config `Registry` (see
 /// `from_registry`); consulted by the chat passthrough to take the pooled path.
-pub struct PoolRegistry(HashMap<String, (Arc<DeviceModelManager>, Gate)>);
+/// Per-inferencer view onto the device pools. Two inferencers that name the SAME
+/// `management_url` share one `(manager, gate)` pair — see `from_registry`.
+pub struct PoolRegistry(HashMap<String, (Arc<DeviceModelManager>, Arc<Gate>)>);
 
 impl PoolRegistry {
-    pub fn get(&self, provider: &str) -> Option<&(Arc<DeviceModelManager>, Gate)> {
+    pub fn get(&self, provider: &str) -> Option<&(Arc<DeviceModelManager>, Arc<Gate>)> {
         self.0.get(provider)
     }
 
@@ -900,35 +975,81 @@ impl PoolRegistry {
                 );
             }
         }
-        let mut map = HashMap::new();
+        // Group by management_url FIRST. Two inferencers pointing at one device must share both
+        // the residency view and the concurrency gate (issue #26):
+        //   * separate managers mean neither sees the other's loads, so alternating between two
+        //     routes onto one device swaps the model on every call;
+        //   * separate gates mean `parallel` is enforced twice over, DOUBLING the effective
+        //     in-flight concurrency against hardware where `parallel = 1` exists to stop a wedge.
+        // The second is a safety property being silently halved, not a performance question.
+        let mut groups: HashMap<String, Vec<engine::Inferencer>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
         for inf in registry.list() {
-            let Some(management_url) = inf.management_url.clone() else { continue };
-            let headers = inf.auth_headers().unwrap_or_default();
-            let protocol_name = inf.management_protocol.as_deref().unwrap_or("device");
+            let Some(url) = inf.management_url.clone() else { continue };
+            if !groups.contains_key(&url) {
+                order.push(url.clone());
+            }
+            groups.entry(url).or_default().push(inf);
+        }
+
+        let mut map = HashMap::new();
+        for url in order {
+            let infs = &groups[&url];
+            let lead = &infs[0];
+            if infs.len() > 1 {
+                let names: Vec<&str> = infs.iter().map(|i| i.name.as_str()).collect();
+                eprintln!(
+                    "woollamad: inferencers {names:?} share management_url '{url}' — they will \
+                     share one device pool and one concurrency gate, using the most restrictive \
+                     limits configured across them"
+                );
+                for other in &infs[1..] {
+                    if other.management_protocol != lead.management_protocol {
+                        eprintln!(
+                            "woollamad: WARNING: inferencer '{}' declares a different \
+                             management_protocol than '{}' for the same device; using '{}'s",
+                            other.name, lead.name, lead.name
+                        );
+                    }
+                }
+            }
+            let headers = lead.auth_headers().unwrap_or_default();
+            let protocol_name = lead.management_protocol.as_deref().unwrap_or("device");
             let backend: Arc<dyn DeviceBackend> = match protocol_name {
-                "device" => Arc::new(RestBackend::device(management_url, headers, 0.5, 120.0)),
-                "ollama" => Arc::new(OllamaBackend::new(management_url, None)),
+                "device" => Arc::new(RestBackend::device(url.clone(), headers, 0.5, 120.0)),
+                "ollama" => Arc::new(OllamaBackend::new(url.clone(), None)),
                 other => match protocols.get(other) {
                     Some(engine::ProtocolSpec::Rest { running, start, stop }) => {
-                        Arc::new(RestBackend::from_spec(&management_url, &headers, running, start, stop, 0.5, 120.0))
+                        Arc::new(RestBackend::from_spec(&url, &headers, running, start, stop, 0.5, 120.0))
                     }
                     Some(engine::ProtocolSpec::Ollama { keep_alive }) => {
-                        Arc::new(OllamaBackend::new(management_url, keep_alive.clone()))
+                        Arc::new(OllamaBackend::new(url.clone(), keep_alive.clone()))
                     }
                     None => {
                         eprintln!(
                             "woollamad: management_protocols: WARNING: inferencer '{}': unknown \
                              management_protocol '{other}' — skipping this inferencer (its device pool is \
                              disabled; other inferencers are unaffected)",
-                            inf.name
+                            lead.name
                         );
                         continue;
                     }
                 },
             };
+
+            // Most restrictive wins for anything that bounds load on the device. `queue_timeout`
+            // is the exception: a SHORTER wait causes spurious 503s on a slow cold load without
+            // protecting the device, so the most forgiving value is the safe one there.
+            let parallel = infs.iter().map(|i| i.parallel).min().unwrap_or(1);
+            let queue_max = infs.iter().filter_map(|i| i.queue_max).min();
+            let pool_max = infs.iter().filter_map(|i| i.pool_max).min();
+            let queue_timeout = infs.iter().map(|i| i.queue_timeout).fold(0.0f64, f64::max);
+
             let manager = Arc::new(DeviceModelManager::new(backend));
-            let gate = Gate::new(manager.clone(), inf.parallel, inf.queue_max, inf.queue_timeout, inf.pool_max, 5.0);
-            map.insert(inf.name.clone(), (manager, gate));
+            let gate = Arc::new(Gate::new(manager.clone(), parallel, queue_max, queue_timeout, pool_max, 5.0));
+            for inf in infs {
+                map.insert(inf.name.clone(), (manager.clone(), gate.clone()));
+            }
         }
         PoolRegistry(map)
     }
