@@ -332,8 +332,12 @@ async fn default_skips_an_embedder_using_the_devices_own_capability_report() {
     std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
     std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
     // No `models` list and no `[capabilities]` table — the whole point is that this needs NO
-    // configuration. Alphabetically the embedder sorts first, so without the capability filter
-    // `default` would pick it and the request would fail.
+    // configuration.
+    //
+    // FIXTURE CONSTRAINT: the embedder must sort BEFORE the chat model, or this passes without
+    // the capability filter doing anything. Fallback ordering is lexicographic, so a chat model
+    // whose id happens to sort first wins by luck of the alphabet — a real hardware test nearly
+    // shipped as "verified" for exactly that reason.
     std::fs::write(
         cfg.path().join("inferencers.toml"),
         format!("[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n"),

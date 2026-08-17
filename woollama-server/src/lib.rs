@@ -1993,6 +1993,11 @@ mod default_candidate_tests {
 
     #[test]
     fn a_backends_own_capability_report_excludes_non_chat_residents() {
+        // FIXTURE CONSTRAINT: the embedder must sort BEFORE the chat model, or the filter is not
+        // what makes this pass. `Qwen/Qwen3-Embedding` < `Qwen/Qwen3.6-...` because '-' (0x2D)
+        // precedes '.' (0x2E) — so without the capability filter the embedder wins and the test
+        // fails, which is the point.
+        //
         // Zero configuration. The device publishes `capabilities` per resident in the same payload
         // woollama already fetches, so the exclusion set is DISCOVERED — which is what removes the
         // treadmill: nobody has to enumerate models a peer might load.
@@ -2017,6 +2022,12 @@ mod default_candidate_tests {
         // The production failure, with discovery: a peer loads a model nobody listed. It is not
         // excluded (no non-chat token), so it is served transparently instead of the request
         // 503ing on an embedder.
+        //
+        // FIXTURE CONSTRAINT — do not "simplify" the ids. The unknown chat model's id must sort
+        // AFTER the non-chat resident, because the fallback ordering is lexicographic: with
+        // `Qwen/Qwen3-Coder-...` instead of `zai-org/...` this test passes even WITHOUT the
+        // capability filter, since C sorts before E and the chat model wins by luck of the
+        // alphabet. That near-miss happened on real hardware.
         let models = vec!["Qwen/Qwen3-Embedding-0.6B".to_string(), "zai-org/GLM-4.7-Flash".to_string()];
         let got = default_candidates(
             &inf(&[], None),
