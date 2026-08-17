@@ -47,16 +47,39 @@ woollama starts one long-lived connection per server and aggregates their tools
 
 #### The `url` form — consuming a remote MCP server
 
+Across a network, use `https` — the credential is on the wire on every request:
+
 ```json
 {
   "mcpServers": {
     "shelf": {
-      "url": "http://mcp.example.lan:9200/mcp",
+      "url": "https://mcp.example.lan/mcp",
       "headers": { "Authorization": "Bearer ${SHELF_TOKEN}" }
     }
   }
 }
 ```
+
+Same host, over loopback, plain `http` is fine — nothing leaves the machine. This
+is the common shape when a tools-only instance publishes to `127.0.0.1` only and
+still requires its token, so the bind address isn't load-bearing for auth:
+
+```json
+{
+  "mcpServers": {
+    "suite": {
+      "url": "http://127.0.0.1:9200/mcp",
+      "headers": { "Authorization": "Bearer ${WOOLLAMA_TOKEN}" }
+    }
+  }
+}
+```
+
+> If the *consuming* router runs in a container, `127.0.0.1` is that container's
+> own network namespace, not the host's loopback. Use host networking, or address
+> the host explicitly — a loopback URL that works from a shell will fail from
+> inside a container, and the connection-refused error looks identical to the
+> downstream being down.
 
 Because woollama also *serves* Streamable HTTP at `/mcp`, the `url` form is how
 one woollamad consumes another — an inference-holding instance reaching a
