@@ -426,6 +426,92 @@ pub fn expand_env(text: &str) -> String {
     expand_env_with(text, |name| std::env::var(name).ok())
 }
 
+/// Bare unset `${VAR}` references among a TOML document's **string values**.
+///
+/// Parses first, deliberately. A raw-text scan reads comments and documentation — woollama's own
+/// bundled `mcp.json` explains `${VAR}` in prose, and scanning raw text made the router refuse to
+/// load its own default config. Only values the loader will actually consume can be a
+/// misconfiguration. An unparseable document yields nothing here; its parse error surfaces next
+/// and is the better message anyway.
+pub fn missing_vars_in_toml(text: &str) -> Vec<String> {
+    missing_vars_in_toml_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`missing_vars_in_toml`] with the environment injected (see [`expand_env_with`]).
+pub fn missing_vars_in_toml_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    fn walk(v: &toml::Value, out: &mut Vec<String>, lookup: &dyn Fn(&str) -> Option<String>) {
+        match v {
+            toml::Value::String(s) => {
+                for name in missing_vars_with(s, lookup) {
+                    if !out.iter().any(|n| n == &name) {
+                        out.push(name);
+                    }
+                }
+            }
+            toml::Value::Array(items) => items.iter().for_each(|i| walk(i, out, lookup)),
+            // Skip `_`-prefixed keys: documentation by convention, matching the JSON walker and
+            // the Python mirror. Without this the same file loads under one implementation and is
+            // refused by the other.
+            toml::Value::Table(t) => t
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .for_each(|(_, i)| walk(i, out, lookup)),
+            _ => {}
+        }
+    }
+    let Ok(doc) = toml::from_str::<toml::Value>(text) else { return Vec::new() };
+    let mut out = Vec::new();
+    walk(&doc, &mut out, &lookup);
+    out
+}
+
+/// Bare `${VAR}` references in `text` whose variable is unset, in first-seen order.
+///
+/// "Bare" means no declared fallback: `${VAR:-x}` is the author saying absence is intended, and is
+/// never reported. A variable that is SET but empty is likewise not missing — `FOO=` is an
+/// explicit operator choice, and treating it as an error would make a deliberately-empty value
+/// indistinguishable from a typo'd name.
+///
+/// Callers turn a non-empty result into a hard load failure. That is safe to do only because the
+/// `:-` form exists: before it, an unset variable could not be distinguished from an intentional
+/// one, and refusing would have broken the bundled default config.
+pub fn missing_vars(text: &str) -> Vec<String> {
+    missing_vars_with(text, |name| std::env::var(name).ok())
+}
+
+/// [`missing_vars`] with the environment injected (see [`expand_env_with`] for why).
+pub fn missing_vars_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("${") {
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find('}') else { break };
+        let token = &after[..end];
+        if !token.is_empty()
+            && !token.contains(":-")
+            && lookup(token).is_none()
+            && !out.iter().any(|n| n == token)
+        {
+            out.push(token.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    out
+}
+
+/// The standard refusal for a config that references variables which do not exist.
+pub fn missing_vars_error(file: &str, missing: &[String]) -> String {
+    let names: Vec<String> = missing.iter().map(|n| format!("${{{n}}}")).collect();
+    format!(
+        "{file} references {} which {} not set: {}. Export {}, or declare a fallback with \
+         `${{VAR:-default}}` if absence is intended.",
+        if missing.len() == 1 { "a variable" } else { "variables" },
+        if missing.len() == 1 { "is" } else { "are" },
+        names.join(", "),
+        if missing.len() == 1 { "it" } else { "them" },
+    )
+}
+
 /// [`expand_env`] with the environment injected.
 ///
 /// Tests use this rather than `set_var`: mutating process-wide environment from a `#[test]`
@@ -469,6 +555,17 @@ fn load_toml_document() -> Result<Option<(std::path::PathBuf, Value)>, EngineErr
         Ok(t) => t,
         Err(_) => return Ok(None),
     };
+    // Refuse a config that references variables which do not exist. Deliberately BEFORE
+    // expansion: afterwards a missing variable is an empty string, indistinguishable from an
+    // intentionally-empty one, which is the whole reason this check has to happen here.
+    let missing = missing_vars_in_toml(&text);
+    if !missing.is_empty() {
+        return Err(EngineError::new(
+            missing_vars_error(&path.display().to_string(), &missing),
+            "invalid_request_error",
+            400,
+        ));
+    }
     let v: Value = toml::from_str(&expand_env(&text)).map_err(|e| {
         EngineError::new(
             format!("inferencers.toml parse error in {}: {e}", path.display()),

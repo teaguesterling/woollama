@@ -383,3 +383,98 @@ def test_expand_env_bare_and_defaulted_forms(monkeypatch):
     # Unchanged edge cases: unclosed brace emits the remainder verbatim and stops.
     assert _expand_env("${unclosed") == "${unclosed"
     assert _expand_env("no vars here") == "no vars here"
+
+
+def test_missing_variable_without_a_default_is_a_hard_failure(monkeypatch, tmp_path):
+    """A bare `${VAR}` that is unset REFUSES the config; `${VAR:-x}` does not.
+
+    Safe to refuse only because the `:-` form exists -- before it, an unset
+    variable could not be distinguished from an intentional one. Mirrors the
+    Rust behaviour (`reject_missing_vars` / `missing_vars_in_toml`); a config
+    that loads under one implementation and fails under the other is the
+    divergence both sides exist to prevent.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_MISSING", raising=False)
+    from woollama import config
+
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"a": {"command": "${WOOLLAMA_T_MISSING}/x"}}}'
+    )
+    with pytest.raises(ValueError) as e:
+        config.load_mcp_servers()
+    assert "WOOLLAMA_T_MISSING" in str(e.value)
+    assert ":-" in str(e.value), "the error must point at the escape hatch"
+
+    # A declared fallback loads.
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"a": {"command": "${WOOLLAMA_T_MISSING:-/opt}/x"}}}'
+    )
+    assert config.load_mcp_servers()["a"]["command"] == "/opt/x"
+
+    # A variable that is SET BUT EMPTY is an explicit operator choice, not missing.
+    monkeypatch.setenv("WOOLLAMA_T_MISSING", "")
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"a": {"command": "${WOOLLAMA_T_MISSING}/x"}}}'
+    )
+    assert config.load_mcp_servers()["a"]["command"] == "/x"
+
+
+def test_documentation_keys_are_not_scanned_for_variables(monkeypatch, tmp_path):
+    """`_`-prefixed keys are documentation and must not fail the load.
+
+    The bundled default's own `_doc2` EXPLAINS `${VAR}` in prose. A raw-text
+    scan made the loader refuse its own shipped config -- caught only by
+    running the suite, which is why the check walks the parsed structure.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_DOCONLY", raising=False)
+    from woollama import config
+    (tmp_path / "mcp.json").write_text(
+        '{"_doc": "use ${WOOLLAMA_T_DOCONLY} like this", "mcpServers": {}}'
+    )
+    assert config.load_mcp_servers() == {}
+
+
+def test_a_server_name_is_not_a_documentation_key(monkeypatch, tmp_path):
+    """`_` marks a documentation KEY, not a namespace.
+
+    Skipping `_`-prefixed keys at every depth also skipped MCP server NAMES, so
+    `_disabled` passed the check and then LOADED with a silently-empty command
+    -- while Rust, which does not skip server names, refused the same file.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_MISSING", raising=False)
+    from woollama import config
+
+    (tmp_path / "mcp.json").write_text(
+        '{"mcpServers": {"_disabled": {"command": "${WOOLLAMA_T_MISSING}/x"}}}'
+    )
+    with pytest.raises(ValueError):
+        config.load_mcp_servers()
+
+
+def test_inferencers_toml_documentation_keys_are_not_scanned(monkeypatch, tmp_path):
+    """A `_`-prefixed TOML key is prose, matching the JSON rule and Rust.
+
+    The Rust TOML walker skipped comments but not `_` keys, so the same file
+    loaded here and hard-failed there -- the cross-implementation divergence
+    both sides exist to prevent.
+    """
+    monkeypatch.setenv("WOOLLAMA_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("WOOLLAMA_T_MISSING", raising=False)
+    from woollama import config
+
+    (tmp_path / "inferencers.toml").write_text(
+        '# see ${WOOLLAMA_T_MISSING}\n'
+        '_doc = "also set ${WOOLLAMA_T_MISSING}"\n'
+        '[inferencers.x]\nbase_url = "http://h/v1"\n'
+    )
+    assert "x" in config.load_inferencers()
+
+    # But a real value referencing it IS refused.
+    (tmp_path / "inferencers.toml").write_text(
+        '[inferencers.x]\nbase_url = "${WOOLLAMA_T_MISSING}/v1"\n'
+    )
+    with pytest.raises(ValueError):
+        config.load_inferencers()

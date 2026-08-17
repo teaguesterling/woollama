@@ -24,24 +24,35 @@ semantics). Use it to say a missing variable is intended:
 
 The default runs to the first `}`, so it cannot itself contain one.
 
-**A bare unset variable expands to nothing, deliberately.** Optional paths depend on it — the bundled
-default `mcp.json` references `${WOOLLAMA_EXAMPLES_DIR}`, which is unset on a binary-only install,
-so those example servers fail to start and are skipped while everything else loads. Expansion runs
-over the whole file *before* parsing, so erroring on an unset variable would take every unrelated
-entry down with it.
+**A bare `${VAR}` that is not set is a hard load error.** woollama refuses the file, naming every
+offending variable. This is safe to do only because `:-` exists: without a way to say "absent is
+intended", refusing would break configurations that legitimately depend on an optional value —
+including woollama's own bundled default.
 
-Anything security-relevant is therefore validated by its **consumer**, where the consequence is
-known: an `Authorization` header that expands to a bare `Bearer ` invalidates that server (see
-[`mcp.json`](#mcpjson) below), because there an empty value is unambiguously a missing credential.
+A variable that is **set but empty** is not missing. `FOO=` is an explicit operator choice, and
+treating it as an error would make being deliberate indistinguishable from a typo'd name.
 
-woollama reports every **bare** referenced-but-unset variable at startup and from
-`woollamad check-config`. A `${VAR:-default}` reference is never reported: the author declared
-the fallback, so a variable that does not resolve is intended rather than a mistake. That is what
-keeps the warning worth reading. One case is called out separately: a variable used inside a server's
-**`env` block**. That is the one position where woollama cannot check on the consumer's behalf —
-the consumer is a child process, and an empty `API_KEY=` may mean "auth disabled", "anonymous
-mode", or "this child will talk to a remote service unauthenticated". Many servers treat an empty
-string as absent and proceed.
+The check runs on the **parsed** structure, so a `${VAR}` that appears only in documentation is
+prose rather than configuration and never fails a load: `_`-prefixed keys (in JSON *and* TOML) and
+TOML comments are skipped. MCP **server names** are not — `_disabled` is a server that loads, not
+a comment.
+
+It applies to `mcp.json` and `inferencers.toml`, in both implementations. `woollamad check-config`
+reports it and exits non-zero, so a reload can be gated on it.
+
+Anything security-relevant that survives the check is validated by its **consumer**, where the
+consequence is known: an `Authorization` header expanding to a bare `Bearer ` invalidates that
+server (see below), because there an empty value is unambiguously a missing credential.
+
+Two things are **warned** about rather than refused, because refusing them would be wrong:
+
+- a value inside a server's **`env` block** that resolves to empty — including via `${VAR:-}`.
+  That is the one position woollama cannot check on the consumer's behalf: the consumer is a child
+  process, and an empty `API_KEY=` may mean "auth disabled", "anonymous mode", or "this child will
+  talk to a remote service unauthenticated". Many servers treat an empty string as absent and
+  proceed.
+- a **malformed** reference. `${VAR:-default}` does not nest, so `${DIR:-${HOME}/fb}` emits a
+  literal `${HOME` rather than expanding it.
 
 ## `mcp.json`
 

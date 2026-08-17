@@ -400,7 +400,9 @@ pub enum ConvStoreConfig {
 }
 
 pub fn load_conversation_store() -> Result<Option<ConvStoreConfig>, String> {
-    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
+    let raw = read_user_or_default("mcp.json", DEFAULT_MCP);
+    reject_missing_vars(&raw)?;
+    let text = engine::expand_env(&raw);
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     match v.get("conversationStore") {
         None | Some(Value::Null) => Ok(None),
@@ -450,7 +452,9 @@ pub struct FabricConfig {
 }
 
 pub fn load_fabric_config() -> Result<Option<FabricConfig>, String> {
-    let text = engine::expand_env(&read_user_or_default("mcp.json", DEFAULT_MCP));
+    let raw = read_user_or_default("mcp.json", DEFAULT_MCP);
+    reject_missing_vars(&raw)?;
+    let text = engine::expand_env(&raw);
     let v: Value = serde_json::from_str(&text).map_err(|e| format!("mcp.json parse error: {e}"))?;
     match v.get("fabric") {
         None | Some(Value::Null) => Ok(None),
@@ -502,6 +506,42 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
     Ok(())
 }
 
+/// Refuse a config referencing variables that do not exist. Checked BEFORE expansion, because
+/// afterwards a missing variable is an empty string — indistinguishable from an intentionally
+/// empty one, which is precisely what `${VAR:-default}` exists to let an author say.
+fn reject_missing_vars(raw: &str) -> Result<(), String> {
+    reject_missing_vars_with(raw, |name| std::env::var(name).ok())
+}
+
+fn reject_missing_vars_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    // Via the structural walker, which skips `_`-prefixed documentation keys. A raw-text scan
+    // reads the bundled default's own `_doc2` — which EXPLAINS `${VAR}` in prose — and made
+    // woollamad refuse to load its own config. Only values the loader consumes can be wrong.
+    let mut missing: Vec<String> = Vec::new();
+    for r in referenced_vars(raw) {
+        // A malformed reference is not a missing variable, and telling someone to export
+        // `${${HOME}` is advice they cannot follow. Report what is actually wrong.
+        if r.var.is_malformed() {
+            return Err(format!(
+                "mcp.json: `${{{}}}` looks malformed — `${{VAR:-default}}` does not nest, so a \
+                 `${{...}}` inside a reference is not expanded. Check this reference.",
+                r.var.name
+            ));
+        }
+        if r.var.fallback.is_none()
+            && lookup(&r.var.name).is_none()
+            && !missing.contains(&r.var.name)
+        {
+            missing.push(r.var.name.clone());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(engine::missing_vars_error("mcp.json", &missing))
+    }
+}
+
 /// `load_mcp_servers`, but returning the per-server diagnostics it would otherwise log and
 /// discard. For `woollamad check-config`, which exists because those diagnostics are otherwise
 /// visible only in the boot log: a *connection* failure may self-heal on the next request, but a
@@ -509,6 +549,7 @@ fn validate_header_value(server: &str, name: &str, value: &str) -> Result<(), St
 /// ever configured is a startup line nobody re-reads.
 pub fn diagnose_mcp_servers() -> Result<McpConfigLoad, String> {
     let raw = read_user_or_default("mcp.json", DEFAULT_MCP);
+    reject_missing_vars(&raw)?;
     let (specs, errors, mut warnings) = parse_mcp_servers(&engine::expand_env(&raw))?;
     // Unset-variable lines first WITHIN the warnings, since they usually explain the rest. (They
     // still print after errors — both consumers drain errors first — so this orders warnings
@@ -563,6 +604,10 @@ pub fn serves(caps: &CapabilityMap, model: &str, capability: &str) -> Option<boo
 pub fn load_capabilities() -> Result<HashMap<String, CapabilityMap>, String> {
     let path = engine::config_dir().join("inferencers.toml");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(HashMap::new()) };
+    let missing = engine::missing_vars_in_toml(&text);
+    if !missing.is_empty() {
+        return Err(engine::missing_vars_error("inferencers.toml", &missing));
+    }
     parse_capabilities(&engine::expand_env(&text))
 }
 
@@ -724,6 +769,9 @@ fn unset_var_warnings_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -
             (Some(fb), "") => fb.clone(),
             (_, v) => v.to_string(),
         };
+        // A bare unset reference is a hard load error now (`reject_missing_vars`), so it can
+        // never reach this point. What remains is what an error would be wrong to refuse: a value
+        // that RESOLVES to empty inside an env block, and a malformed reference.
         let report = if r.env_key.is_some() {
             // Inside an `env` block the question is what the CHILD receives, not how it was
             // written. `${API_KEY:-}` is a plausible way to say "optional" and still hands the
@@ -731,9 +779,7 @@ fn unset_var_warnings_with(raw: &str, lookup: impl Fn(&str) -> Option<String>) -
             // can catch, so a declared fallback does not buy silence here.
             resolved.is_empty()
         } else {
-            // Elsewhere a declared fallback means the author said absence is intended, which is
-            // the whole point of the syntax; only a bare unset reference is worth a line.
-            r.var.fallback.is_none() && raw_value.is_none()
+            false
         } || r.var.is_malformed();
         if !report {
             continue;
@@ -1143,15 +1189,23 @@ mod tests {
             "documentation must not be mistaken for configuration: {warnings:?}"
         );
         // And the bundled default declares a fallback for its one real reference, so with the
-        // examples absent it says nothing at all — which is the point of the `:-` form. A bare
-        // reference in the same position WOULD be reported.
+        // examples absent it says nothing at all — the point of the `:-` form.
         assert!(warnings.is_empty(), "a declared fallback is deliberate, not a mistake: {warnings:?}");
+
+        // A BARE reference is no longer a warning at all — it is a hard load error, checked by
+        // `reject_missing_vars` before any of this runs. Pinned here because the two mechanisms
+        // must not both claim the same case: the structural walker is what makes the error safe,
+        // and a raw-text version of it made woollamad refuse its own bundled config.
         let bare = DEFAULT_MCP.replace(":-/nonexistent", "");
+        // Injected lookup: this module documents why tests must not depend on ambient env, and
+        // an exported WOOLLAMA_EXAMPLES_DIR made an earlier version of this assertion fail.
         assert!(
-            unset_var_warnings_with(&bare, |_| None)
-                .iter()
-                .any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
-            "a BARE reference to the same variable must still be reported"
+            reject_missing_vars_with(&bare, |_| None).is_err(),
+            "a bare unset reference must be refused, not merely reported"
+        );
+        assert!(
+            reject_missing_vars_with(DEFAULT_MCP, |_| None).is_ok(),
+            "and the shipped default, whose only reference declares a fallback, must load"
         );
     }
 
@@ -1191,6 +1245,27 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_reference_is_refused_with_actionable_advice() {
+        // `${${HOME}}` has no fallback, so the missing-variable path would have refused it with
+        // "export ${${HOME}" — advice nobody can follow. Report what is actually wrong.
+        let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${${HOME}}"]}}}"#;
+        let err = reject_missing_vars_with(raw, |_| None).unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+        assert!(!err.contains("Export it"), "must not advise exporting an unexportable name: {err}");
+    }
+
+    #[test]
+    fn a_server_name_is_not_a_documentation_key() {
+        // `_` marks a documentation KEY, not a namespace. Applying it to server names would let
+        // `_disabled` skip the check and then LOAD with a silently-empty command.
+        let raw = r#"{"mcpServers": {"_disabled": {"command": "${NOPE}/x"}}}"#;
+        assert!(
+            reject_missing_vars_with(raw, |_| None).is_err(),
+            "a server named `_disabled` is still a server"
+        );
+    }
+
+    #[test]
     fn a_malformed_reference_is_still_reported() {
         // `${VAR:-default}` does not nest. An author writing shell-style `${DIR:-${HOME}/fb}`
         // gets a literal `${HOME` in a spawn argument. Skipping every token containing `:-`
@@ -1202,23 +1277,18 @@ mod tests {
     }
 
     #[test]
-    fn env_and_non_env_references_differ_in_wording_and_in_threshold() {
+    fn warnings_now_cover_only_what_an_error_would_be_wrong_to_refuse() {
+        // The split, after bare-unset became a hard error:
+        //   unset, no fallback   -> ERROR (reject_missing_vars), never a warning
+        //   set-but-EMPTY in env -> warning; `FOO=` is a deliberate operator choice, so refusing
+        //                           it would make being explicit indistinguishable from a typo
+        //   set-but-empty else   -> silence; likely deliberate and nothing consumes it unsafely
         let raw = r#"{"mcpServers": {"a": {"command": "x", "args": ["${P}/s.py"],
             "env": {"API_KEY": "${T}"}}}}"#;
 
-        // Both unset: both reported, with different wording.
-        let w = unset_var_warnings_with(raw, |_| None);
-        assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w.iter().any(|l| l.contains("env 'API_KEY'") && l.contains("EMPTY value")));
-        // The non-env line now tells the operator how to declare intent, rather than just
-        // observing that something is unset.
-        assert!(w.iter().any(|l| l.contains("${P}") && l.contains("${P:-fallback}")), "{w:?}");
-
-        // Both set-but-EMPTY: only the env one is reported. `FOO=` in a unit file is
-        // indistinguishable from missing to a child; an empty optional path is likely deliberate.
         let w = unset_var_warnings_with(raw, env_of(&[("P", ""), ("T", "")]));
-        assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("env 'API_KEY'"), "{}", w[0]);
+        assert_eq!(w.len(), 1, "only the env-block empty is reported: {w:?}");
+        assert!(w[0].contains("env 'API_KEY'") && w[0].contains("EMPTY value"), "{}", w[0]);
         assert!(
             !w[0].contains("is unset"),
             "must not claim 'unset' about a variable that is set-but-empty: {}",

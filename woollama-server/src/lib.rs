@@ -64,6 +64,32 @@ pub use mcp_registry::{spawn_reconnect, McpRegistry, ServerHealth, ServerStatus}
 /// boot log — one journal line, read approximately never. A connection failure may self-heal on
 /// the next request; a config error will still be there in six weeks. So strictness lives in a
 /// deliberate step the operator runs before a reload, rather than in the daemon's startup path.
+/// Config faults that must STOP the daemon rather than degrade it.
+///
+/// `build_state` deliberately degrades most problems — a downstream that won't start is skipped so
+/// one bad server can't cost an operator the other eleven. That is right for a *world* fault and
+/// wrong for a *config* fault: a `mcp.json` referencing a variable that does not exist makes the
+/// whole file unusable, and degrading it means starting with ZERO MCP servers, `conversationStore`
+/// silently back to `None` (statelessness restored for non-claude models), no fabric backend —
+/// while reporting healthy. Three stderr lines nobody re-reads, which is precisely what
+/// `check-config` exists to prevent.
+///
+/// So this runs BEFORE `build_state` and refuses. It matches the Python reference, which raises
+/// out of its lifespan and does not start.
+pub fn fatal_config_error() -> Option<String> {
+    config::ensure_examples_dir();
+    if let Err(e) = config::diagnose_mcp_servers() {
+        return Some(e);
+    }
+    if let Err(e) = config::load_capabilities() {
+        return Some(e);
+    }
+    if let Err(e) = engine::Registry::from_config() {
+        return Some(e.message);
+    }
+    None
+}
+
 pub fn check_config() -> i32 {
     config::ensure_examples_dir();
     let mut errors = 0usize;
@@ -102,7 +128,7 @@ pub fn check_config() -> i32 {
 
     match engine::Registry::from_config() {
         Err(e) => {
-            eprintln!("error: inferencers.toml: {e}");
+            eprintln!("error: {e}");
             errors += 1;
         }
         Ok(_) => println!("inferencers.toml: OK"),
