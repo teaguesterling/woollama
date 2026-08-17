@@ -27,8 +27,12 @@ Binding where they conflict with the brief:
 1. **`env` is a parity regression, not an unimplemented key.** The brief says `env` is "never parsed" and the docs are wrong. In fact `src/woollama/config.py:136` parses it and `src/woollama/manager.py:89` forwards it to `StdioServerParameters.env`. `docs/configuration.md:38` correctly documents the oracle; `woollamad` dropped a working feature during the port. Restore Python's semantics; do not design a new key.
 2. **"A failed server aborts startup" is divergent, not stale.** Python's `Registry.start_all` (`manager.py:149-151`) awaits `start()`, which re-raises at `:74`. Python genuinely aborts; Rust skips with a warning (`mcp_registry.rs:111`). The doc is true of the oracle. Split it per implementation rather than deleting the claim.
 3. **The startup tool-list recursion does not exist.** The brief's decision 2 assumes `list_all_tools` can recurse across routers. It cannot: `mcp_surface.rs:118-126` serves `list_tools` from `registry.reexport_tools()` (`mcp_registry.rs:160-176`), which reads the `ServerConn.tools` vec cached once at connect (`:136`). No downstream call happens at request time. A mutual A↔B config is a startup ordering race over stale-or-empty rosters, bounded by `connect_timeout` and the concurrent skip-on-failure at `:97-117`.
-4. **A self-loop guard would be unreachable code today, so this plan does not ship one.** `build_state()` — which connects every downstream — runs at `main.rs:13`; `axum::serve` starts at `:62`. The process is **not listening** while it connects. An instance whose `mcp.json` names its own address therefore fails with connection-refused and never reaches any inbound guard. A guard here would look responsible and could never fire. It becomes reachable exactly when reconnect-after-startup lands — see amendment 5.
-5. **The hop cap AND the self-loop guard both belong to the future retry slice, for the same reason.** Both concern behavior *after* startup, and today there is no after-startup: `McpRegistry::connect` is called once (`lib.rs:111`) before the listener opens. Caching is what makes federation safe now, and startup-only connection is what makes self-loops unreachable now; a retry loop removes both properties at once. Task 4 records this so it is not orphaned.
+4. **No self-loop guard ships, but loop protection is DEFERRED — NOT UNNECESSARY.** Read this whole amendment before concluding anything about loops; an earlier draft said "unreachable code" and that was misleading.
+   - *Self-reference (A→A) is unreachable.* `build_state()` — which connects every downstream — runs at `main.rs:13`; `axum::serve` starts at `:62`. The process is not listening while it connects, so an instance naming its own address gets connection-refused and never reaches any inbound check.
+   - *Mutual cycles (A→B→A) ARE reachable, through ordinary restarts, and are currently UNGUARDED.* A starts (B down, skipped); B starts and connects to A; A restarts and now connects to B. Both directions established, neither instance ever self-references, startup ordering never violated. Credit: the `tiiny-85` session, which caught this after the first draft.
+   - *An inbound self-id check would not have helped.* It compares an inbound id to our own; in A→B→A neither side ever sees its own id. The mechanism for mutual cycles is the instance-id **Via chain plus hop cap**, which is what amendment 5 defers. Do not read "no self-loop guard" as "loops handled".
+   - *Bounded in dispatch, unbounded in names.* A federated call terminates: `resolve()` (`mcp_registry.rs:147-151`) returns the **stripped** bare name, so each hop removes one `mcp__<server>__` prefix and the finite name shrinks monotonically — the innermost hop errors with `unknown tool` rather than looping. What is NOT bounded is name growth: one nesting level per mutual restart cycle, hitting the 64-char `wire_name` limit and degrading silently to hashed names.
+5. **The hop cap belongs to the future retry slice.** Caching is what keeps federation safe today — rosters snapshot at connect and serve from cache, so nothing recurses at request time. A retry loop that refreshes rosters removes that property, making live recursion reachable for the first time, and is also what would make an inbound identity check able to fire at all. Both obligations land there together. Task 4 records this so neither is orphaned.
 6. **The recommended credential mechanism fails open.** `woollama-engine/src/lib.rs:417` resolves `${VAR}` with `unwrap_or_default()`, so an unset `${TOKEN}` expands to the empty string and `"Bearer ${TOKEN}"` becomes the literal header `Bearer ` — a well-formed request carrying no credential. Task 3 adds a fail-closed validation step in `load_mcp_servers` (never in the engine).
 7. **The enum refactor touches claude-code delegation.** `lib.rs:536` reads `spec.command` / `spec.args` directly to build the `--mcp-config` handed to the `claude` CLI. That is the delegation containment boundary, not incidental code. Task 2 handles it.
 
@@ -965,10 +969,14 @@ In `docs/roadmap.md`, under the not-yet section:
     recurses at request time. Dynamic roster refresh is exactly what removes that property: a
     refresh can cascade across routers at request time, making live recursion reachable for the
     first time. Design the hop cap here or not at all.
-  - **A self-loop guard.** Likewise unreachable today: `build_state()` connects every downstream
-    (`main.rs:13`) *before* `axum::serve` opens the listener (`:62`), so an instance naming its
-    own address gets connection-refused and never reaches any inbound check. Reconnect-while-
-    serving is what makes such a guard able to fire.
+    **Mutual cycles are reachable today and unguarded.** A→B→A needs no self-reference: A starts
+    (B down, skipped), B starts and connects to A, A restarts and connects to B. Startup ordering
+    is never violated. Only the degenerate A→A case is prevented, and only incidentally —
+    `build_state()` connects downstreams (`main.rs:13`) before `axum::serve` opens the listener
+    (`:62`), so an instance naming its own address gets connection-refused. **That is not loop
+    protection.** Dispatch does terminate (`resolve()` strips one namespace prefix per hop, so a
+    finite name shrinks monotonically), but tool names gain a nesting level per mutual restart
+    cycle and degrade silently to hashed forms at the 64-char limit.
   - Retry must stay observable: never present a reconnecting server as present-with-zero-tools.
     Distinct connected / degraded-retrying / never-connected states with last error and attempt
     count. The test that matters is "while down, the degraded state is visible" — a test that
