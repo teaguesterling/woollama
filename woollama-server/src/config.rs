@@ -599,15 +599,21 @@ struct VarRef {
     env_key: Option<String>,
 }
 
-/// Extract `${VAR}` names from one string value.
+/// Extract the names of BARE `${VAR}` references from one string value.
+///
+/// A `${VAR:-default}` reference is deliberately skipped: the author declared a fallback, so a
+/// variable that does not resolve is intended rather than a mistake. That is the whole point of
+/// the syntax — it turns this warning from "here are some unset variables, one of which is fine
+/// and we cannot tell you which" into a signal whose false-positive rate is near zero.
 fn vars_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(pos) = rest.find("${") {
         let after = &rest[pos + 2..];
         let Some(end) = after.find('}') else { break };
-        if !after[..end].is_empty() {
-            out.push(after[..end].to_string());
+        let token = &after[..end];
+        if !token.is_empty() && !token.contains(":-") {
+            out.push(token.to_string());
         }
         rest = &after[end + 1..];
     }
@@ -1102,10 +1108,16 @@ mod tests {
             !warnings.iter().any(|w| w.contains("${VAR}")),
             "documentation must not be mistaken for configuration: {warnings:?}"
         );
-        // The real reference in the same file is still found.
+        // And the bundled default declares a fallback for its one real reference, so with the
+        // examples absent it says nothing at all — which is the point of the `:-` form. A bare
+        // reference in the same position WOULD be reported.
+        assert!(warnings.is_empty(), "a declared fallback is deliberate, not a mistake: {warnings:?}");
+        let bare = DEFAULT_MCP.replace(":-/nonexistent", "");
         assert!(
-            warnings.iter().any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
-            "the genuinely-referenced variable must still be reported: {warnings:?}"
+            unset_var_warnings_with(&bare, |_| None)
+                .iter()
+                .any(|w| w.contains("WOOLLAMA_EXAMPLES_DIR")),
+            "a BARE reference to the same variable must still be reported"
         );
     }
 
@@ -1154,8 +1166,10 @@ mod tests {
         let (specs, errors, _) = parse_mcp_servers(&engine::expand_env(DEFAULT_MCP)).unwrap();
         assert_eq!(specs.len(), 2, "the bundled default must yield both example servers");
         assert!(errors.is_empty(), "and none of them may be skipped: {errors:?}");
-        // With the examples dir absent it warns, and warning is all it may do.
-        assert!(!unset_var_warnings_with(DEFAULT_MCP, |_| None).is_empty());
+        // And with the examples dir absent it is SILENT, because the default now declares its
+        // fallback with `:-`. That absence is deliberate, so there is nothing to report — the
+        // warning channel stays for references that might actually be mistakes.
+        assert!(unset_var_warnings_with(DEFAULT_MCP, |_| None).is_empty());
     }
 
     #[test]

@@ -80,7 +80,17 @@ def _expand_env(text: str) -> str:
       - braceless `$VAR` is left EXACTLY as-is, never expanded (`os.path
         .expandvars` would expand it).
     An unclosed `${` (no matching `}`) emits the literal remainder unchanged
-    and stops scanning right there -- same as Rust's early `return`."""
+    and stops scanning right there -- same as Rust's early `return`.
+
+    `${VAR:-default}` uses POSIX `:-` semantics: unset OR EMPTY yields
+    `default`. That distinction is what lets woollamad's unset-variable
+    warning stay trustworthy -- a bare `${VAR}` resolving to nothing may be a
+    mistake, a declared fallback never is -- so only the bare form is
+    reported. The default runs to the first `}`, so it cannot contain one.
+
+    A config file is read by BOTH implementations, so a divergence here is a
+    config that behaves differently depending on which one loaded it. Change
+    the two together or not at all."""
     os.environ["WOOLLAMA_EXAMPLES_DIR"] = str(_examples_dir())
     out: list[str] = []
     rest = text
@@ -94,7 +104,13 @@ def _expand_env(text: str) -> str:
         if end == -1:
             out.append(rest[pos:])
             return "".join(out)
-        out.append(os.environ.get(after[:end], ""))
+        token = after[:end]
+        name, sep, fallback = token.partition(":-")
+        if sep:
+            value = os.environ.get(name, "")
+            out.append(value if value else fallback)
+        else:
+            out.append(os.environ.get(token, ""))
         rest = after[end + 1:]
     out.append(rest)
     return "".join(out)

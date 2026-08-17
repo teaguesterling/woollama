@@ -15,7 +15,16 @@ optional — woollama falls back to bundled defaults for `mcp.json` and
 `${VAR}` references are expanded from the environment in `mcp.json` and
 `inferencers.toml` (e.g. `base_url = "${VLLM_URL}/v1"`).
 
-**An unset variable expands to nothing, deliberately.** Optional paths depend on it — the bundled
+`${VAR:-default}` supplies a fallback when the variable is unset **or empty** (POSIX `:-`
+semantics). Use it to say a missing variable is intended:
+
+```json
+"args": ["${WOOLLAMA_EXAMPLES_DIR:-/nonexistent}/mcp-hello/server.py"]
+```
+
+The default runs to the first `}`, so it cannot itself contain one.
+
+**A bare unset variable expands to nothing, deliberately.** Optional paths depend on it — the bundled
 default `mcp.json` references `${WOOLLAMA_EXAMPLES_DIR}`, which is unset on a binary-only install,
 so those example servers fail to start and are skipped while everything else loads. Expansion runs
 over the whole file *before* parsing, so erroring on an unset variable would take every unrelated
@@ -25,8 +34,10 @@ Anything security-relevant is therefore validated by its **consumer**, where the
 known: an `Authorization` header that expands to a bare `Bearer ` invalidates that server (see
 [`mcp.json`](#mcpjson) below), because there an empty value is unambiguously a missing credential.
 
-woollama reports every referenced-but-unset variable at startup and from
-`woollamad check-config`. One case is called out separately: a variable used inside a server's
+woollama reports every **bare** referenced-but-unset variable at startup and from
+`woollamad check-config`. A `${VAR:-default}` reference is never reported: the author declared
+the fallback, so a variable that does not resolve is intended rather than a mistake. That is what
+keeps the warning worth reading. One case is called out separately: a variable used inside a server's
 **`env` block**. That is the one position where woollama cannot check on the consumer's behalf —
 the consumer is a child process, and an empty `API_KEY=` may mean "auth disabled", "anonymous
 mode", or "this child will talk to a remote service unauthenticated". Many servers treat an empty
