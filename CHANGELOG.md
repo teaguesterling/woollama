@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Features
+
+- **CPython 3.14 is supported.** pyo3 0.23 refused to build against any interpreter newer than
+  3.13, so 3.14 had no wheel *and* no working source build — `pip install woollama` failed
+  outright, while `requires-python = ">=3.11"` advertised support. Upgraded pyo3,
+  pyo3-async-runtimes and pythonize 0.23 → 0.29. The only source change needed was the GIL API
+  rename (`Python::with_gil` → `Python::attach`, `py.allow_threads` → `py.detach`); the crate was
+  already on the `Bound<'py, T>` API, which is the migration that would have hurt. (#43)
+
+  Verified on 3.14.6: a cp314 wheel builds, the sdist builds from source, `woollama.core`
+  imports, `InferenceError` still subclasses `Exception` (the reason abi3 remains unusable), and
+  both suites pass — 42 conformance tests and 336 Python tests. `woollama`'s own dependencies
+  (fastapi, httpx, mcp, uvicorn) all resolve on 3.14, so nothing else blocks the install.
+
+  Note that prebuilt cp314 **wheels** additionally need the matrix change in the still-unapplied
+  workflow patch. Until that lands, 3.14 installs by building from source, which needs a Rust
+  toolchain and takes minutes — working, but not yet pleasant.
+
+- No behavioural change on 3.11–3.13: clippy output is identical to the pre-upgrade baseline,
+  and the Rust suites are unchanged (93 server, 16 engine).
+
+
 ## v0.14.4 — 2026-08-17
 
 **Completes v0.14.3, which published only half of what it intended.** `woollama` 0.14.4 +
