@@ -159,3 +159,87 @@ fn inferencers_toml_is_checked_too_and_its_comments_are_not() {
     );
     assert_eq!(code, 0, "documentation must not fail a load: {text}");
 }
+
+/// Informational flags must print and exit, and a second daemon must not damage the first.
+///
+/// Reported from production: `woollamad --help` fell through to starting a full daemon, which
+/// overwrote the running daemon's address file with its own ephemeral port and then, on the way
+/// out, unlinked a socket it had explicitly DECLINED to create. The healthy daemon was left bound
+/// to an orphaned inode — `ss` showed it listening, `ls` showed no file, path-based clients got
+/// ECONNREFUSED, and the daemon reported healthy and logged nothing. The failure was
+/// indistinguishable from health from every vantage point except an actual client connect.
+#[test]
+fn informational_flags_exit_without_starting_a_daemon() {
+    for flag in ["--version", "-V", "--help", "-h"] {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_woollamad"))
+            .arg(flag)
+            .env("WOOLLAMA_CONFIG_DIR", dir.path())
+            .env("XDG_RUNTIME_DIR", dir.path())
+            .env("WOOLLAMA_STATE_DIR", dir.path())
+            .output()
+            .expect("run woollamad");
+        assert!(out.status.success(), "`{flag}` must exit 0, got {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "`{flag}` must print the version: {text}");
+        // The decisive part: it must not have touched the runtime dir at all.
+        assert!(
+            !dir.path().join("woollama.addr").exists(),
+            "`{flag}` wrote a discovery address file — it would clobber a running daemon's"
+        );
+        assert!(!dir.path().join("woollama.sock").exists(), "`{flag}` bound a socket");
+    }
+}
+
+#[test]
+fn a_second_daemon_refuses_rather_than_breaking_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(dir.path().join("recipes.toml"), "").unwrap();
+
+    let mut live = Command::new(env!("CARGO_BIN_EXE_woollamad"))
+        .env("WOOLLAMA_CONFIG_DIR", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("WOOLLAMA_STATE_DIR", dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn live daemon");
+
+    let addr_file = dir.path().join("woollama.addr");
+    let sock = dir.path().join("woollama.sock");
+    let mut addr = String::new();
+    for _ in 0..100 {
+        if let Ok(s) = std::fs::read_to_string(&addr_file) {
+            if !s.trim().is_empty() && sock.exists() {
+                addr = s.trim().to_string();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!addr.is_empty(), "the live daemon never published an address");
+
+    // Second daemon, same runtime dir.
+    let out = Command::new(env!("CARGO_BIN_EXE_woollamad"))
+        .env("WOOLLAMA_CONFIG_DIR", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("WOOLLAMA_STATE_DIR", dir.path())
+        .output()
+        .expect("run second daemon");
+
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "the second daemon must refuse: {text}");
+    assert!(text.contains("already owns"), "and say why: {text}");
+
+    // The first daemon is untouched — this is what the refusal is FOR.
+    assert_eq!(
+        std::fs::read_to_string(&addr_file).unwrap().trim(),
+        addr,
+        "the second daemon overwrote the first's discovery address"
+    );
+    assert!(sock.exists(), "the second daemon unlinked a socket it does not own");
+
+    let _ = live.kill();
+    let _ = live.wait();
+}

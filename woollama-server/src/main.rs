@@ -10,10 +10,36 @@ use woollama_server::binding;
 
 #[tokio::main]
 async fn main() {
+    // Informational flags print and exit, BEFORE anything reads config or touches the runtime
+    // dir. They previously fell through and started a full daemon — so `woollamad --version`
+    // never exited, and on its way out clobbered a running daemon's discovery.
+    let arg1 = std::env::args().nth(1);
+    match arg1.as_deref() {
+        Some("--version" | "-V") => {
+            println!("woollamad {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "woollamad {}\n\n\
+                 USAGE:\n  \
+                 woollamad                 serve the OpenAI + MCP surfaces (loopback TCP + unix socket)\n  \
+                 woollamad mcp             serve the MCP surface over stdio\n  \
+                 woollamad check-config    validate config and exit non-zero on any problem\n  \
+                 woollamad --version       print the version\n\n\
+                 Config lives in $WOOLLAMA_CONFIG_DIR (default $XDG_CONFIG_HOME/woollama).\n\
+                 See https://woollama.readthedocs.io/",
+                env!("CARGO_PKG_VERSION")
+            );
+            return;
+        }
+        _ => {}
+    }
+
     // `woollamad check-config` → validate config, report, exit. Runs BEFORE build_state: it must
     // not connect downstreams or bind anything, so it is safe to run against a live deployment's
     // config dir before a reload.
-    if std::env::args().nth(1).as_deref() == Some("check-config") {
+    if arg1.as_deref() == Some("check-config") {
         std::process::exit(woollama_server::check_config());
     }
 
@@ -30,12 +56,27 @@ async fn main() {
 
     // `woollamad mcp` → serve the MCP surface over stdio (for an MCP client's
     // mcp.json). stdout is the protocol channel; the banner/logs go to stderr.
-    if std::env::args().nth(1).as_deref() == Some("mcp") {
+    if arg1.as_deref() == Some("mcp") {
         if let Err(e) = woollama_server::serve_mcp_stdio(state).await {
             eprintln!("woollamad mcp: {e}");
             std::process::exit(1);
         }
         return;
+    }
+
+    // BEFORE binding anything: if a live peer holds our unix socket, another daemon already owns
+    // this runtime dir. Continuing would overwrite ITS address file with our ephemeral port, so
+    // every client discovering by that file gets a dead address — the healthy daemon's discovery
+    // broken by ours, with no error on either side. Checked here rather than after the TCP bind
+    // because the TCP bind is what writes the address file.
+    let sock_path = binding::sock_path();
+    if std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
+        eprintln!(
+            "woollamad: another woollamad already owns {} — refusing to start rather than \
+             overwrite its discovery address. Use a different XDG_RUNTIME_DIR to run a second one.",
+            sock_path.display()
+        );
+        std::process::exit(1);
     }
 
     // TCP loopback (or the WOOLLAMA_ADDRESS override). Persist the real host:port for discovery.
@@ -55,8 +96,9 @@ async fn main() {
 
     // Unix socket alongside TCP — best-effort (degrades to TCP-only). The default transport
     // for local MCP clients (the panel, the CLI).
-    let sock_path = binding::sock_path();
     let unix = binding::bind_unix(&sock_path);
+    // Whether WE created the socket. Only the creator may unlink it on shutdown.
+    let unix_owned = unix.is_some();
 
     eprintln!("woollamad {} listening:", env!("CARGO_PKG_VERSION"));
     if unix.is_some() {
@@ -94,7 +136,7 @@ async fn main() {
             _ = shutdown_signal() => {}
         }
     }
-    binding::cleanup_unix(&sock_path);
+    binding::cleanup_unix(&sock_path, unix_owned);
     // Graceful shutdown: let each pattern backend release resources (e.g. kill a managed
     // `fabric --serve` we spawned; a reused/external one has no child handle → no-op).
     for backend in &backends {

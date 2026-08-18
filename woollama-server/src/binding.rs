@@ -90,7 +90,18 @@ pub fn persist_addr(host: &str, port: u16) {
 }
 
 /// Remove the Unix socket file on shutdown (FileNotFound is fine). Mirrors `cleanup`.
-pub fn cleanup_unix(path: &Path) {
+/// Remove the Unix socket on shutdown — **only if this process created it**.
+///
+/// `owned` must be the result of this process's own `bind_unix`. Unlinking unconditionally means a
+/// process that correctly DECLINED to steal a live peer's socket still deletes it on the way out,
+/// leaving the healthy daemon bound to an orphaned inode: `ss` shows it listening, `ls` shows no
+/// file, path-based clients get ECONNREFUSED, and the daemon reports perfectly healthy and logs
+/// nothing. Observed in production — `woollamad --help` severed a running daemon's MCP transport
+/// with no error on either side.
+pub fn cleanup_unix(path: &Path, owned: bool) {
+    if !owned {
+        return;
+    }
     let _ = std::fs::remove_file(path);
 }
 
