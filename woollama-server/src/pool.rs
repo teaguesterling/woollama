@@ -605,6 +605,10 @@ pub struct DeviceModelManager {
     /// Last-seen per-model capabilities from the backend. Cached alongside residency because it
     /// arrives in the same payload and changes for the same reasons.
     discovered_caps: StdMutex<ModelCapabilities>,
+    /// Models the backend has just failed a request for. The next `ensure_loaded` reloads them
+    /// unconditionally instead of trusting either our view or the backend's (see
+    /// `mark_needs_reload`).
+    needs_reload: StdMutex<std::collections::HashSet<String>>,
     /// Single-flights concurrent read-throughs. Deliberately NOT `load_lock`: residency reads sit
     /// on the request path, and sharing that lock would make every `default` request queue behind
     /// an in-progress model load.
@@ -632,6 +636,7 @@ impl DeviceModelManager {
                 .map(|ms| ms / 1000.0)
                 .unwrap_or(1.0),
             discovered_caps: StdMutex::new(ModelCapabilities::new()),
+            needs_reload: StdMutex::new(std::collections::HashSet::new()),
             residency_lock: AsyncMutex::new(()),
         }
     }
@@ -732,17 +737,22 @@ impl DeviceModelManager {
     /// one device `start` (serialized on `load_lock`, re-checked after acquiring
     /// it). Never evicts a model with `in_flight > 0` or `queued > 0`.
     pub async fn ensure_loaded(&self, real_id: &str, pool_max: Option<u32>) -> Result<(), PoolError> {
-        if self.mark_used_if_loaded(real_id) {
+        // A model the backend just failed for is reloaded unconditionally: neither our view nor
+        // the backend's can be trusted here, since the backend keeps listing a crashed instance
+        // for seconds (see `mark_needs_reload`). Taken ONCE — a load that fails surfaces its error
+        // rather than looping, so a model that genuinely cannot load fails cleanly.
+        let forced = self.needs_reload.lock().unwrap().remove(real_id);
+        if !forced && self.mark_used_if_loaded(real_id) {
             return Ok(());
         }
         let _guard = self.load_lock.lock().await;
-        if self.mark_used_if_loaded(real_id) {
+        if !forced && self.mark_used_if_loaded(real_id) {
             return Ok(());
         }
 
         let running = self.backend.list_loaded().await?;
         self.reconcile(&running);
-        if running.contains(real_id) {
+        if !forced && running.contains(real_id) {
             self.mark_loaded(real_id);
             return Ok(());
         }
@@ -867,6 +877,34 @@ impl DeviceModelManager {
             capabilities: self.discovered_caps.lock().unwrap().clone(),
             current,
         }
+    }
+
+    /// Mark `real_id` as needing a reload, because the backend just failed a request for it.
+    ///
+    /// Does NOT reconcile against the backend, and that is the whole point. Measured on real
+    /// hardware: for **2–5 seconds** after an instance crash the device still reports the model as
+    /// `running` (with a stale `active_request_count`) before reaping catches up. So a reconcile
+    /// fired on the failure reads "still resident, all fine" and does nothing — the correct-looking
+    /// fix, failing intermittently, because the stale belief is the *backend's* and reading through
+    /// to the authority cannot help when the authority has not noticed yet.
+    ///
+    /// Nor does it wait out the reaping window: how long a backend takes to reap is not a constant
+    /// either side should be encoding.
+    ///
+    /// Instead the next `ensure_loaded` for this model issues a load unconditionally — skipping
+    /// both the "we believe it is loaded" short-circuit and the "the backend still lists it" one.
+    /// Measured: `start` is accepted immediately after a crash even while the dead instance is
+    /// still listed, so this recovers on the next request rather than after the window.
+    pub fn mark_needs_reload(&self, real_id: &str) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(e) = entries.get_mut(real_id) {
+            e.loaded = false;
+        }
+        self.needs_reload.lock().unwrap().insert(real_id.to_string());
+        eprintln!(
+            "woollamad: the backend failed a request for '{real_id}'; it will be reloaded on the \
+             next request rather than assumed resident"
+        );
     }
 
     fn fresh_enough(&self) -> bool {

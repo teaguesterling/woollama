@@ -1505,6 +1505,12 @@ async fn passthrough_pooled(
             Err(e) => return e,
         };
         if resp.status().as_u16() >= 400 {
+            // The backend just refused. Re-check what it is actually running so a model that was
+            // dropped from under us stops being believed resident — otherwise `ensure_loaded`
+            // short-circuits on that belief and EVERY later request fails the same way (#38).
+            if resp.status().as_u16() >= 500 {
+                manager.mark_needs_reload(&real);
+            }
             return relay_json(resp).await;
         }
         // Hold `slot` for the lifetime of the stream body: it moves into the
@@ -1523,7 +1529,15 @@ async fn passthrough_pooled(
 
     fwd["stream"] = json!(false);
     let result = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
-        Ok(resp) => relay_json(resp).await,
+        Ok(resp) => {
+            // See the streaming branch: a 5xx may mean the model went away underneath us.
+            let server_error = resp.status().as_u16() >= 500;
+            let relayed = relay_json(resp).await;
+            if server_error {
+                manager.mark_needs_reload(&real);
+            }
+            relayed
+        }
         Err(e) => e,
     };
     // `slot` drops here (end of scope), after the dispatch has completed.

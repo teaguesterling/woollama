@@ -59,6 +59,19 @@
 
 ### Fixes
 
+- **The pool recovers when a model is unloaded underneath it (#38).** `ensure_loaded` short-circuits
+  on its own belief before consulting the backend, so once that belief went stale — a crash that
+  killed a model instance, an eviction by another consumer — *every* subsequent request for that
+  model failed identically, forever. A 20-item batch lost six items to it, reporting nothing but
+  per-item errors. Now an upstream `5xx` triggers a residency re-check, and a model the backend is
+  no longer running stops being believed resident, so the next request reloads it. Deliberately
+  **asks the backend rather than parsing its error**: whether a message means "unloaded" is vendor
+  wording — but nor does it reconcile against the backend, because measurement showed the backend
+  keeps reporting a crashed model as running for 2–5s while reaping catches up. A reconcile fired
+  on the failure reads "all fine" and does nothing: the stale belief is the *backend's*, and reading
+  through to the authority cannot help when the authority has not noticed. The failing model is
+  marked for reload directly and the next request loads it unconditionally.
+
 - **`default` no longer blames a config that is fine.** The fail-open warning fired whenever the
   candidate set came back empty, including when the residency read itself *failed* — telling an
   operator to fix a correct config while three models were resident and the real cause was a 401.
@@ -113,7 +126,20 @@ plus two fixes that came out of running them against real hardware. The
 - `parallel` documentation now claims the true thing — woollama sends at most N; the
   device may still receive more from other consumers.
 
-### Fixes found by running the above against real hardware
+### Fixes
+
+- **The pool recovers when a model is unloaded underneath it (#38).** `ensure_loaded` short-circuits
+  on its own belief before consulting the backend, so once that belief went stale — a crash that
+  killed a model instance, an eviction by another consumer — *every* subsequent request for that
+  model failed identically, forever. A 20-item batch lost six items to it, reporting nothing but
+  per-item errors. Now an upstream `5xx` triggers a residency re-check, and a model the backend is
+  no longer running stops being believed resident, so the next request reloads it. Deliberately
+  **asks the backend rather than parsing its error**: whether a message means "unloaded" is vendor
+  wording — but nor does it reconcile against the backend, because measurement showed the backend
+  keeps reporting a crashed model as running for 2–5s while reaping catches up. A reconcile fired
+  on the failure reads "all fine" and does nothing: the stale belief is the *backend's*, and reading
+  through to the authority cannot help when the authority has not noticed. The failing model is
+  marked for reload directly and the next request loads it unconditionally. found by running the above against real hardware
 
 - **BUGFIX — `<provider>/default` was nondeterministic across restarts.**
   `reconcile` stamped every newly-discovered resident with the same `last_used`, so
