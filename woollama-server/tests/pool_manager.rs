@@ -236,8 +236,15 @@ async fn evicts_lru_idle_at_capacity() {
     assert!(device.running().contains("C"));
 }
 
+/// Every loaded model busy at capacity reports `SwapBlocked`, NOT `Backpressure`.
+///
+/// This assertion changed with #39, deliberately. The manager's job is to report what it sees —
+/// "capacity is full and nothing is evictable *yet*" — and that is a signal, not an answer to a
+/// caller. Deciding how long that is worth waiting for belongs to `Gate`, which owns
+/// `queue_timeout`; it converts this to `Backpressure` once the wait is spent. The refusal to
+/// evict a busy model is unchanged and is what this test still guards.
 #[tokio::test]
-async fn no_evict_when_all_busy_raises_backpressure() {
+async fn no_evict_when_all_busy_reports_swap_blocked() {
     let device = FakeDevice::spawn(&["A", "B"]).await;
     let m = mgr(&device);
     m.ensure_loaded("A", None).await.unwrap();
@@ -245,9 +252,11 @@ async fn no_evict_when_all_busy_raises_backpressure() {
     m.acquire("A");
     m.acquire("B"); // both serving -> not evictable
     match m.ensure_loaded("C", Some(2)).await {
-        Err(PoolError::Backpressure(_)) => {}
-        other => panic!("expected PoolError::Backpressure, got {other:?}"),
+        Err(PoolError::SwapBlocked) => {}
+        other => panic!("expected PoolError::SwapBlocked, got {other:?}"),
     }
+    assert!(!device.calls().contains(&("stop".to_string(), "A".to_string())));
+    assert!(!device.calls().contains(&("stop".to_string(), "B".to_string())));
 }
 
 #[tokio::test]

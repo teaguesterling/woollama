@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Features
+
+- **A request for a non-resident model now queues behind the model swap instead of getting an
+  immediate `503`.** On a capacity-bound device, serving B can mean evicting A — so when A was
+  busy, nothing was evictable and B was refused outright, even though B was servable as soon as
+  work already in flight drained. That pushed a cold-load-length retry decision onto every
+  client, over a resource woollama was already sequencing. (#39)
+
+  A busy model is still never evicted, and `503` + `Retry-After` is still the answer once the
+  wait exceeds `queue_timeout` — the complaint was that it arrived *immediately*, not that it
+  arrived. No new configuration: a swap is a cold load with an eviction in front of it, and
+  `queue_timeout` already has to exceed a cold load.
+
+  The non-obvious half is a **fairness hold**, and it is load-bearing rather than a refinement.
+  `Gate::enter` enqueues before it loads, and eviction skips any model with a queued request, so
+  under steady traffic for the resident model its queue never empties and a waiter would time
+  out anyway — converting a fast failure into a slow one. While a swap is pending, arriving
+  requests for the resident model are held *before* they enqueue, letting it drain. Work already
+  in flight is never interrupted.
+
+  Verified by mutation, not just by passing: removing the fairness hold fails the starvation test
+  and nothing else; removing the wait fails all four. The suite was run 40× to catch a race that
+  a single green run had hidden.
+
+
 ## v0.15.0 — 2026-08-18
 
 **CPython 3.14 is supported.** `woollama` 0.15.0 + `woollama-core` 0.9.0; `woollama-server`

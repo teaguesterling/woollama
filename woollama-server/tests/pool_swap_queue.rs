@@ -13,14 +13,14 @@
 //! the first #38 fix passed while being wrong.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::extract::{Path as AxPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::Notify;
@@ -132,7 +132,7 @@ async fn a_request_for_another_model_waits_for_the_swap_instead_of_503() {
     let held = gate.enter("A").await.expect("A is resident");
 
     let gb = gate.clone();
-    let waiter = tokio::spawn(async move { gb.enter("B").await.map(|s| drop(s)) });
+    let waiter = tokio::spawn(async move { gb.enter("B").await.map(drop) });
 
     // B must still be waiting while A is held — if it resolves here it either 503'd (the bug)
     // or evicted a busy model (much worse).
@@ -160,7 +160,11 @@ async fn a_request_for_another_model_waits_for_the_swap_instead_of_503() {
 async fn a_steady_stream_for_the_resident_model_cannot_starve_the_waiter() {
     let (device, _m, gate) = capacity_one(10.0).await;
 
-    let stop = Arc::new(Notify::new());
+    // A flag, not a `Notify`: `notify_waiters` wakes only whoever is registered at that instant
+    // and stores nothing, so a stop signal sent while the stream task is inside `enter` is lost
+    // and the task loops forever. That hung this test rather than failing it — which is the
+    // worse outcome, because a hang looks like infrastructure trouble rather than a bug.
+    let stop = Arc::new(AtomicBool::new(false));
     let first_ready = Arc::new(Notify::new());
 
     // A pipeline of A requests, each briefly held, arriving continuously.
@@ -178,16 +182,17 @@ async fn a_steady_stream_for_the_resident_model_cannot_starve_the_waiter() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 drop(slot);
             }
-            if tokio::time::timeout(Duration::from_millis(1), stop_a.notified()).await.is_ok() {
+            if stop_a.load(Ordering::SeqCst) {
                 return served;
             }
+            tokio::task::yield_now().await;
         }
     });
 
     first_ready.notified().await;
 
     let gb = gate.clone();
-    let waiter = tokio::spawn(async move { gb.enter("B").await.map(|s| drop(s)) });
+    let waiter = tokio::spawn(async move { gb.enter("B").await.map(drop) });
 
     let outcome = tokio::time::timeout(Duration::from_secs(10), waiter)
         .await
@@ -195,7 +200,7 @@ async fn a_steady_stream_for_the_resident_model_cannot_starve_the_waiter() {
         .unwrap();
     assert!(outcome.is_ok(), "B should eventually be served, got {outcome:?}");
 
-    stop.notify_waiters();
+    stop.store(true, Ordering::SeqCst);
     let served = stream.await.unwrap();
     assert!(served > 0, "the A stream should have been served too, not blocked outright");
     assert!(device.stopped("A"), "the swap should have evicted A once it drained");
@@ -215,6 +220,9 @@ async fn the_wait_is_bounded_by_queue_timeout() {
         Err(PoolError::Backpressure(_)) => {}
         Ok(_) => panic!("expected Backpressure once the wait exceeded queue_timeout"),
         Err(PoolError::Device(msg)) => panic!("expected Backpressure, got Device({msg})"),
+        // `Gate::enter` must convert this internally; leaking it would 503 with no
+        // Retry-After budget and hide a missed conversion (#39).
+        Err(PoolError::SwapBlocked) => panic!("SwapBlocked escaped Gate::enter"),
     }
     let waited = started.elapsed();
 
@@ -236,7 +244,7 @@ async fn the_swap_never_evicts_a_model_that_is_still_serving() {
     let held = gate.enter("A").await.expect("A is resident");
 
     let gb = gate.clone();
-    let waiter = tokio::spawn(async move { gb.enter("B").await.map(|s| drop(s)) });
+    let waiter = tokio::spawn(async move { gb.enter("B").await.map(drop) });
 
     for _ in 0..20 {
         assert!(
