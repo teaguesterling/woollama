@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.15.0 — 2026-08-18
+
+**CPython 3.14 is supported.** `woollama` 0.15.0 + `woollama-core` 0.9.0; `woollama-server`
+(0.14.2) and `woollama-engine` (0.12.0) are unchanged.
+
 ### Features
 
 - **CPython 3.14 is supported.** pyo3 0.23 refused to build against any interpreter newer than
