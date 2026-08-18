@@ -442,3 +442,200 @@ async fn a_declared_embedder_is_refused_on_chat_and_annotated_in_v1_models() {
     let chat = entries.iter().find(|m| m["id"] == "dev/Qwen/Chat-7B").expect("chat model listed");
     assert!(chat.get("capabilities").is_none(), "undeclared means absent, never 'cannot': {chat}");
 }
+
+/// `/v1/models` must answer "which model will respond right now", not just "which exist".
+///
+/// Reported by a caller who was blocked on exactly this: `/v1/models` listed a model, the request
+/// 503'd with "not loaded", and there was no way to tell the two states apart except by sending a
+/// request that may fail after a thirty-second load.
+#[tokio::test]
+async fn v1_models_reports_what_is_actually_loaded() {
+    let router = Router::new()
+        .route(
+            "/api/v1/models/running",
+            // Resident: one DECLARED model, and one the operator never listed.
+            get(|| async {
+                Json(json!({"running": ["Declared/Up", "Surprise/AlsoUp"],
+                            "instances": {"running": []}}))
+            }),
+        )
+        .route("/v1/chat/completions", post(|| async { Json(json!({"choices": []})) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!(
+            "[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n\
+             models=[\"Declared/Up\",\"Declared/Down\"]\n\
+             [inferencers.plain]\nbase_url=\"{url}/v1\"\nmodels=[\"Plain/Model\"]\n"
+        ),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+
+    let body: Value = reqwest::get(format!("http://{raddr}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let find = |id: &str| {
+        body["data"].as_array().unwrap().iter().find(|m| m["id"] == id).cloned()
+    };
+
+    // Declared AND resident -> loaded true. Declared but not resident -> loaded false. That
+    // distinction is the whole point; before it, both looked identical.
+    assert_eq!(find("dev/Declared/Up").expect("listed")["loaded"], json!(true));
+    assert_eq!(find("dev/Declared/Down").expect("listed")["loaded"], json!(false));
+
+    // Resident but never declared: still routable, still the thing that will answer, so it is
+    // listed — flagged, because the operator did not promise it.
+    let surprise = find("dev/Surprise/AlsoUp").expect("a resident model must be discoverable");
+    assert_eq!(surprise["loaded"], json!(true));
+    assert_eq!(surprise["undeclared"], json!(true));
+
+    // An inferencer with NO pool cannot know, so it says nothing. Absent must not read as "no".
+    let plain = find("plain/Plain/Model").expect("listed");
+    assert!(plain.get("loaded").is_none(), "unknown must not be reported as not-loaded: {plain}");
+}
+
+/// Issue #38: the pool must recover when a model is unloaded underneath it.
+///
+/// Reported from hardware: certain requests crashed a model instance, and every subsequent request
+/// then returned "…is not loaded" INDEFINITELY. `ensure_loaded` short-circuits on its own belief
+/// before consulting the backend, so once that belief went stale it stayed stale for the life of
+/// the process. A 20-item batch lost items 15–20 to it.
+///
+/// The fix asks the backend rather than parsing its error: whether a given message means
+/// "unloaded" is vendor wording, but whether the model is running is a question the backend can
+/// answer directly. This test drives that end to end — the device drops the model AND fails the
+/// call, and the NEXT request must succeed.
+#[tokio::test]
+async fn a_model_dropped_underneath_the_pool_is_reloaded_on_the_next_request() {
+    #[derive(Clone)]
+    struct Dev {
+        resident: Arc<Mutex<Vec<String>>>,
+        /// Fail the next chat call and drop the model, simulating a crash that unloads it.
+        crash_next: Arc<Mutex<bool>>,
+        starts: Arc<Mutex<usize>>,
+    }
+    let dev = Dev {
+        resident: Arc::new(Mutex::new(vec!["M".to_string()])),
+        crash_next: Arc::new(Mutex::new(true)),
+        starts: Arc::new(Mutex::new(0)),
+    };
+
+    let d = dev.clone();
+    let router = Router::new()
+        .route(
+            "/api/v1/models/running",
+            get({
+                let d = d.clone();
+                move || {
+                    let d = d.clone();
+                    async move { Json(json!({"running": *d.resident.lock().unwrap()})) }
+                }
+            }),
+        )
+        .route(
+            "/api/v1/models/{id}/start",
+            post({
+                let d = d.clone();
+                move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let d = d.clone();
+                    async move {
+                        *d.starts.lock().unwrap() += 1;
+                        d.resident.lock().unwrap().push(id);
+                        Json(json!({"ok": true}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post({
+                let d = d.clone();
+                move || {
+                    let d = d.clone();
+                    async move {
+                        let mut crash = d.crash_next.lock().unwrap();
+                        if *crash {
+                            *crash = false;
+                            // The crash. CRITICALLY, the model stays in the running list — real
+                            // hardware keeps reporting a crashed instance as `running` (with a
+                            // stale in-flight count) for 2-5s until reaping catches up. An earlier
+                            // fixture cleared it immediately, which made a reconcile-based fix
+                            // look correct when on real hardware it would have done nothing.
+                            return (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                Json(json!({"error": {"message": "Upstream model server request failed"}})),
+                            );
+                        }
+                        (axum::http::StatusCode::OK,
+                         Json(json!({"choices": [{"message": {"role": "assistant", "content": "ok"}}]})))
+                    }
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let url = format!("http://{addr}");
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!("[inferencers.dev]\nbase_url=\"{url}/v1\"\nmanagement_url=\"{url}\"\n"),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+    let c = reqwest::Client::new();
+    let call = || {
+        c.post(format!("http://{raddr}/v1/chat/completions"))
+            .json(&json!({"model": "dev/M", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+    };
+
+    // First call crashes the instance and unloads the model. The failure itself is expected.
+    let r = call().await.unwrap();
+    assert!(r.status().is_server_error(), "the crash is relayed, got {}", r.status());
+
+    // THE POINT: the next call must succeed. Before the fix this returned the same failure
+    // forever, because the pool still believed the model was resident and never asked again.
+    let r = call().await.unwrap();
+    let status = r.status();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(status, 200, "the pool must recover, not fail identically forever: {body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+    assert!(
+        *dev.starts.lock().unwrap() >= 1,
+        "the model must actually have been RELOADED — recovery cannot come from trusting the \
+         backend's list, which still contains the dead instance at this point"
+    );
+}

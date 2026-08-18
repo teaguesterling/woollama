@@ -550,6 +550,55 @@ Precedence: **config beats discovery beats unknown**, and *unknown always means 
 backend that publishes nothing and has no declarations behaves exactly as it did before, and an
 operator correcting a backend has the last word.
 
+#### Knowing which model will actually answer
+
+`GET /v1/models` is a catalogue: it lists what an inferencer declares plus whatever discovery
+found. For a **management-capable** inferencer it also reports what is *resident right now*, so a
+caller can tell "this model exists" from "this model will answer" without sending a request that
+may `503` after a thirty-second load:
+
+```json
+{"id": "device/Qwen3-30B-Instruct", "object": "model", "owned_by": "device", "loaded": true}
+{"id": "device/Qwen3-Coder-30B",    "object": "model", "owned_by": "device", "loaded": false}
+{"id": "device/GLM-4.7-Flash",      "object": "model", "owned_by": "device",
+ "loaded": true, "undeclared": true}
+```
+
+- **`loaded`** answers *"is this model in memory"* — which is **necessary but not sufficient** for
+  *"will this call succeed"*. Do not build a pre-flight check on it alone. On real hardware the two
+  differ in at least three ways: a resident model may not be **servable on the endpoint you called**
+  (an embedding model on the chat path — see capabilities above), may **crash on certain inputs**,
+  and may be **evicted by another consumer** between your check and your call. Treat it as "worth
+  trying" rather than "will work".
+
+  There is also a window where `loaded` is **affirmatively wrong** rather than merely incomplete:
+  after an instance crash a backend may keep reporting the model as running — measured at 2–5
+  seconds on one device, with a stale in-flight count alongside it — so `loaded: true` can describe
+  a model that is already gone. That window is exactly when someone is most likely to be reading
+  this field and drawing conclusions from it.
+- `loaded` appears only for inferencers that declare a `management_url`. An inferencer with no pool
+  cannot know, and **absent never means "no"**.
+- A model that is resident but **not** in the inferencer's `models` list is still routable as
+  `<provider>/<id>`, and it is the one that will answer — so it is listed, flagged `undeclared`
+  because the operator did not promise it.
+- If the residency read itself fails, `loaded` is omitted rather than reported as `false`: not
+  seeing is not the same as not loaded.
+
+The read shares the same coalescing window `<provider>/default` uses, so listing models does not
+add a backend round trip per request.
+
+#### Recovering from a model that disappears
+
+A backend can drop a model woollama believes it is running — an instance crash, an eviction by
+another consumer. On an upstream `5xx`, woollama re-checks what the backend is actually running and
+stops believing in anything that has gone; the next request loads it again, and the drop is logged
+naming the model.
+
+This asks the backend rather than interpreting its error. Whether a particular message means
+"unloaded" is vendor wording; whether a model is running is a question the backend can answer.
+
+Recovery happens on the **next** request — the one that hit the failure still fails.
+
 #### woollama is not the device's only consumer
 
 Pool state is a **cache of the backend's state, not a ledger of it**. The vendor's own UI may load

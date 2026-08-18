@@ -22,6 +22,24 @@
 - Precedence is **config → discovery → unknown**, and unknown is always eligible, so a backend
   that publishes nothing and has no declarations behaves exactly as before.
 
+### `/v1/models` says which model will actually answer
+
+- For a **management-capable** inferencer, each entry carries **`loaded`** — read through to the
+  backend, sharing the coalescing window `<provider>/default` uses, so listing costs no extra round
+  trip. Previously `/v1/models` was a catalogue with no readiness signal: it listed a model the
+  backend was not running, and the only way to find out was a request that could `503` after a
+  thirty-second load.
+- A model that is **resident but undeclared** is listed too, flagged `undeclared`. It is routable
+  and it is the one that will answer; omitting it hid the answer from a caller willing to use
+  whatever is up.
+- `loaded` is **omitted**, never `false`, for an inferencer with no pool or when the residency read
+  fails. Not seeing is not the same as not loaded.
+- **`loaded` is necessary, not sufficient.** It answers "is this in memory", not "will this call
+  succeed" — a resident model may be unservable on the endpoint called, may crash on certain
+  inputs, or may be evicted by another consumer between the check and the call. Documented on the
+  field itself, so the next caller does not build a pre-flight check on it and get surprised the
+  way a caller treating `/v1/models` as a readiness signal was.
+
 ### Config variables (#21)
 
 - **`${VAR:-default}`** — POSIX `:-` semantics (unset *or* empty takes the fallback), in **both**
@@ -40,6 +58,19 @@
   `mcp.json` and `inferencers.toml`.
 
 ### Fixes
+
+- **The pool recovers when a model is unloaded underneath it (#38).** `ensure_loaded` short-circuits
+  on its own belief before consulting the backend, so once that belief went stale — a crash that
+  killed a model instance, an eviction by another consumer — *every* subsequent request for that
+  model failed identically, forever. A 20-item batch lost six items to it, reporting nothing but
+  per-item errors. Now an upstream `5xx` triggers a residency re-check, and a model the backend is
+  no longer running stops being believed resident, so the next request reloads it. Deliberately
+  **asks the backend rather than parsing its error**: whether a message means "unloaded" is vendor
+  wording — but nor does it reconcile against the backend, because measurement showed the backend
+  keeps reporting a crashed model as running for 2–5s while reaping catches up. A reconcile fired
+  on the failure reads "all fine" and does nothing: the stale belief is the *backend's*, and reading
+  through to the authority cannot help when the authority has not noticed. The failing model is
+  marked for reload directly and the next request loads it unconditionally.
 
 - **`default` no longer blames a config that is fine.** The fail-open warning fired whenever the
   candidate set came back empty, including when the residency read itself *failed* — telling an
@@ -95,7 +126,20 @@ plus two fixes that came out of running them against real hardware. The
 - `parallel` documentation now claims the true thing — woollama sends at most N; the
   device may still receive more from other consumers.
 
-### Fixes found by running the above against real hardware
+### Fixes
+
+- **The pool recovers when a model is unloaded underneath it (#38).** `ensure_loaded` short-circuits
+  on its own belief before consulting the backend, so once that belief went stale — a crash that
+  killed a model instance, an eviction by another consumer — *every* subsequent request for that
+  model failed identically, forever. A 20-item batch lost six items to it, reporting nothing but
+  per-item errors. Now an upstream `5xx` triggers a residency re-check, and a model the backend is
+  no longer running stops being believed resident, so the next request reloads it. Deliberately
+  **asks the backend rather than parsing its error**: whether a message means "unloaded" is vendor
+  wording — but nor does it reconcile against the backend, because measurement showed the backend
+  keeps reporting a crashed model as running for 2–5s while reaping catches up. A reconcile fired
+  on the failure reads "all fine" and does nothing: the stale belief is the *backend's*, and reading
+  through to the authority cannot help when the authority has not noticed. The failing model is
+  marked for reload directly and the next request loads it unconditionally. found by running the above against real hardware
 
 - **BUGFIX — `<provider>/default` was nondeterministic across restarts.**
   `reconcile` stamped every newly-discovered resident with the same `last_used`, so

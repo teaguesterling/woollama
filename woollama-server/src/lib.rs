@@ -774,6 +774,25 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
             }
         }
         let caps = state.capabilities.get(&inf.name).cloned().unwrap_or_default();
+        // What is RESIDENT right now, for a management-capable inferencer. `/v1/models` is
+        // otherwise a catalogue rather than a readiness signal: it lists a model the backend is
+        // not running, so a caller cannot tell "this exists" from "this will answer" except by
+        // sending a request that may 503 after a thirty-second load. Reported by a caller who hit
+        // exactly that.
+        //
+        // Read through to the backend, sharing the same coalescing window `default` resolution
+        // uses — so listing models does not add a device round trip per request. An inferencer
+        // with no pool contributes nothing here and its entries carry no `loaded` field at all,
+        // because "unknown" must not be reported as "no".
+        let residency: Option<std::collections::HashSet<String>> = match state.pools.get(&inf.name) {
+            Some((manager, _)) => {
+                let r = manager.residency().await;
+                // A failed read means we could not see, NOT that nothing is loaded — saying "no"
+                // there would be the same conflation `Residency::current` exists to prevent.
+                r.current.then(|| r.models.into_iter().collect())
+            }
+            None => None,
+        };
         for id in ids {
             if seen.insert(id.clone()) {
                 let mut entry =
@@ -789,7 +808,35 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
                 if !declared.is_empty() {
                     entry["capabilities"] = json!(declared);
                 }
+                if let Some(resident) = &residency {
+                    // NECESSARY, NOT SUFFICIENT. This says the model is in memory, not that a
+                    // call will succeed: a resident model may be unservable on the endpoint
+                    // called, may crash on certain inputs, or may be evicted by another consumer
+                    // between this read and the request. Callers that treat it as a pre-flight
+                    // guarantee will be surprised the same way a caller treating `/v1/models` as
+                    // a readiness signal was — which is why this field exists.
+                    entry["loaded"] = json!(resident.contains(&id));
+                }
                 data.push(entry);
+            }
+        }
+        // A model the backend is RUNNING but the operator never declared is still routable as
+        // `<provider>/<id>`, and it is the one that will answer right now. Omitting it hides the
+        // answer to the question this endpoint is being asked — "which model will respond?" —
+        // from a caller who is willing to use whatever is up.
+        if let Some(resident) = &residency {
+            let mut extra: Vec<&String> = resident.iter().filter(|id| !seen.contains(*id)).collect();
+            extra.sort();
+            for id in extra {
+                data.push(json!({
+                    "id": format!("{}/{id}", inf.name),
+                    "object": "model",
+                    "owned_by": inf.name,
+                    "loaded": true,
+                    // Flagged so a caller can tell a declared catalogue entry from something that
+                    // merely happens to be up — the operator did not promise this one.
+                    "undeclared": true,
+                }));
             }
         }
     }
@@ -1458,6 +1505,12 @@ async fn passthrough_pooled(
             Err(e) => return e,
         };
         if resp.status().as_u16() >= 400 {
+            // The backend just refused. Re-check what it is actually running so a model that was
+            // dropped from under us stops being believed resident — otherwise `ensure_loaded`
+            // short-circuits on that belief and EVERY later request fails the same way (#38).
+            if resp.status().as_u16() >= 500 {
+                manager.mark_needs_reload(&real);
+            }
             return relay_json(resp).await;
         }
         // Hold `slot` for the lifetime of the stream body: it moves into the
@@ -1476,7 +1529,15 @@ async fn passthrough_pooled(
 
     fwd["stream"] = json!(false);
     let result = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
-        Ok(resp) => relay_json(resp).await,
+        Ok(resp) => {
+            // See the streaming branch: a 5xx may mean the model went away underneath us.
+            let server_error = resp.status().as_u16() >= 500;
+            let relayed = relay_json(resp).await;
+            if server_error {
+                manager.mark_needs_reload(&real);
+            }
+            relayed
+        }
         Err(e) => e,
     };
     // `slot` drops here (end of scope), after the dispatch has completed.
