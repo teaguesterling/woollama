@@ -57,9 +57,18 @@ still fail there. v0.14.4 supersedes it.
 
 ### Known gaps
 
-- No wheels for Python 3.14: pyo3 0.23 refuses to build against interpreters newer than 3.13, and
-  abi3 is unavailable here (`InferenceError` subclasses `PyException`). 3.14 users can now install
-  from source with a Rust toolchain; native wheels need a pyo3 0.23 → 0.29 upgrade.
+- **Python 3.14 is still unsupported, wheels or source.** An earlier draft of this entry claimed
+  3.14 users could now install from source; that was wrong, and installing `woollama==0.14.4`
+  under 3.14.6 disproves it. The failure has *moved* — metadata generation now succeeds and the
+  build gets as far as compiling — but `pyo3-ffi` then refuses: `the configured Python interpreter
+  version (3.14) is newer than PyO3's maximum supported version (3.13)`. A working sdist cannot
+  help when the code in it will not compile. 3.14 needs the pyo3 0.23 → 0.29 upgrade in #43, and
+  nothing short of it; abi3 can't sidestep this either, since `InferenceError` subclasses
+  `PyException`.
+
+  What the sdist fix does buy: every *other* environment we don't ship a wheel for — uncommon
+  architectures, non-glibc/musl targets, distro packaging, and `--no-binary` install policies —
+  can now build from source on 3.11–3.13, which was impossible in every previous release.
 
 ## v0.14.2 — 2026-08-17
 
