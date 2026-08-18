@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixes
+
+- **`woollamad --help` no longer severs a running daemon's MCP transport.** `--version`, `-V`,
+  `--help` and `-h` fell through to starting a full daemon, which overwrote the live daemon's
+  discovery address file with its own ephemeral port and then, on exit, unlinked a socket it had
+  explicitly **declined** to create. The healthy daemon was left bound to an orphaned inode: `ss`
+  showed it listening, `ls` showed no file, path-based clients got `ECONNREFUSED`, and it reported
+  healthy and logged nothing. Now they print and exit before anything reads config or touches the
+  runtime directory.
+- **A second daemon sharing a runtime directory refuses to start**, rather than degrading to
+  TCP-only and clobbering the first's discovery address. Checked before binding anything, because
+  the TCP bind is what writes that file. Sharing a runtime dir is a misconfiguration, and degrading
+  there damages someone else rather than yourself.
+- **A socket is only unlinked by the process that created it.** The guard existed at bind and not
+  at cleanup, which is how a probe that correctly refused to steal the socket still deleted it.
+
+
 ## v0.14.1 — 2026-08-17
 
 **Release fix — v0.14.0 reached PyPI but not crates.io.** `woollama-engine` gained public API in
