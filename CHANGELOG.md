@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.14.0 — 2026-08-17
+
+**Routing learns what a backend can do and what it is actually running, and the config
+contract stops failing silently.** Every headline change here was found, reproduced, or
+corrected against real hardware rather than a fixture. The `woollama-server` crate and the
+`woollama` PyPI package move to 0.14.0; `woollama-engine` (0.11.0) and `woollama-core`
+(0.8.0) are unchanged.
+
 ### Capability-aware routing (#20)
 
 - **`<provider>/default` picks a model that can serve the endpoint.** `default` is never asked in
