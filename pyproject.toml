@@ -1,6 +1,6 @@
 [project]
 name = "woollama"
-version = "0.14.4"
+version = "0.15.0"
 description = "Web Over Ollama (and Llamas) — an MCP + OpenAI router for AI desktops."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -26,14 +26,14 @@ dependencies = [
     "mcp>=1.0,<1.30",        # cap: mcp>=1.30 renamed McpError->MCPError, breaking fastmcp-slim 3.4.x (CI green)
     # The Rust engine: provides `woollama.core` (complete*/orchestrate*/ModelRegistry).
     # `woollama` is a PEP 420 namespace shared between this dist and woollama-core.
-    # Floored at 0.8.2 — the first version that ships a usable sdist at all (#41). Everything
-    # at or below 0.8.0 has an sdist that cannot build, and 0.8.1 has no sdist whatsoever (PyPI
-    # rejected it after the wheels had already uploaded). Those releases are on PyPI forever, so
-    # without this floor a resolver that backtracks onto one either dies in metadata generation
-    # complaining about `python-source`, or reports no compatible distribution — neither of which
-    # mentions anything of ours. Below the floor, wheel-covered CPythons work and everyone else
-    # fails confusingly; at or above it, source installs work everywhere.
-    "woollama-core>=0.8.2",
+    # Floored at 0.9.0 — the first version that builds on CPython 3.14 (pyo3 0.29, #43), and
+    # the floor doubles as the sdist floor from #41. The history below it is all sharp edges
+    # that stay on PyPI forever: <=0.8.0 ships an sdist that cannot build at all, 0.8.1 has no
+    # sdist whatsoever (PyPI rejected it after its wheels had uploaded), and 0.8.2 builds only
+    # up to 3.13. A resolver that backtracks past this floor fails with an error about
+    # `python-source`, or about pyo3's maximum supported version, or with no candidate at all —
+    # none of which mentions anything of ours.
+    "woollama-core>=0.9.0",
 ]
 
 [project.optional-dependencies]

@@ -62,7 +62,7 @@ impl InferenceError {
 
 /// Convert a pure-engine `EngineError` into the raised `InferenceError` pyclass.
 fn engine_err(e: EngineError) -> PyErr {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let payload_py = e
             .payload
             .and_then(|p| pythonize::pythonize(py, &p).ok())
@@ -80,7 +80,7 @@ fn engine_err(e: EngineError) -> PyErr {
 // --- Python <-> serde helpers -------------------------------------------------
 
 fn pyval(v: &Value) -> PyResult<Py<PyAny>> {
-    Python::with_gil(|py| Ok(pythonize::pythonize(py, v)?.unbind()))
+    Python::attach(|py| Ok(pythonize::pythonize(py, v)?.unbind()))
 }
 
 fn depy(v: &Option<Bound<'_, PyAny>>) -> PyResult<Option<Value>> {
@@ -90,7 +90,7 @@ fn depy(v: &Option<Bound<'_, PyAny>>) -> PyResult<Option<Value>> {
 /// `"{TypeName}: {message}"` for a caught Python error — matches the Python loop's
 /// `f"{type(e).__name__}: {e}"` when a dispatch raises (orchestrate.py:141).
 fn pyerr_brief(e: &PyErr) -> String {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         let tn = e
             .get_type(py)
             .name()
@@ -156,7 +156,7 @@ struct PyToolProvider {
 #[async_trait::async_trait]
 impl ToolProvider for PyToolProvider {
     fn tool_schemas(&self, allow: &[String]) -> Result<Vec<Value>, EngineError> {
-        Python::with_gil(|py| -> PyResult<Vec<Value>> {
+        Python::attach(|py| -> PyResult<Vec<Value>> {
             let allow_list = pyo3::types::PyList::new(py, allow)?;
             let specs = self.obj.bind(py).call_method1("tools_for", (allow_list,))?;
             let mut schemas: Vec<Value> = Vec::new();
@@ -169,7 +169,7 @@ impl ToolProvider for PyToolProvider {
     }
 
     async fn dispatch(&self, name: &str, args: &Value) -> (String, bool) {
-        let built = Python::with_gil(|py| -> PyResult<_> {
+        let built = Python::attach(|py| -> PyResult<_> {
             let args_py = pythonize::pythonize(py, args)?;
             let awaitable = self.obj.bind(py).call_method1("dispatch", (name, args_py))?;
             pyo3_async_runtimes::tokio::into_future(awaitable)
@@ -180,7 +180,7 @@ impl ToolProvider for PyToolProvider {
         };
         match fut.await {
             Err(e) => (format!("ERROR: {}", pyerr_brief(&e)), false),
-            Ok(tr) => match Python::with_gil(|py| render_tool_result_rs(tr.bind(py))) {
+            Ok(tr) => match Python::attach(|py| render_tool_result_rs(tr.bind(py))) {
                 Ok((body, is_error)) => (body, !is_error),
                 Err(e) => (format!("ERROR: {}", pyerr_brief(&e)), false),
             },
@@ -278,7 +278,7 @@ fn complete_sync(
     let msgs: Value = pythonize::depythonize(&messages)?;
     let req = engine::build_request(&model, msgs, depy(&options)?, depy(&params)?, api_key.as_deref(), base_url, false)
         .map_err(engine_err)?;
-    py.allow_threads(move || engine::run_complete_blocking(req)).map_err(engine_err)
+    py.detach(move || engine::run_complete_blocking(req)).map_err(engine_err)
 }
 
 /// The built-in provider names (parity with `inferencers.names()`).
@@ -339,7 +339,7 @@ fn orchestrate<'py>(
         while let Some(item) = s.next().await {
             match item {
                 Ok(Event::Final(resp)) => {
-                    return Python::with_gil(|py| Ok(pythonize::pythonize(py, &resp)?.unbind()))
+                    return Python::attach(|py| Ok(pythonize::pythonize(py, &resp)?.unbind()))
                 }
                 Ok(_) => continue,
                 Err(e) => return Err(engine_err(e)),
