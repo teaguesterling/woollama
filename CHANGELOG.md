@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.14.2 — 2026-08-17
+
+**A probe no longer severs a running daemon's transports.** No functional change otherwise;
+`woollama-engine` (0.12.0) and `woollama-core` (0.8.0) are unchanged.
+
 ### Fixes
 
 - **`woollamad --help` no longer severs a running daemon's MCP transport.** `--version`, `-V`,
