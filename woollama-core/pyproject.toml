@@ -4,10 +4,19 @@ build-backend = "maturin"
 
 [project]
 name = "woollama-core"
-version = "0.8.1"
+version = "0.8.2"
 description = "The embeddable woollama model-management core (Rust) — start of the v1.0 port."
 requires-python = ">=3.11"
-license = { text = "AGPL-3.0-or-later" }
+# PEP 639 form, and the explicit `license-files` is required rather than stylistic. With the
+# older `license = { text = ... }`, maturin still emitted `License-File: LICENSE` in PKG-INFO
+# but — same workspace-member hoisting bug as `python-source` above — packaged the file at
+# `<sdist>/woollama-core/LICENSE` while the metadata names `<sdist>/LICENSE`. PyPI validates
+# that path and rejected the 0.8.1 sdist with a 400 after all 21 wheels had already uploaded.
+# Declaring `license-files` explicitly makes maturin place LICENSE at the sdist root, so the
+# claim is true. Note `twine check` PASSES the broken artifact — this is upload-time-only
+# validation, which is why the check in wheels.yml verifies the path itself.
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
