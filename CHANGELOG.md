@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v0.14.1 — 2026-08-17
+
+**Release fix — v0.14.0 reached PyPI but not crates.io.** `woollama-engine` gained public API in
+this cycle (`missing_vars*`, `expand_env_with`) and was not bumped, so `cargo publish -p
+woollama-server` resolved the *published* 0.11.0 and failed to compile. A path dependency hides
+this locally: only publish resolves by version.
+
+- `woollama-engine` → **0.12.0**, with its pins in `woollama-server` and `woollama-core` updated.
+- A CI **publish dry-run** gate is written and verified but **not yet applied** — modifying
+  `.github/workflows/` needs a token scope this session does not have. The patch is prepared: the
+  server dry-run runs only when the pinned engine version is already on crates.io — precisely the
+  forgot-to-bump case — so missing API becomes a compile error in CI rather than a failed release.
+  Until it lands, this class of mistake is still only caught at publish time.
+
+No functional change from v0.14.0; the crates.io line starts here.
+
 ## v0.14.0 — 2026-08-17
 
 **Routing learns what a backend can do and what it is actually running, and the config
