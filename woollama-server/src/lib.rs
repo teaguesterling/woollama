@@ -809,6 +809,12 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
                     entry["capabilities"] = json!(declared);
                 }
                 if let Some(resident) = &residency {
+                    // NECESSARY, NOT SUFFICIENT. This says the model is in memory, not that a
+                    // call will succeed: a resident model may be unservable on the endpoint
+                    // called, may crash on certain inputs, or may be evicted by another consumer
+                    // between this read and the request. Callers that treat it as a pre-flight
+                    // guarantee will be surprised the same way a caller treating `/v1/models` as
+                    // a readiness signal was — which is why this field exists.
                     entry["loaded"] = json!(resident.contains(&id));
                 }
                 data.push(entry);

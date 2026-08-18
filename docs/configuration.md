@@ -564,8 +564,14 @@ may `503` after a thirty-second load:
  "loaded": true, "undeclared": true}
 ```
 
-- **`loaded`** appears only for inferencers that declare a `management_url`. An inferencer with no
-  pool cannot know, and **absent never means "no"**.
+- **`loaded`** answers *"is this model in memory"* — which is **necessary but not sufficient** for
+  *"will this call succeed"*. Do not build a pre-flight check on it alone. On real hardware the two
+  differ in at least three ways: a resident model may not be **servable on the endpoint you called**
+  (an embedding model on the chat path — see capabilities above), may **crash on certain inputs**,
+  and may be **evicted by another consumer** between your check and your call. Treat it as "worth
+  trying" rather than "will work".
+- `loaded` appears only for inferencers that declare a `management_url`. An inferencer with no pool
+  cannot know, and **absent never means "no"**.
 - A model that is resident but **not** in the inferencer's `models` list is still routable as
   `<provider>/<id>`, and it is the one that will answer — so it is listed, flagged `undeclared`
   because the operator did not promise it.

@@ -34,6 +34,11 @@
   whatever is up.
 - `loaded` is **omitted**, never `false`, for an inferencer with no pool or when the residency read
   fails. Not seeing is not the same as not loaded.
+- **`loaded` is necessary, not sufficient.** It answers "is this in memory", not "will this call
+  succeed" — a resident model may be unservable on the endpoint called, may crash on certain
+  inputs, or may be evicted by another consumer between the check and the call. Documented on the
+  field itself, so the next caller does not build a pre-flight check on it and get surprised the
+  way a caller treating `/v1/models` as a readiness signal was.
 
 ### Config variables (#21)
 
