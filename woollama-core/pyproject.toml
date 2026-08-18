@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "woollama-core"
-version = "0.8.0"
+version = "0.8.1"
 description = "The embeddable woollama model-management core (Rust) — start of the v1.0 port."
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
@@ -25,6 +25,20 @@ module-name = "woollama.core"
 # it → `woollama/core.*.so`, so `from woollama.core import complete` resolves to the
 # Rust ext directly (and `woollama` stays a shared namespace the server can also populate).
 python-source = "python"
+# REQUIRED, and load-bearing in a way that is easy to delete by accident.
+#
+# `python/woollama/` is an intentionally empty PEP 420 namespace directory whose only
+# tracked file is `.gitkeep`. maturin ships `.gitkeep` in WHEELS but filters it out of
+# SDISTS — so the directory came out empty, an empty directory is not archived, and the
+# published sdist had no `python/` at all. Every source build then died on
+#   `python-source is set to 'python' but the directory does not exist`
+# which is how `pip install woollama` broke for anyone without a prebuilt wheel (#41).
+#
+# Naming the file explicitly is what forces it into the sdist. Do not "simplify" this by
+# dropping `python-source`: without it maturin emits `core/core.so` (import path
+# `core.core`), silently breaking `from woollama.core import complete`. Verified both ways.
+# The sdist-installs test in wheels.yml is what keeps this honest.
+include = [{ path = "python/woollama/.gitkeep", format = "sdist" }]
 strip = true
 
 [tool.pytest.ini_options]

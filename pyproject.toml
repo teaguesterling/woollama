@@ -1,6 +1,6 @@
 [project]
 name = "woollama"
-version = "0.14.2"
+version = "0.14.3"
 description = "Web Over Ollama (and Llamas) — an MCP + OpenAI router for AI desktops."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -26,7 +26,10 @@ dependencies = [
     "mcp>=1.0,<1.30",        # cap: mcp>=1.30 renamed McpError->MCPError, breaking fastmcp-slim 3.4.x (CI green)
     # The Rust engine: provides `woollama.core` (complete*/orchestrate*/ModelRegistry).
     # `woollama` is a PEP 420 namespace shared between this dist and woollama-core.
-    "woollama-core",
+    # Floored at 0.8.1: every woollama-core sdist at or below 0.8.0 is unbuildable (#41) and
+    # is still on PyPI, so a resolver that backtracks onto one fails during metadata
+    # generation with an error about `python-source` that says nothing about us.
+    "woollama-core>=0.8.1",
 ]
 
 [project.optional-dependencies]

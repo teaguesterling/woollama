@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixes
+
+- **The `woollama-core` sdist could not be built, in any release, on any Python.** maturin ships
+  `.gitkeep` in wheels but filters it out of sdists, and `.gitkeep` was the only tracked file in
+  `python/woollama/` — the empty PEP 420 namespace directory `python-source` points at. The
+  directory came out empty, empty directories are not archived, and every source build died in
+  metadata generation with `python-source is set to 'python' but the directory does not exist`.
+  Prebuilt wheels covered every supported CPython, so nothing ever exercised the path. Python
+  3.14 — for which pyo3 0.23 cannot build wheels — removed that cover and made `pip install
+  woollama` fail outright. `woollama-core` 0.8.1 ships the file explicitly; `woollama` now
+  requires `woollama-core>=0.8.1`, since the broken sdists remain on PyPI forever. (#41)
+  Verified by installing the fixed sdist from source with `--no-binary :all:` and importing
+  `woollama.core`, and by confirming the 0.8.0 sdist still fails that same check.
+
+### Not yet gated
+
+- The regression gate for the above — build the sdist, install it with `--no-binary :all:`,
+  import `woollama.core`, and block the PyPI publish unless it passes — is written and verified
+  but **not applied**: pushing `.github/workflows/` needs a token with `workflow` scope. Until
+  it lands, "the sdist works" is a fact about this release, not a property CI enforces. That is
+  precisely the gap that let this ship broken in every prior version.
+
+### Known gaps
+
+- No wheels for Python 3.14: pyo3 0.23 refuses to build against interpreters newer than 3.13, and
+  abi3 is unavailable here (`InferenceError` subclasses `PyException`). 3.14 users can now install
+  from source with a Rust toolchain; native wheels need a pyo3 0.23 → 0.29 upgrade.
+
 ## v0.14.2 — 2026-08-17
 
 **A probe no longer severs a running daemon's transports.** No functional change otherwise;
