@@ -2,10 +2,36 @@
 
 ## Unreleased
 
+## v0.14.4 — 2026-08-17
+
+**Completes v0.14.3, which published only half of what it intended.** `woollama` 0.14.4 +
+`woollama-core` 0.8.2. Use this rather than v0.14.3.
+
+### Fixes
+
+- **PyPI rejected the `woollama-core` 0.8.1 sdist, after the wheels had already uploaded.** The
+  same maturin workspace-member hoisting bug behind #41, in a second place: PKG-INFO declared
+  `License-File: LICENSE` — a path relative to the sdist root — while the file was packaged at
+  `<sdist>/woollama-core/LICENSE`. PyPI validates that path and returned a 400. Because wheels
+  upload before the sdist, 0.8.1 exists on PyPI as 21 wheels with **no sdist at all**, so the
+  v0.14.3 fix never reached the people it was for: anyone without a prebuilt wheel. Declaring
+  `license-files = ["LICENSE"]` explicitly (PEP 639) makes maturin place the file at the sdist
+  root, so the metadata is true. `woollama` now floors on `woollama-core>=0.8.2` — 0.8.1 is
+  unusable from source and 0.8.0 and earlier are unbuildable.
+- `twine check` does **not** catch this; it passes the artifact PyPI rejects. The check has to
+  confirm each declared `License-File` path exists, which is what the CI step below does.
+
+### Note on v0.14.3
+
+`woollama` 0.14.3 and the `woollama-core` 0.8.1 **wheels** are on PyPI and are fine on CPython
+3.11–3.13. Only the sdist is missing, so source installs — the entire point of that release —
+still fail there. v0.14.4 supersedes it.
+
 ## v0.14.3 — 2026-08-17
 
-**The `woollama-core` sdist is buildable for the first time.** `woollama` 0.14.3 + `woollama-core`
-0.8.1; `woollama-server` stays at 0.14.2 and `woollama-engine` at 0.12.0 (both unchanged).
+**Superseded by v0.14.4 — the sdist this release was about was rejected at upload.** `woollama`
+0.14.3 + `woollama-core` 0.8.1 (wheels only); `woollama-server` stays at 0.14.2 and
+`woollama-engine` at 0.12.0 (both unchanged).
 
 ### Fixes
 
