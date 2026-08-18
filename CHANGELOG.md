@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.14.3 — 2026-08-17
+
+**The `woollama-core` sdist is buildable for the first time.** `woollama` 0.14.3 + `woollama-core`
+0.8.1; `woollama-server` stays at 0.14.2 and `woollama-engine` at 0.12.0 (both unchanged).
+
 ### Fixes
 
 - **The `woollama-core` sdist could not be built, in any release, on any Python.** maturin ships
