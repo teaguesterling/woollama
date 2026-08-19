@@ -318,3 +318,40 @@ async fn queue_max_is_rechecked_after_a_fairness_hold() {
          queue_max has to be re-checked after the hold, not only before it"
     );
 }
+
+/// An abandoned request must not leak its place in the queue.
+///
+/// A client disconnecting drops the handler future mid-await. The old hand-written cleanup
+/// decremented on both `match` arms — every path the function can *return* by — but a dropped
+/// future takes none of them, so the count stayed raised forever. Eviction skips any model with
+/// a queued request, so that model could never be swapped out again.
+///
+/// Pre-existing (the enqueue/cleanup structure is unchanged by #39), but #39 makes the symptom
+/// far worse: instead of one model never being evicted, every later swap waits out
+/// `queue_timeout` and then 503s — indistinguishable from the bug #39 exists to fix.
+#[tokio::test]
+async fn an_abandoned_request_releases_its_place_in_the_queue() {
+    let device = FakeDevice::spawn(&["A"]).await;
+    let m = mgr(&device);
+    m.ensure_loaded("A", Some(2)).await.unwrap();
+    device.slow_start(500);
+    let gate = Arc::new(Gate::new(m.clone(), 1, None, 10.0, Some(2), 5.0));
+
+    let g = gate.clone();
+    let t = tokio::spawn(async move { g.enter("B").await.map(drop) });
+    // Let it enqueue and get into the slow load.
+    while m.queued("B") == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(m.queued("B"), 1, "B should be queued while loading");
+
+    t.abort();
+    let _ = t.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        m.queued("B"),
+        0,
+        "abandoned request leaked its queued count — B can now never be evicted"
+    );
+}

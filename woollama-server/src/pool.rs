@@ -1150,11 +1150,16 @@ impl Gate {
         // widened a documented bound (#39).
         self.reject_if_queue_full(real_id)?;
 
-        self.manager.enqueue(real_id);
-
-        // Python's `try/finally`: `dequeue` must run whether `ensure_loaded`/the
-        // semaphore acquire succeeds or fails. The `async` block plays the role of
-        // the `try` body; `dequeue` below plays `finally`.
+        // An RAII ticket, not a manual `finally`. The hand-written version below used to
+        // decrement on both match arms, which covers every path the function can *return* by —
+        // but not the path where the whole future is DROPPED mid-await, which is exactly what a
+        // client disconnect does. The count then stayed above zero forever, and since eviction
+        // skips any model with a queued request, that model could never be swapped out again.
+        //
+        // Pre-existing, but #39 turned it from "this model is never evicted" into "every future
+        // swap waits out `queue_timeout` and then 503s" — a permanent, silent capacity leak whose
+        // symptom is indistinguishable from the bug #39 set out to fix.
+        let ticket = QueueTicket::new(self.manager.clone(), real_id);
         let outcome: Result<OwnedSemaphorePermit, PoolError> = async {
             self.ensure_loaded_waiting_for_swap(real_id).await?;
             let sem = self.sem(real_id);
@@ -1177,13 +1182,11 @@ impl Gate {
         // branch (both sync).
         match outcome {
             Ok(permit) => {
-                self.manager.dequeue_acquire(real_id);
+                ticket.acquire();
                 Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
             }
-            Err(e) => {
-                self.manager.dequeue(real_id);
-                Err(e)
-            }
+            // `ticket` drops here and decrements, as it does on any abandoned path.
+            Err(e) => Err(e),
         }
     }
 
@@ -1256,6 +1259,40 @@ impl Gate {
                 Err(PoolError::SwapBlocked) => continue,
                 other => return other,
             }
+        }
+    }
+}
+
+/// A place in a model's queue, released on drop.
+///
+/// Exists so the queued count survives cancellation: a request abandoned mid-load — a client
+/// disconnecting is enough — must not leave the count raised, because a model with a queued
+/// request is never evicted and would pin a pool slot for the life of the process.
+struct QueueTicket {
+    manager: Arc<DeviceModelManager>,
+    real_id: String,
+    held: bool,
+}
+
+impl QueueTicket {
+    fn new(manager: Arc<DeviceModelManager>, real_id: &str) -> Self {
+        manager.enqueue(real_id);
+        QueueTicket { manager, real_id: real_id.to_string(), held: true }
+    }
+
+    /// Hand the place off to an in-flight slot. Consumes the ticket, so `Drop` cannot also
+    /// decrement. The handoff stays ATOMIC (`dequeue_acquire`, one critical section) — splitting
+    /// it lets a concurrent evictor see the model as idle mid-handoff and stop it.
+    fn acquire(mut self) {
+        self.manager.dequeue_acquire(&self.real_id);
+        self.held = false;
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        if self.held {
+            self.manager.dequeue(&self.real_id);
         }
     }
 }

@@ -27,6 +27,15 @@
   reservation clears; only the second check sees the depth that applies at enqueue time. Without
   it a burst would overshoot the configured limit, quietly widening a documented bound.
 
+- **An abandoned request no longer leaks its place in a model's queue.** A client disconnecting
+  drops the handler future mid-await; the cleanup decremented the queued count on both `match`
+  arms — every path the function can *return* by — but a dropped future takes none of them, so
+  the count stayed raised forever and that model could never be evicted again. Replaced with an
+  RAII ticket that releases on drop. Pre-existing, but the swap queueing above turns the symptom
+  from "one model is never evicted" into "every later swap waits out `queue_timeout` and then
+  `503`s" — which is indistinguishable from the bug that change exists to fix. Found by
+  self-review, not by a failing test.
+
   Verified by mutation, not just by passing: removing the fairness hold fails the starvation test
   and nothing else; removing the post-hold `queue_max` check fails only its own test; removing
   the wait fails all four. The suite was run 40× to catch a race that
