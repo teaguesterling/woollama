@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.16.0 — 2026-08-18
+
+**A request for a non-resident model queues behind the model swap instead of being refused.**
+`woollama` 0.16.0 + `woollama-server` 0.15.0; `woollama-core` (0.9.0) and `woollama-engine`
+(0.12.0) are unchanged.
+
 ### Features
 
 - **A request for a non-resident model now queues behind the model swap instead of getting an
