@@ -182,6 +182,9 @@ async fn gate_queue_max_saturated_is_backpressure() {
         Err(PoolError::Backpressure(_)) => {}
         Ok(_) => panic!("expected Backpressure, got Ok(Slot)"),
         Err(PoolError::Device(msg)) => panic!("expected Backpressure, got Device({msg})"),
+        // `Gate::enter` must convert this internally; leaking it would 503 with no
+        // Retry-After budget and hide a missed conversion (#39).
+        Err(PoolError::SwapBlocked) => panic!("SwapBlocked escaped Gate::enter"),
     }
 
     release_holder.notify_one();
@@ -215,14 +218,22 @@ async fn gate_queue_timeout_is_backpressure() {
         Err(PoolError::Backpressure(_)) => {}
         Ok(_) => panic!("expected Backpressure, got Ok(Slot)"),
         Err(PoolError::Device(msg)) => panic!("expected Backpressure, got Device({msg})"),
+        // `Gate::enter` must convert this internally; leaking it would 503 with no
+        // Retry-After budget and hide a missed conversion (#39).
+        Err(PoolError::SwapBlocked) => panic!("SwapBlocked escaped Gate::enter"),
     }
 
     release_holder.notify_one();
     holder.await.unwrap();
 }
 
-/// A model with a held `Slot` (in-flight) is never chosen as an eviction victim —
-/// loading a third model at capacity must Backpressure rather than stop a busy one.
+/// A model with a held `Slot` (in-flight) is never chosen as an eviction victim — loading a
+/// third model at capacity must Backpressure rather than stop a busy one.
+///
+/// Since #39 the *timing* of that answer changed: `enter("C")` now waits for a victim to become
+/// evictable and only refuses once `queue_timeout` is spent, so this call blocks for the gate's
+/// timeout before returning. What it guarantees is unchanged and is the point of the test — a
+/// busy model is never stopped. `pool_swap_queue.rs` covers the waiting behaviour itself.
 #[tokio::test]
 async fn gate_protects_serving_model_from_eviction() {
     let device = FakeDevice::spawn(&["A", "B"]).await;
@@ -261,6 +272,9 @@ async fn gate_protects_serving_model_from_eviction() {
         Err(PoolError::Backpressure(_)) => {}
         Ok(_) => panic!("expected Backpressure, got Ok(Slot)"),
         Err(PoolError::Device(msg)) => panic!("expected Backpressure, got Device({msg})"),
+        // `Gate::enter` must convert this internally; leaking it would 503 with no
+        // Retry-After budget and hide a missed conversion (#39).
+        Err(PoolError::SwapBlocked) => panic!("SwapBlocked escaped Gate::enter"),
     }
     assert!(!device.calls().contains(&("stop".to_string(), "A".to_string())));
     assert!(!device.calls().contains(&("stop".to_string(), "B".to_string())));

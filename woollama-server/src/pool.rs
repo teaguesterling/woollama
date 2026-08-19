@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use woollama_engine as engine;
@@ -65,6 +65,12 @@ use woollama_engine::resolver::{self, PoolEntry};
 pub enum PoolError {
     Device(String),
     Backpressure(f64),
+    /// Capacity is full and every loaded model is busy, so a swap cannot happen *yet*.
+    ///
+    /// Distinct from `Backpressure` because it is not an answer to the caller — it is a signal
+    /// to `Gate::enter` that waiting is worthwhile. `Gate` converts it to `Backpressure` when the
+    /// wait exceeds `queue_timeout`, and it must never escape to the HTTP surface (#39).
+    SwapBlocked,
 }
 
 impl std::fmt::Display for PoolError {
@@ -73,6 +79,9 @@ impl std::fmt::Display for PoolError {
             PoolError::Device(msg) => write!(f, "{msg}"),
             PoolError::Backpressure(retry_after) => {
                 write!(f, "backpressure; retry after {retry_after}s")
+            }
+            PoolError::SwapBlocked => {
+                write!(f, "capacity full and every loaded model is busy")
             }
         }
     }
@@ -613,6 +622,25 @@ pub struct DeviceModelManager {
     /// on the request path, and sharing that lock would make every `default` request queue behind
     /// an in-progress model load.
     residency_lock: AsyncMutex<()>,
+    /// The model currently waiting for a swap slot, if any (#39).
+    ///
+    /// Set by a caller that found capacity full with every loaded model busy. While it is set,
+    /// `Gate::enter` holds back arriving requests for *other* models before they enqueue — which
+    /// is what lets the resident model's `queued` count drain to zero so it becomes evictable.
+    /// Without that hold the waiter starves, because `Gate::enter` enqueues before it loads.
+    ///
+    /// One reservation at a time: a second would-be swapper waits its turn behind the first.
+    swap_reservation: StdMutex<Option<String>>,
+    /// Bumped whenever a model becomes idle or a reservation clears, so waiters re-check rather
+    /// than poll.
+    ///
+    /// A `watch` epoch and NOT a `Notify`: `Notify::notify_waiters` wakes only the waiters
+    /// already registered at that instant and stores nothing, so a wakeup landing between a
+    /// waiter's state check and its `.await` is lost — and the waiter then sits until its
+    /// timeout even though the victim went idle immediately, which looks exactly like the bug
+    /// this is meant to fix. A `watch` receiver remembers the version it last saw, so a bump
+    /// during the check is still observed. Subscribe BEFORE the first check (see `swap_watch`).
+    swap_epoch: watch::Sender<u64>,
 }
 
 impl DeviceModelManager {
@@ -638,6 +666,8 @@ impl DeviceModelManager {
             discovered_caps: StdMutex::new(ModelCapabilities::new()),
             needs_reload: StdMutex::new(std::collections::HashSet::new()),
             residency_lock: AsyncMutex::new(()),
+            swap_reservation: StdMutex::new(None),
+            swap_epoch: watch::Sender::new(0),
         }
     }
 
@@ -656,13 +686,19 @@ impl DeviceModelManager {
 
     pub fn release(&self, real_id: &str) {
         let tick = self.tick();
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(e) = entries.get_mut(real_id) {
-            if e.in_flight > 0 {
-                e.in_flight -= 1;
+        {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(e) = entries.get_mut(real_id) {
+                if e.in_flight > 0 {
+                    e.in_flight -= 1;
+                }
+                e.last_used = tick;
             }
-            e.last_used = tick;
         }
+        // This may be the drop that makes a model evictable, so a swap waiter must re-check
+        // rather than sit until its timeout. Notified unconditionally (cheap, and no waiters
+        // means no-op) instead of trying to detect "became idle" under the lock (#39).
+        self.bump_swap_epoch();
     }
 
     pub fn enqueue(&self, real_id: &str) {
@@ -672,12 +708,16 @@ impl DeviceModelManager {
     }
 
     pub fn dequeue(&self, real_id: &str) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(e) = entries.get_mut(real_id) {
-            if e.queued > 0 {
-                e.queued -= 1;
+        {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(e) = entries.get_mut(real_id) {
+                if e.queued > 0 {
+                    e.queued -= 1;
+                }
             }
         }
+        // Same reason as `release`: a queue that just emptied can make a model evictable (#39).
+        self.bump_swap_epoch();
     }
 
     /// Atomic queued→in-flight handoff: decrement `queued` (saturating, matching
@@ -706,6 +746,70 @@ impl DeviceModelManager {
             e.queued -= 1;
         }
         e.in_flight += 1;
+    }
+
+    /// Claim the swap slot for `real_id`, if it is free or already ours.
+    ///
+    /// Returns `false` when a *different* model already holds it — the caller then waits rather
+    /// than contending, so two would-be swappers cannot livelock trading evictions (#39).
+    pub fn reserve_swap(&self, real_id: &str) -> bool {
+        let mut r = self.swap_reservation.lock().unwrap();
+        match r.as_deref() {
+            None => {
+                *r = Some(real_id.to_string());
+                true
+            }
+            Some(held) => held == real_id,
+        }
+    }
+
+    /// Release the swap slot if `real_id` holds it. Idempotent, and safe to call on every exit
+    /// path — a caller that never reserved must not release someone else's claim.
+    pub fn release_swap(&self, real_id: &str) {
+        {
+            let mut r = self.swap_reservation.lock().unwrap();
+            if r.as_deref() == Some(real_id) {
+                *r = None;
+            } else {
+                return;
+            }
+        }
+        self.bump_swap_epoch();
+    }
+
+    /// The configured `Retry-After` for this device, in seconds.
+    ///
+    /// `ensure_loaded` no longer builds `Backpressure` itself — it returns `SwapBlocked` and lets
+    /// `Gate` decide when waiting is exhausted — so this is the value a caller needs when it has
+    /// to answer backpressure on the manager's behalf.
+    pub fn retry_after(&self) -> f64 {
+        self.retry_after
+    }
+
+    /// The model currently holding the swap slot, if any.
+    pub fn swap_reserved_by(&self) -> Option<String> {
+        self.swap_reservation.lock().unwrap().clone()
+    }
+
+    /// Record that something which could change a swap decision has happened.
+    fn bump_swap_epoch(&self) {
+        self.swap_epoch.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// A receiver for swap-relevant changes: a model going idle, a queue emptying, or a
+    /// reservation clearing.
+    ///
+    /// Subscribe **before** the first state check and keep the receiver across the whole wait.
+    /// A receiver created after the check would mark the current epoch as already seen and miss
+    /// a change that happened during it — the lost-wakeup this type exists to avoid.
+    pub fn swap_watch(&self) -> watch::Receiver<u64> {
+        self.swap_epoch.subscribe()
+    }
+
+    /// Wait for the next swap-relevant change, or `timeout`. A spurious wakeup is harmless:
+    /// callers re-check the real state.
+    pub async fn await_swap_change(rx: &mut watch::Receiver<u64>, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, rx.changed()).await;
     }
 
     pub fn queued(&self, real_id: &str) -> u32 {
@@ -775,8 +879,10 @@ impl DeviceModelManager {
         };
 
         if resolver::needs_eviction(&loaded_ids, real_id, pool_max) {
-            let victim = resolver::pick_eviction(&pool_entries)
-                .ok_or(PoolError::Backpressure(self.retry_after))?;
+            // Every loaded model is busy. That is NOT the caller's answer — the model they want
+            // is servable once work already in flight drains. Signal `Gate`, which owns
+            // `queue_timeout` and decides how long waiting is worth it (#39).
+            let victim = resolver::pick_eviction(&pool_entries).ok_or(PoolError::SwapBlocked)?;
 
             // Eviction-race fix (ported from pool.py): flip the victim's `loaded`
             // flag off SYNCHRONOUSLY, before the `.await` on `_stop`, so a
@@ -1022,18 +1128,40 @@ impl Gate {
     }
 
     pub async fn enter(&self, real_id: &str) -> Result<Slot, PoolError> {
-        if let Some(queue_max) = self.queue_max {
-            if self.manager.queued(real_id) >= queue_max {
-                return Err(PoolError::Backpressure(self.retry_after));
-            }
-        }
-        self.manager.enqueue(real_id);
+        self.reject_if_queue_full(real_id)?;
 
-        // Python's `try/finally`: `dequeue` must run whether `ensure_loaded`/the
-        // semaphore acquire succeeds or fails. The `async` block plays the role of
-        // the `try` body; `dequeue` below plays `finally`.
+        // Fairness hold — and note WHERE it is: before `enqueue`, not inside the load path.
+        //
+        // While another model is waiting for a swap slot, arriving requests for a different
+        // model wait here. This is load-bearing, not politeness: `enqueue` below raises this
+        // model's `queued` count, and `pick_eviction` skips anything with `queued > 0`. Under a
+        // steady stream for the resident model its queue never empties, so the waiter would sit
+        // until its timeout and 503 anyway — turning an immediate failure into a slow one. Held
+        // back here, the resident model drains to idle and the swap can proceed (#39).
+        //
+        // In-flight work is never preempted; this only stops NEW work from overtaking a waiter.
+        self.hold_for_swap(real_id).await;
+
+        // Re-checked AFTER the hold, and that is the point of doing it twice. The first check
+        // used the queue depth on arrival; requests parked in the hold are deliberately not
+        // counted as queued, so several can be released at once when the reservation clears. Only
+        // this second check sees the depth that actually applies at `enqueue` time — without it a
+        // burst would overshoot the operator's `queue_max` and the change would have quietly
+        // widened a documented bound (#39).
+        self.reject_if_queue_full(real_id)?;
+
+        // An RAII ticket, not a manual `finally`. The hand-written version below used to
+        // decrement on both match arms, which covers every path the function can *return* by —
+        // but not the path where the whole future is DROPPED mid-await, which is exactly what a
+        // client disconnect does. The count then stayed above zero forever, and since eviction
+        // skips any model with a queued request, that model could never be swapped out again.
+        //
+        // Pre-existing, but #39 turned it from "this model is never evicted" into "every future
+        // swap waits out `queue_timeout` and then 503s" — a permanent, silent capacity leak whose
+        // symptom is indistinguishable from the bug #39 set out to fix.
+        let ticket = QueueTicket::new(self.manager.clone(), real_id);
         let outcome: Result<OwnedSemaphorePermit, PoolError> = async {
-            self.manager.ensure_loaded(real_id, self.pool_max).await?;
+            self.ensure_loaded_waiting_for_swap(real_id).await?;
             let sem = self.sem(real_id);
             match tokio::time::timeout(Duration::from_secs_f64(self.queue_timeout), sem.acquire_owned()).await {
                 Ok(Ok(permit)) => Ok(permit),
@@ -1054,14 +1182,140 @@ impl Gate {
         // branch (both sync).
         match outcome {
             Ok(permit) => {
-                self.manager.dequeue_acquire(real_id);
+                ticket.acquire();
                 Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
             }
-            Err(e) => {
-                self.manager.dequeue(real_id);
-                Err(e)
+            // `ticket` drops here and decrements, as it does on any abandoned path.
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `Backpressure` if this model's queue is already at `queue_max`.
+    fn reject_if_queue_full(&self, real_id: &str) -> Result<(), PoolError> {
+        if let Some(queue_max) = self.queue_max {
+            if self.manager.queued(real_id) >= queue_max {
+                return Err(PoolError::Backpressure(self.retry_after));
             }
         }
+        Ok(())
+    }
+
+    /// Wait while a *different* model holds the swap reservation. See the call site in `enter`
+    /// for why this must happen before `enqueue`.
+    ///
+    /// Bounded by `queue_timeout` like every other wait here: a stuck reservation must not
+    /// silently pin a caller forever. Falling through on timeout is deliberate — the caller then
+    /// takes its normal path and gets a normal answer (served, or `Backpressure`) rather than a
+    /// special error for an internal condition.
+    async fn hold_for_swap(&self, real_id: &str) {
+        // Subscribed before the first check, so a reservation that clears while we are looking
+        // is still seen. See `swap_epoch`.
+        let mut rx = self.manager.swap_watch();
+        let deadline = Instant::now() + Duration::from_secs_f64(self.queue_timeout);
+        loop {
+            match self.manager.swap_reserved_by() {
+                None => return,
+                Some(holder) if holder == real_id => return,
+                Some(_) => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            DeviceModelManager::await_swap_change(&mut rx, deadline - now).await;
+        }
+    }
+
+    /// `ensure_loaded`, but a full-capacity device whose models are all busy makes the caller
+    /// wait for the swap instead of refusing it outright (#39).
+    ///
+    /// The reservation is taken only once we know a swap is actually blocked, so the ordinary
+    /// path — model already resident, or capacity available — never touches it and pays nothing.
+    async fn ensure_loaded_waiting_for_swap(&self, real_id: &str) -> Result<(), PoolError> {
+        // Subscribed before the first attempt: the victim can go idle *during* `ensure_loaded`,
+        // and that change must not be missed. See `swap_epoch`.
+        let mut rx = self.manager.swap_watch();
+
+        match self.manager.ensure_loaded(real_id, self.pool_max).await {
+            Err(PoolError::SwapBlocked) => {}
+            other => return other,
+        }
+
+        let deadline = Instant::now() + Duration::from_secs_f64(self.queue_timeout);
+        // `release_swap` is a no-op unless we hold it, so this is safe even when `reserve_swap`
+        // loses the race to another waiter.
+        let _guard = SwapReservation::new(self.manager.clone(), real_id);
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                // Still nothing evictable within the caller's budget. NOW it is backpressure:
+                // the answer #39 objects to only when it arrives immediately.
+                return Err(PoolError::Backpressure(self.retry_after));
+            }
+            DeviceModelManager::await_swap_change(&mut rx, deadline - now).await;
+
+            match self.manager.ensure_loaded(real_id, self.pool_max).await {
+                Err(PoolError::SwapBlocked) => continue,
+                other => return other,
+            }
+        }
+    }
+}
+
+/// A place in a model's queue, released on drop.
+///
+/// Exists so the queued count survives cancellation: a request abandoned mid-load — a client
+/// disconnecting is enough — must not leave the count raised, because a model with a queued
+/// request is never evicted and would pin a pool slot for the life of the process.
+struct QueueTicket {
+    manager: Arc<DeviceModelManager>,
+    real_id: String,
+    held: bool,
+}
+
+impl QueueTicket {
+    fn new(manager: Arc<DeviceModelManager>, real_id: &str) -> Self {
+        manager.enqueue(real_id);
+        QueueTicket { manager, real_id: real_id.to_string(), held: true }
+    }
+
+    /// Hand the place off to an in-flight slot. Consumes the ticket, so `Drop` cannot also
+    /// decrement. The handoff stays ATOMIC (`dequeue_acquire`, one critical section) — splitting
+    /// it lets a concurrent evictor see the model as idle mid-handoff and stop it.
+    fn acquire(mut self) {
+        self.manager.dequeue_acquire(&self.real_id);
+        self.held = false;
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        if self.held {
+            self.manager.dequeue(&self.real_id);
+        }
+    }
+}
+
+/// Holds a swap reservation for the lifetime of a value, so every exit path from the wait —
+/// success, timeout, backend error, or a dropped future when the client disconnects — releases
+/// it. A reservation leaked by an early return would hold back every other model's requests
+/// until the process restarted.
+struct SwapReservation {
+    manager: Arc<DeviceModelManager>,
+    real_id: String,
+}
+
+impl SwapReservation {
+    fn new(manager: Arc<DeviceModelManager>, real_id: &str) -> Self {
+        manager.reserve_swap(real_id);
+        SwapReservation { manager, real_id: real_id.to_string() }
+    }
+}
+
+impl Drop for SwapReservation {
+    fn drop(&mut self) {
+        self.manager.release_swap(&self.real_id);
     }
 }
 

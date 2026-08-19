@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Features
+
+- **A request for a non-resident model now queues behind the model swap instead of getting an
+  immediate `503`.** On a capacity-bound device, serving B can mean evicting A — so when A was
+  busy, nothing was evictable and B was refused outright, even though B was servable as soon as
+  work already in flight drained. That pushed a cold-load-length retry decision onto every
+  client, over a resource woollama was already sequencing. (#39)
+
+  A busy model is still never evicted, and `503` + `Retry-After` is still the answer once the
+  wait exceeds `queue_timeout` — the complaint was that it arrived *immediately*, not that it
+  arrived. No new configuration: a swap is a cold load with an eviction in front of it, and
+  `queue_timeout` already has to exceed a cold load.
+
+  The non-obvious half is a **fairness hold**, and it is load-bearing rather than a refinement.
+  `Gate::enter` enqueues before it loads, and eviction skips any model with a queued request, so
+  under steady traffic for the resident model its queue never empties and a waiter would time
+  out anyway — converting a fast failure into a slow one. While a swap is pending, arriving
+  requests for the resident model are held *before* they enqueue, letting it drain. woollama
+  never *chooses* to evict a model that is serving.
+
+  **Verified on hardware**, same base and config, only this change differing:
+
+  | | asker | holder |
+  |---|---|---|
+  | `main` | `503` after 0.0s | 4/4 ok |
+  | this change | `200` after 32.6–32.7s | 5/5 ok |
+
+  Reproduced 3/3 per arm on an NPU device with two 30B-class models that cannot coexist. The
+  holder is not merely undamaged: the request that would have been refused is queued *through*
+  the swap and the swap back, returning after 61.8s. In-flight work really is protected when
+  woollama is the party doing the evicting.
+
+  An earlier run appeared to show one holder request lost per swap. That run had no `pool_max`,
+  where woollama never evicts and the device force-evicts instead — so none of these protections
+  applied. It measured #47, not this. What bounds a swap is still not established: waits were
+  observed to exceed `queue_timeout` and succeed.
+
+- **An abandoned request no longer leaks its place in a model's queue.** A client disconnecting
+  drops the handler future mid-await; the cleanup decremented the queued count on both `match`
+  arms — every path the function can *return* by — but a dropped future takes none of them, so
+  the count stayed raised forever and that model could never be evicted again. Replaced with an
+  RAII ticket that releases on drop. Pre-existing, but the swap queueing above turns the symptom
+  from "one model is never evicted" into "every later swap waits out `queue_timeout` and then
+  `503`s" — which is indistinguishable from the bug that change exists to fix. Found by
+  self-review, not by a failing test.
+
+  Verified by mutation, not just by passing: removing the fairness hold fails the starvation test
+  and nothing else; removing the post-hold `queue_max` check fails only its own test; removing
+  the wait fails all four. The suite was run 40× to catch a race that
+  a single green run had hidden.
+
+
 ## v0.15.0 — 2026-08-18
 
 **CPython 3.14 is supported.** `woollama` 0.15.0 + `woollama-core` 0.9.0; `woollama-server`

@@ -503,9 +503,9 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 |---|---|---|
 | `management_url` | — | Base URL of the backend's model-management API (`GET/POST /api/v1/models/{running,start,stop}`). Its presence is what turns on pooling for this inferencer. |
 | `parallel` | — | How many requests **woollama** sends the backend concurrently per loaded model (default `1`). Sizes the per-model queue semaphore. |
-| `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). Unset ⇒ no cap and no auto-eviction. |
+| `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). If every loaded model is busy, the request **waits** for one to free up rather than being refused — see *Queueing across a model swap* below. Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
-| `queue_timeout` | — | Seconds a queued request waits before woollama gives up and returns `503` + `Retry-After` (default `30`). |
+| `queue_timeout` | — | Seconds a request waits for its turn before woollama gives up and returns `503` + `Retry-After` (default `30`). Bounds three waits: a place in a model's queue, a cold load, and — since v0.15 — a **model swap** on a full device. |
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
 #### Model capabilities — what `default` is allowed to pick
@@ -624,6 +624,58 @@ alternating between them swapped the model on *every* call — and it enforced `
 route, **doubling** the concurrency the device actually saw. The shared gate takes the most
 restrictive limit configured across them, except `queue_timeout`, where the most forgiving value
 wins (a shorter wait causes spurious `503`s on a slow cold load without protecting the device).
+
+#### Queueing across a model swap
+
+On a capacity-bound device, serving model B can mean evicting model A. woollama used to answer
+such a request with an immediate `503`: A was busy, so nothing was evictable, so B was treated as
+unservable. But B is not unservable — it is servable after work that is already draining, and
+making the caller run a retry loop over a resource woollama is already sequencing pushes a
+cold-load-length decision onto every client.
+
+A request for a non-resident model now **waits for the swap**, bounded by `queue_timeout`:
+
+- A busy model is still never evicted. That protection is unchanged.
+- While a swap is pending, arriving requests for the *resident* model queue behind it, so it can
+  drain and become evictable. Without this, steady traffic for the resident model would keep it
+  permanently busy and the waiter would time out anyway — a slow failure instead of a fast one.
+  Only new work is held back; woollama never *chooses* to evict a model that is serving.
+
+> **woollama not choosing to evict is not the same as nothing being interrupted**, and with
+> `pool_max` unset woollama does not choose at all. It never evicts, so it simply issues the load
+> and the *device* makes room however it wants. On hardware where two models cannot coexist —
+> measured on an NPU where both occupy 55% — that means the device tears down an instance
+> woollama never asked it to stop, and a request already dispatched to that instance dies with
+> it. Measured: **one holder request lost per swap**, consistently the one issued as the swap
+> began. A logging proxy in front of the device recorded **zero `stop` calls** across a full
+> contention run, which is the proof: the in-flight protection did not fail, it never applied.
+>
+> This is not a consequence of swap queueing — it is what `pool_max` being unset means on a
+> capacity-bound device. "No cap and no auto-eviction" reads as benign and is not: it hands
+> eviction to the device, where none of woollama's protections reach. Tracked in #47.
+>
+> **With `pool_max` set, none of this happens.** The same measurement with `pool_max = 1` lost
+> nothing: the holder request that previously died was queued through the swap and the swap back
+> and served after 61.8s. The protections work when woollama is the party doing the evicting.
+
+Each swap serves at least the request that caused it, so two consumers competing for one slot
+alternate rather than thrash — confirmed on hardware, with no wedge, stall, or starvation.
+
+**What a swap costs, measured** on an NPU device with two 30B-class models that cannot coexist:
+
+| | measured |
+|---|---|
+| cold load, each model | 24.8s / 28.6s |
+| swap under contention (the second consumer) | 32.7s |
+| swap-back for the original holder | 60.3s |
+
+Budget for the swap-back figure, not the cold-load one: under alternation a consumer waits for the
+swap away *and* the swap back.
+
+> **These waits were observed to exceed `queue_timeout` and still succeed** — 32.8s against a
+> `queue_timeout` of 5. So `queue_timeout` is *not* what bounds a swap on that configuration, and
+> what does is not yet established. Size it for the queue and cold-load waits it does govern
+> (below); do not assume it caps a swap.
 
 > **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
 > The first request for a model that isn't resident waits for the backend to load it, and that

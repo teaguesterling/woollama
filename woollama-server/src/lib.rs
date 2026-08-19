@@ -1496,6 +1496,11 @@ async fn passthrough_pooled(
             // in `router.py::_passthrough_pooled`.
             return engine_err_response(EngineError::new(format!("device error: {msg}"), "server_error", 502));
         }
+        // `Gate::enter` converts `SwapBlocked` into `Backpressure` once the caller's
+        // `queue_timeout` is spent, so it should be unreachable here. Answer as backpressure
+        // anyway rather than inventing a new status: if the conversion is ever missed, a client
+        // that retries is the right outcome, and a `503` is not a lie — capacity really is full.
+        Err(pool::PoolError::SwapBlocked) => return backpressure_response(manager.retry_after()),
     };
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
