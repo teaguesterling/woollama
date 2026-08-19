@@ -641,34 +641,37 @@ A request for a non-resident model now **waits for the swap**, bounded by `queue
   permanently busy and the waiter would time out anyway — a slow failure instead of a fast one.
   Only new work is held back; woollama never *chooses* to evict a model that is serving.
 
-> **woollama not choosing to evict is not the same as nothing being interrupted.** On a device
-> where two models cannot physically coexist — measured on an NPU where both models occupy 55%
-> of the device — loading one forces the *device* to evict the other, whatever woollama's
-> bookkeeping says. Hardware measurement showed **one holder request lost per swap**, consistently
-> the one issued just as the swap began, failing in ~1.5s. That is strictly better than the
-> guaranteed immediate `503` it replaces, but it is not zero, and a client on the resident model
-> should still expect an occasional failure around a swap. Tracked in #47.
-- `503` + `Retry-After` is still the answer when the wait genuinely exceeds `queue_timeout`.
-- A request held this way is **not** counted against `queue_max` while it waits — it has not
-  joined the queue yet. `queue_max` is re-checked at the moment it does, so a burst released
-  together cannot overshoot the limit; the surplus gets `503` as it would have on arrival.
+> **woollama not choosing to evict is not the same as nothing being interrupted**, and with
+> `pool_max` unset woollama does not choose at all. It never evicts, so it simply issues the load
+> and the *device* makes room however it wants. On hardware where two models cannot coexist —
+> measured on an NPU where both occupy 55% — that means the device tears down an instance
+> woollama never asked it to stop, and a request already dispatched to that instance dies with
+> it. Measured: **one holder request lost per swap**, consistently the one issued as the swap
+> began. A logging proxy in front of the device recorded **zero `stop` calls** across a full
+> contention run, which is the proof: the in-flight protection did not fail, it never applied.
+>
+> This is not a consequence of swap queueing — it is what `pool_max` being unset means on a
+> capacity-bound device. "No cap and no auto-eviction" reads as benign and is not: it hands
+> eviction to the device, where none of woollama's protections reach. Tracked in #47.
 
 Each swap serves at least the request that caused it, so two consumers competing for one slot
 alternate rather than thrash — confirmed on hardware, with no wedge, stall, or starvation.
 
-**Size `queue_timeout` for TWO cold loads, not one.** Under alternation a request waits for the
-swap away *and* the swap back. Measured on an NPU device with two 30B-class models that cannot
-coexist:
+**What a swap costs, measured** on an NPU device with two 30B-class models that cannot coexist:
 
 | | measured |
 |---|---|
 | cold load, each model | 24.8s / 28.6s |
 | swap under contention (the second consumer) | 32.7s |
-| swap-back for the original holder | **60.3s** |
+| swap-back for the original holder | 60.3s |
 
-`queue_timeout = 30` fails against a 32.7s swap — not marginally, but on the wrong side of it.
-**Use ≥ 90.** Anything under ~70 will fail intermittently for the second consumer, in a way that
-looks like flakiness rather than like configuration.
+Budget for the swap-back figure, not the cold-load one: under alternation a consumer waits for the
+swap away *and* the swap back.
+
+> **These waits were observed to exceed `queue_timeout` and still succeed** — 32.8s against a
+> `queue_timeout` of 5. So `queue_timeout` is *not* what bounds a swap on that configuration, and
+> what does is not yet established. Size it for the queue and cold-load waits it does govern
+> (below); do not assume it caps a swap.
 
 > **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
 > The first request for a model that isn't resident waits for the backend to load it, and that

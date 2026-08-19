@@ -22,20 +22,18 @@
   requests for the resident model are held *before* they enqueue, letting it drain. woollama
   never *chooses* to evict a model that is serving.
 
-  **Measured on hardware, and one claim did not survive it.** "Work already in flight is never
-  interrupted" is true of woollama's own decisions and false of the outcome: where two models
-  cannot physically coexist, loading one forces the *device* to evict the other. One holder
-  request is lost per swap, consistently the one issued as the swap begins. Strictly better than
-  the guaranteed immediate `503` it replaces, but not zero — see #47.
+  **Hardware measurement is inconclusive for this change specifically, and that is worth stating
+  plainly.** A contention run on a real NPU device showed the asker's immediate `503` becoming a
+  served request — but the tested configuration had no `pool_max`, and with `pool_max` unset
+  `needs_eviction` is false, so the waiting path added here never engages. Whatever produced that
+  improvement, it was not this. The baseline was also a released 0.14.1 binary rather than the
+  current `main`, so the delta spans two releases. A clean A/B — `main` vs this branch, with
+  `pool_max` set — is still outstanding.
 
-  **`queue_timeout` must cover two cold loads, not one.** Under alternation a request waits for
-  the swap away and the swap back: 60.3s measured, against 24.8s/28.6s cold loads. The 30s
-  default fails a 32.7s swap. Documentation now says ≥ 90.
-
-  `queue_max` is now checked twice — on arrival and again after the hold. Requests parked in the
-  hold are deliberately not counted as queued, so several can be released together when the
-  reservation clears; only the second check sees the depth that applies at enqueue time. Without
-  it a burst would overshoot the configured limit, quietly widening a documented bound.
+  What the same run did establish, independent of this change: a logging proxy recorded **zero
+  `stop` calls**, so woollama never evicted anything and the *device* force-evicted. One holder
+  request is lost per swap, and the in-flight protection did not fail — it never applied. That is
+  what `pool_max` being unset means on a device where two models cannot coexist. See #47.
 
 - **An abandoned request no longer leaks its place in a model's queue.** A client disconnecting
   drops the handler future mid-await; the cleanup decremented the queued count on both `match`
