@@ -1128,11 +1128,7 @@ impl Gate {
     }
 
     pub async fn enter(&self, real_id: &str) -> Result<Slot, PoolError> {
-        if let Some(queue_max) = self.queue_max {
-            if self.manager.queued(real_id) >= queue_max {
-                return Err(PoolError::Backpressure(self.retry_after));
-            }
-        }
+        self.reject_if_queue_full(real_id)?;
 
         // Fairness hold — and note WHERE it is: before `enqueue`, not inside the load path.
         //
@@ -1145,6 +1141,14 @@ impl Gate {
         //
         // In-flight work is never preempted; this only stops NEW work from overtaking a waiter.
         self.hold_for_swap(real_id).await;
+
+        // Re-checked AFTER the hold, and that is the point of doing it twice. The first check
+        // used the queue depth on arrival; requests parked in the hold are deliberately not
+        // counted as queued, so several can be released at once when the reservation clears. Only
+        // this second check sees the depth that actually applies at `enqueue` time — without it a
+        // burst would overshoot the operator's `queue_max` and the change would have quietly
+        // widened a documented bound (#39).
+        self.reject_if_queue_full(real_id)?;
 
         self.manager.enqueue(real_id);
 
@@ -1181,6 +1185,16 @@ impl Gate {
                 Err(e)
             }
         }
+    }
+
+    /// `Backpressure` if this model's queue is already at `queue_max`.
+    fn reject_if_queue_full(&self, real_id: &str) -> Result<(), PoolError> {
+        if let Some(queue_max) = self.queue_max {
+            if self.manager.queued(real_id) >= queue_max {
+                return Err(PoolError::Backpressure(self.retry_after));
+            }
+        }
+        Ok(())
     }
 
     /// Wait while a *different* model holds the swap reservation. See the call site in `enter`

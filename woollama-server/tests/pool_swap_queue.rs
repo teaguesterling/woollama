@@ -262,3 +262,59 @@ async fn the_swap_never_evicts_a_model_that_is_still_serving() {
         .unwrap()
         .expect("B should be served");
 }
+
+/// `queue_max` still bounds the queue after a fairness hold.
+///
+/// Found by reading the entry path rather than by a failure: the `queue_max` check happens
+/// BEFORE the hold, so requests parked in `hold_for_swap` are not counted as queued. When the
+/// reservation clears they all enqueue at once, and the queue can overshoot the limit the
+/// operator configured — the change would have quietly widened a documented bound.
+#[tokio::test]
+async fn queue_max_is_rechecked_after_a_fairness_hold() {
+    let device = FakeDevice::spawn(&["A"]).await;
+    let m = mgr(&device);
+    m.ensure_loaded("A", Some(1)).await.unwrap();
+    // queue_max = 1: at most one request may be waiting in A's queue at a time.
+    let gate = Arc::new(Gate::new(m.clone(), 1, Some(1), 10.0, Some(1), 5.0));
+
+    let held = gate.enter("A").await.expect("A is resident");
+
+    // Takes the swap reservation and waits, since A is in flight.
+    let gb = gate.clone();
+    let waiter = tokio::spawn(async move { gb.enter("B").await.map(drop) });
+    while m.swap_reserved_by().is_none() {
+        tokio::task::yield_now().await;
+    }
+
+    // Two more A requests, both parked in the fairness hold (they have NOT enqueued).
+    let mut parked = Vec::new();
+    for _ in 0..2 {
+        let g = gate.clone();
+        parked.push(tokio::spawn(async move { g.enter("A").await.map(drop) }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(m.queued("A"), 0, "parked requests must not be queued yet");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("B never completed")
+        .unwrap()
+        .expect("B should be served");
+
+    let mut backpressured = 0;
+    for t in parked {
+        if let Err(PoolError::Backpressure(_)) = tokio::time::timeout(Duration::from_secs(10), t)
+            .await
+            .expect("a parked request never resolved")
+            .unwrap()
+        {
+            backpressured += 1;
+        }
+    }
+    assert!(
+        backpressured >= 1,
+        "with queue_max=1, releasing two parked requests must not admit both — \
+         queue_max has to be re-checked after the hold, not only before it"
+    );
+}

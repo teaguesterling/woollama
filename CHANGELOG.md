@@ -22,8 +22,14 @@
   requests for the resident model are held *before* they enqueue, letting it drain. Work already
   in flight is never interrupted.
 
+  `queue_max` is now checked twice — on arrival and again after the hold. Requests parked in the
+  hold are deliberately not counted as queued, so several can be released together when the
+  reservation clears; only the second check sees the depth that applies at enqueue time. Without
+  it a burst would overshoot the configured limit, quietly widening a documented bound.
+
   Verified by mutation, not just by passing: removing the fairness hold fails the starvation test
-  and nothing else; removing the wait fails all four. The suite was run 40× to catch a race that
+  and nothing else; removing the post-hold `queue_max` check fails only its own test; removing
+  the wait fails all four. The suite was run 40× to catch a race that
   a single green run had hidden.
 
 
