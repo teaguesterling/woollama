@@ -11,6 +11,13 @@
 //! dispatches), with one addition that matters: `start` can be made SLOW, because a swap that
 //! completes instantly cannot expose an ordering bug. A fixture kinder than the hardware is how
 //! the first #38 fix passed while being wrong.
+//!
+//! EVERY test here must hold a slot on the resident model. That is not incidental setup, and it
+//! is worth stating because hardware measurement made the point sharply: an attempt to reproduce
+//! this against an *idle* incumbent showed the released and fixed builds behaving identically —
+//! 200 in 32.8s vs 32.7s, no difference to measure. The failure exists only while a consumer is
+//! actively holding the resident model. A version of these tests that let the incumbent go idle
+//! would pass before and after the fix and prove nothing at all.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
