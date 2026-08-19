@@ -653,6 +653,10 @@ A request for a non-resident model now **waits for the swap**, bounded by `queue
 > This is not a consequence of swap queueing — it is what `pool_max` being unset means on a
 > capacity-bound device. "No cap and no auto-eviction" reads as benign and is not: it hands
 > eviction to the device, where none of woollama's protections reach. Tracked in #47.
+>
+> **With `pool_max` set, none of this happens.** The same measurement with `pool_max = 1` lost
+> nothing: the holder request that previously died was queued through the swap and the swap back
+> and served after 61.8s. The protections work when woollama is the party doing the evicting.
 
 Each swap serves at least the request that caused it, so two consumers competing for one slot
 alternate rather than thrash — confirmed on hardware, with no wedge, stall, or starvation.

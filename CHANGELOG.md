@@ -22,18 +22,22 @@
   requests for the resident model are held *before* they enqueue, letting it drain. woollama
   never *chooses* to evict a model that is serving.
 
-  **Hardware measurement is inconclusive for this change specifically, and that is worth stating
-  plainly.** A contention run on a real NPU device showed the asker's immediate `503` becoming a
-  served request — but the tested configuration had no `pool_max`, and with `pool_max` unset
-  `needs_eviction` is false, so the waiting path added here never engages. Whatever produced that
-  improvement, it was not this. The baseline was also a released 0.14.1 binary rather than the
-  current `main`, so the delta spans two releases. A clean A/B — `main` vs this branch, with
-  `pool_max` set — is still outstanding.
+  **Verified on hardware**, same base and config, only this change differing:
 
-  What the same run did establish, independent of this change: a logging proxy recorded **zero
-  `stop` calls**, so woollama never evicted anything and the *device* force-evicted. One holder
-  request is lost per swap, and the in-flight protection did not fail — it never applied. That is
-  what `pool_max` being unset means on a device where two models cannot coexist. See #47.
+  | | asker | holder |
+  |---|---|---|
+  | `main` | `503` after 0.0s | 4/4 ok |
+  | this change | `200` after 32.6–32.7s | 5/5 ok |
+
+  Reproduced 3/3 per arm on an NPU device with two 30B-class models that cannot coexist. The
+  holder is not merely undamaged: the request that would have been refused is queued *through*
+  the swap and the swap back, returning after 61.8s. In-flight work really is protected when
+  woollama is the party doing the evicting.
+
+  An earlier run appeared to show one holder request lost per swap. That run had no `pool_max`,
+  where woollama never evicts and the device force-evicts instead — so none of these protections
+  applied. It measured #47, not this. What bounds a swap is still not established: waits were
+  observed to exceed `queue_timeout` and succeed.
 
 - **An abandoned request no longer leaks its place in a model's queue.** A client disconnecting
   drops the handler future mid-await; the cleanup decremented the queued count on both `match`
