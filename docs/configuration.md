@@ -639,15 +639,36 @@ A request for a non-resident model now **waits for the swap**, bounded by `queue
 - While a swap is pending, arriving requests for the *resident* model queue behind it, so it can
   drain and become evictable. Without this, steady traffic for the resident model would keep it
   permanently busy and the waiter would time out anyway — a slow failure instead of a fast one.
-  Work already in flight is never interrupted; only new work is held back.
+  Only new work is held back; woollama never *chooses* to evict a model that is serving.
+
+> **woollama not choosing to evict is not the same as nothing being interrupted.** On a device
+> where two models cannot physically coexist — measured on an NPU where both models occupy 55%
+> of the device — loading one forces the *device* to evict the other, whatever woollama's
+> bookkeeping says. Hardware measurement showed **one holder request lost per swap**, consistently
+> the one issued just as the swap began, failing in ~1.5s. That is strictly better than the
+> guaranteed immediate `503` it replaces, but it is not zero, and a client on the resident model
+> should still expect an occasional failure around a swap. Tracked in #47.
 - `503` + `Retry-After` is still the answer when the wait genuinely exceeds `queue_timeout`.
 - A request held this way is **not** counted against `queue_max` while it waits — it has not
   joined the queue yet. `queue_max` is re-checked at the moment it does, so a burst released
   together cannot overshoot the limit; the surplus gets `503` as it would have on arrival.
 
 Each swap serves at least the request that caused it, so two consumers competing for one slot
-alternate rather than thrash. The cost of alternation is a cold load per switch, so
-`queue_timeout` needs the same headroom described below — more, if you expect contention.
+alternate rather than thrash — confirmed on hardware, with no wedge, stall, or starvation.
+
+**Size `queue_timeout` for TWO cold loads, not one.** Under alternation a request waits for the
+swap away *and* the swap back. Measured on an NPU device with two 30B-class models that cannot
+coexist:
+
+| | measured |
+|---|---|
+| cold load, each model | 24.8s / 28.6s |
+| swap under contention (the second consumer) | 32.7s |
+| swap-back for the original holder | **60.3s** |
+
+`queue_timeout = 30` fails against a 32.7s swap — not marginally, but on the wrong side of it.
+**Use ≥ 90.** Anything under ~70 will fail intermittently for the second consumer, in a way that
+looks like flakiness rather than like configuration.
 
 > **`queue_timeout` must exceed your backend's COLD-LOAD time, and the default may not.**
 > The first request for a model that isn't resident waits for the backend to load it, and that

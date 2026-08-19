@@ -19,8 +19,18 @@
   `Gate::enter` enqueues before it loads, and eviction skips any model with a queued request, so
   under steady traffic for the resident model its queue never empties and a waiter would time
   out anyway — converting a fast failure into a slow one. While a swap is pending, arriving
-  requests for the resident model are held *before* they enqueue, letting it drain. Work already
-  in flight is never interrupted.
+  requests for the resident model are held *before* they enqueue, letting it drain. woollama
+  never *chooses* to evict a model that is serving.
+
+  **Measured on hardware, and one claim did not survive it.** "Work already in flight is never
+  interrupted" is true of woollama's own decisions and false of the outcome: where two models
+  cannot physically coexist, loading one forces the *device* to evict the other. One holder
+  request is lost per swap, consistently the one issued as the swap begins. Strictly better than
+  the guaranteed immediate `503` it replaces, but not zero — see #47.
+
+  **`queue_timeout` must cover two cold loads, not one.** Under alternation a request waits for
+  the swap away and the swap back: 60.3s measured, against 24.8s/28.6s cold loads. The 30s
+  default fails a 32.7s swap. Documentation now says ≥ 90.
 
   `queue_max` is now checked twice — on arrival and again after the hold. Requests parked in the
   hold are deliberately not counted as queued, so several can be released together when the
