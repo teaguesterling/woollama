@@ -641,6 +641,9 @@ A request for a non-resident model now **waits for the swap**, bounded by `queue
   permanently busy and the waiter would time out anyway — a slow failure instead of a fast one.
   Work already in flight is never interrupted; only new work is held back.
 - `503` + `Retry-After` is still the answer when the wait genuinely exceeds `queue_timeout`.
+- A request held this way is **not** counted against `queue_max` while it waits — it has not
+  joined the queue yet. `queue_max` is re-checked at the moment it does, so a burst released
+  together cannot overshoot the limit; the surplus gets `503` as it would have on arrival.
 
 Each swap serves at least the request that caused it, so two consumers competing for one slot
 alternate rather than thrash. The cost of alternation is a cold load per switch, so
