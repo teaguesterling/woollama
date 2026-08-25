@@ -353,10 +353,18 @@ fn orchestrate<'py>(
     })
 }
 
+/// A boxed, pinned stream shared across `await`s — the shape every async iterator here holds.
+///
+/// Named because the two `#[pyclass]` iterators below spell the same nest of wrappers with only
+/// the item type differing, and the nesting is not incidental: `Pin<Box<dyn ...>>` because the
+/// stream is a trait object that must not move, `Mutex` because `__anext__` takes `&self` and
+/// needs exclusive access, `Arc` because the future handed back to Python outlives the borrow.
+type SharedStream<T> = Arc<Mutex<Pin<Box<dyn Stream<Item = Result<T, EngineError>> + Send>>>>;
+
 /// An async iterator over the recipe loop's progress + `final` events.
 #[pyclass]
 struct EventIter {
-    inner: Arc<Mutex<Pin<Box<dyn Stream<Item = Result<Event, EngineError>> + Send>>>>,
+    inner: SharedStream<Event>,
 }
 
 #[pymethods]
@@ -380,6 +388,12 @@ impl EventIter {
 /// The recipe loop as an async iterator of progress + `final` events. With
 /// `stream=True`, turns run over SSE and the iterator also yields `delta` events.
 #[pyfunction]
+// Eight parameters IS the Python signature — `orchestrate_events(recipe, user_msgs, tools, *,
+// api_key, base_url, registry, stream)` — so the arity is a published API, not an internal
+// choice. Grouping them into a struct would satisfy the lint by changing what Python callers
+// write, which is the wrong direction: the lint is about a function being hard to call, and this
+// one is called from Python with keywords.
+#[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (recipe, user_msgs, tools, *, api_key=None, base_url=None, registry=None, stream=false))]
 fn orchestrate_events<'py>(
     _py: Python<'py>,
@@ -400,7 +414,7 @@ fn orchestrate_events<'py>(
 /// An async iterator over assistant text deltas — `async for d in complete_stream(...)`.
 #[pyclass]
 struct DeltaStream {
-    inner: Arc<Mutex<Pin<Box<dyn Stream<Item = Result<String, EngineError>> + Send>>>>,
+    inner: SharedStream<String>,
 }
 
 #[pymethods]
