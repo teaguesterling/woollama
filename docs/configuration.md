@@ -723,6 +723,16 @@ inferencer (see below):
 A config-defined block may not shadow a built-in name; doing so is warned about
 and ignored.
 
+**A malformed block stops the daemon.** A `[management_protocols.*]` table that
+cannot be parsed — no `kind`, a `kind` that isn't `"rest"` or `"ollama"`, a
+`kind = "rest"` with no `endpoints`, a `running` endpoint with no `path` — is a
+config error you must fix, so `woollamad` refuses to start and says which block
+and which field. `check-config` reports the same thing, so you can gate a reload
+on it. This is deliberate: degrading instead would start the router with pooling
+silently off for every device naming a protocol, and pooling is what enforces
+`parallel` — the setting that keeps a device from being wedged by concurrent
+loads. An unknown protocol *name* is different, and stays a warning (above).
+
 > **The unit of resolution is the device, not the route.** Inferencers sharing a
 > `management_url` share one pool and one gate (see above), and therefore one
 > protocol — resolved from whichever of them is declared **first**. Two

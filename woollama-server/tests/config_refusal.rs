@@ -243,3 +243,85 @@ fn a_second_daemon_refuses_rather_than_breaking_the_first() {
     let _ = live.kill();
     let _ = live.wait();
 }
+
+/// Issue #51: a MALFORMED `[management_protocols.*]` block stops the daemon.
+///
+/// The gap #36 left. `load_management_protocols()` returns `Err` for a block missing `kind`, and
+/// `build_state` degraded it to an empty map — so the daemon started, every inferencer naming a
+/// config-defined protocol fell into the unknown-name branch, and those devices got NO POOL:
+/// no residency tracking, no eviction, and no `parallel` enforcement, which is the setting that
+/// exists to stop a device wedging. The router reported healthy throughout.
+///
+/// Same shape as the `mcp.json` case that motivated #36 — one typo, a whole subsystem silently
+/// off — reached through a path that fix did not cover.
+#[test]
+fn a_malformed_management_protocol_block_stops_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, text) = start_daemon(
+        dir.path(),
+        &[
+            ("recipes.toml", ""),
+            ("mcp.json", r#"{"mcpServers":{}}"#),
+            (
+                "inferencers.toml",
+                // `kind` is required. A device that names this protocol would otherwise start
+                // with pooling silently disabled.
+                "[management_protocols.mybox]\nendpoints = {}\n\
+                 [inferencers.dev]\nbase_url = \"http://h/v1\"\n\
+                 management_url = \"http://h\"\nmanagement_protocol = \"mybox\"\n",
+            ),
+        ],
+    );
+    assert_eq!(code, 1, "the daemon must refuse, not start with pooling off. Output:\n{text}");
+    assert!(text.contains("mybox"), "must name the offending block: {text}");
+    assert!(
+        !text.contains("listening"),
+        "it must not announce itself before refusing: {text}"
+    );
+}
+
+/// `check-config` must refuse the same config the daemon refuses.
+///
+/// This is half the point. An operator gates a reload on `check-config`, so a check that says OK
+/// while the daemon refuses to start is worse than no check — it moves the failure from a
+/// terminal the operator is watching to a service that will not come back.
+#[test]
+fn check_config_refuses_a_malformed_management_protocol_block_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, text) = check_config(
+        dir.path(),
+        &[
+            ("recipes.toml", ""),
+            ("mcp.json", r#"{"mcpServers":{}}"#),
+            ("inferencers.toml", "[management_protocols.mybox]\nendpoints = {}\n"),
+        ],
+    );
+    assert_eq!(code, 1, "check-config must agree with the daemon: {text}");
+    assert!(text.contains("mybox"), "must name the offending block: {text}");
+}
+
+/// A WELL-FORMED protocol block still loads — the refusal must be about malformed config, not
+/// about the feature existing.
+#[test]
+fn a_well_formed_management_protocol_block_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, text) = check_config(
+        dir.path(),
+        &[
+            ("recipes.toml", ""),
+            ("mcp.json", r#"{"mcpServers":{}}"#),
+            (
+                "inferencers.toml",
+                "[management_protocols.mybox]\nkind = \"rest\"\n\
+                 [management_protocols.mybox.endpoints.running]\n\
+                 url = \"{base}/api/v1/models/running\"\npath = \"running\"\n\
+                 [management_protocols.mybox.endpoints.start]\n\
+                 url = \"{base}/api/v1/models/{id}/start\"\n\
+                 [management_protocols.mybox.endpoints.stop]\n\
+                 url = \"{base}/api/v1/models/{id}/stop\"\n",
+            ),
+        ],
+    );
+    assert_eq!(code, 0, "a valid protocol block must load: {text}");
+    assert!(text.contains("config OK"), "{text}");
+}

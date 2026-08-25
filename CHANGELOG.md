@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Fixes
+
+- **A malformed `[management_protocols.*]` block now stops the daemon instead of silently
+  disabling pooling.** The block failed to parse, `build_state` degraded it to an empty map, and
+  every inferencer naming a config-defined protocol fell through to the unknown-name branch — so
+  those devices got no pool at all: no residency tracking, no eviction, and no `parallel`
+  enforcement, which is the setting that keeps a device from being wedged by concurrent loads.
+  The router reported healthy throughout. One typo, a whole subsystem off. (#51)
+
+  This is the rule from #36 — a config the operator must fix stops the daemon rather than
+  degrading — applied to a path that fix missed. `check-config` refuses the same configs, so
+  gating a reload on it is still safe; an unknown protocol *name* remains a warn-and-skip, since
+  that is one inferencer's choice rather than an unusable file.
+
+- **The unknown-protocol warning no longer understates its blast radius.** Protocol resolution
+  happens once per `management_url`, so skipping disables pooling for *every* inferencer routed
+  to that device. The message claimed "other inferencers are unaffected" — true across devices,
+  false across routes onto one device, which is exactly where someone would look for the pool
+  that vanished. It now names the device and the routes it took down.
+
+
 ## v0.16.1 — 2026-08-24
 
 **A dropped connection now invalidates residency.** `woollama` 0.16.1 + `woollama-server` 0.15.1;
