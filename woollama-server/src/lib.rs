@@ -87,6 +87,16 @@ pub fn fatal_config_error() -> Option<String> {
     if let Err(e) = engine::Registry::from_config() {
         return Some(e.message);
     }
+    // A malformed `[management_protocols.*]` block used to degrade to an empty map, which left
+    // every inferencer naming a config-defined protocol with NO POOL — no residency tracking, no
+    // eviction, and no `parallel` enforcement, the setting that exists to stop a device wedging —
+    // while the router reported healthy. One typo, a whole subsystem silently off (#51).
+    //
+    // An unknown protocol NAME is different and stays a warn-and-skip: that is one inferencer
+    // making one choice, not a file the operator cannot have meant.
+    if let Err(e) = engine::load_management_protocols() {
+        return Some(e.message);
+    }
     None
 }
 
@@ -124,6 +134,21 @@ pub fn check_config() -> i32 {
             errors += 1;
         }
         Ok(r) => println!("recipes.toml: {} recipe(s)", r.len()),
+    }
+
+    // Must agree with `fatal_config_error` above: a check that says OK while the daemon refuses
+    // moves the failure from a terminal someone is watching to a service that will not restart.
+    match engine::load_management_protocols() {
+        Err(e) => {
+            eprintln!("error: {e}");
+            errors += 1;
+        }
+        Ok(p) if !p.is_empty() => {
+            let mut names: Vec<&str> = p.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            println!("management_protocols: {} defined ({})", p.len(), names.join(", "));
+        }
+        Ok(_) => {}
     }
 
     match engine::Registry::from_config() {
@@ -214,13 +239,19 @@ pub async fn build_state() -> AppState {
         eprintln!("woollamad: inferencers load error: {e}");
         engine::Registry::new()
     });
+    // `fatal_config_error()` refuses to start on a malformed block before we get here (#51), so
+    // this degrade-to-empty is unreachable in the daemon. It is kept for the library callers that
+    // build state directly, and it now says which failure it is degrading — the previous version
+    // printed the error and silently disabled pooling for every device naming a protocol.
     let management_protocols = engine::load_management_protocols().unwrap_or_else(|e| {
-        eprintln!("woollamad: management_protocols load error: {e}");
+        eprintln!(
+            "woollamad: management_protocols are unusable and pooling is DISABLED for every \
+             inferencer naming one: {e}"
+        );
         HashMap::new()
     });
-    // `from_registry` never fails the whole registry on a bad `management_protocol`
-    // name — it warns and skips just the offending inferencer (see its doc comment) —
-    // so there's no error path here to degrade-to-empty from.
+    // A bad `management_protocol` NAME is a different failure: `from_registry` warns and skips
+    // that device (see its doc comment), so there is no whole-registry error path here.
     let pools = Arc::new(pool::PoolRegistry::from_registry(&inferencers, &management_protocols));
     // Durable handle table at $WOOLLAMA_STATE_DIR/conversations.json (in-memory if unset).
     let state_path = std::env::var("WOOLLAMA_STATE_DIR")

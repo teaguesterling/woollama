@@ -1426,9 +1426,12 @@ impl PoolRegistry {
                     None => {
                         eprintln!(
                             "woollamad: management_protocols: WARNING: inferencer '{}': unknown \
-                             management_protocol '{other}' — skipping this inferencer (its device pool is \
-                             disabled; other inferencers are unaffected)",
-                            lead.name
+                             management_protocol '{other}' — pooling is DISABLED for this device \
+                             ({}), which means every inferencer routed to it: {}. Other devices are \
+                             unaffected.",
+                            lead.name,
+                            url,
+                            infs.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
                         );
                         continue;
                     }
@@ -1483,5 +1486,48 @@ mod tests {
         let pools = PoolRegistry::from_registry(&reg, &HashMap::new());
         assert!(pools.get("cloud").is_none(), "no management_url => no pool");
         assert!(pools.get("device").is_some(), "management_url present => pool built");
+    }
+
+    /// An unknown `management_protocol` disables the pool for EVERY inferencer sharing that
+    /// `management_url`, not just the one that named it (#51).
+    ///
+    /// Resolution happens once per device, from the lead inferencer, so `continue` skips the
+    /// whole group. The warning used to say "skipping this inferencer … other inferencers are
+    /// unaffected", which is true across devices and false across routes onto one device — and a
+    /// second route is exactly where an operator would look for the pool that vanished.
+    #[test]
+    fn an_unknown_protocol_disables_every_route_onto_that_device() {
+        fn dev(name: &str, protocol: Option<&str>) -> engine::Inferencer {
+            engine::Inferencer {
+                name: name.to_string(),
+                base_url: "http://device.example/v1".to_string(),
+                api_key_env: None,
+                extra_body: serde_json::json!({}),
+                models: Vec::new(),
+                discover: false,
+                model_patterns: Vec::new(),
+                // The SAME device, reached by two routes.
+                management_url: Some("http://device.example:8800".to_string()),
+                management_protocol: protocol.map(str::to_string),
+                parallel: 1,
+                pool_max: None,
+                queue_max: None,
+                queue_timeout: 30.0,
+                virtual_models: Default::default(),
+            }
+        }
+        let mut reg = engine::Registry::new();
+        reg.insert(dev("fast", Some("nosuchprotocol")));
+        // Declares nothing, so on its own it would resolve to the `device` preset and get a pool.
+        reg.insert(dev("slow", None));
+        reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
+
+        let pools = PoolRegistry::from_registry(&reg, &HashMap::new());
+        assert!(pools.get("fast").is_none(), "the inferencer naming the bad protocol has no pool");
+        assert!(
+            pools.get("slow").is_none(),
+            "the OTHER route onto the same device loses its pool too — this is what the warning \
+             must say, and what an operator debugging a missing pool needs to know"
+        );
     }
 }
