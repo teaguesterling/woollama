@@ -639,3 +639,143 @@ async fn a_model_dropped_underneath_the_pool_is_reloaded_on_the_next_request() {
          backend's list, which still contains the dead instance at this point"
     );
 }
+
+/// Issue #48: a DROPPED CONNECTION must invalidate residency too, not just a 5xx response.
+///
+/// Sibling of the #38 test above, and the hole that fix left. `mark_needs_reload` was wired only
+/// where the backend *answered* with a 5xx. But `forward_post` returns `Err` when the connection
+/// itself fails — reset, refused, closed mid-response — and both call sites dropped that case on
+/// the floor. So the model instance dies, the caller gets a 502, and our belief that the model is
+/// resident is never invalidated: `ensure_loaded` short-circuits on it forever after.
+///
+/// This is the LIKELIER path, not the edge case. Hardware measurement for #47 showed the device
+/// force-evicting an instance mid-request, deterministically, once per swap — and a killed
+/// request is a dropped connection, not a 5xx. The most common way a model disappears underneath
+/// us was the one way we did not notice.
+///
+/// The fixture drops the connection AND unloads the model, which is what actually happens. If it
+/// only dropped the connection, the next request would succeed with or without the fix and the
+/// test would prove nothing.
+#[tokio::test]
+async fn a_dropped_connection_also_forces_a_reload() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let resident = Arc::new(Mutex::new(vec!["M".to_string()]));
+    let starts = Arc::new(Mutex::new(0usize));
+
+    // --- the inference endpoint: a raw socket, so it can drop a connection mid-request ---
+    let chat = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chat_addr = chat.local_addr().unwrap();
+    {
+        let resident = resident.clone();
+        let mut crash_next = true;
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = chat.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                if crash_next {
+                    // The instance dies: the model goes away AND the connection drops with no
+                    // response at all. `forward_post` sees a transport error, not a status code.
+                    crash_next = false;
+                    resident.lock().unwrap().retain(|m| m != "M");
+                    drop(sock);
+                    continue;
+                }
+                let ok = resident.lock().unwrap().iter().any(|m| m == "M");
+                let (code, body) = if ok {
+                    (200, r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#.to_string())
+                } else {
+                    // A device will not serve a model it is not running. Without this the test
+                    // would pass whether or not the reload happened.
+                    (502, r#"{"error":{"message":"model is not loaded"}}"#.to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+    }
+
+    // --- the management API: an ordinary axum fixture ---
+    let mgmt_router = {
+        let resident = resident.clone();
+        let starts = starts.clone();
+        Router::new()
+            .route(
+                "/api/v1/models/running",
+                get({
+                    let r = resident.clone();
+                    move || {
+                        let r = r.clone();
+                        async move { Json(json!({"running": *r.lock().unwrap()})) }
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/models/{id}/start",
+                post({
+                    let r = resident.clone();
+                    let s = starts.clone();
+                    move |axum::extract::Path(id): axum::extract::Path<String>| {
+                        let (r, s) = (r.clone(), s.clone());
+                        async move {
+                            *s.lock().unwrap() += 1;
+                            r.lock().unwrap().push(id);
+                            Json(json!({"ok": true}))
+                        }
+                    }
+                }),
+            )
+    };
+    let ml = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mgmt_addr = ml.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(ml, mgmt_router).await.unwrap() });
+
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::write(cfg.path().join("recipes.toml"), "").unwrap();
+    std::fs::write(cfg.path().join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        cfg.path().join("inferencers.toml"),
+        format!("[inferencers.dev]\nbase_url=\"http://{chat_addr}/v1\"\nmanagement_url=\"http://{mgmt_addr}\"\n"),
+    )
+    .unwrap();
+    let _env = ENV.lock().await;
+    std::env::set_var("WOOLLAMA_CONFIG_DIR", cfg.path());
+    std::env::set_var("WOOLLAMA_STATE_DIR", cfg.path());
+    let st = Arc::new(woollama_server::build_state().await);
+    std::env::remove_var("WOOLLAMA_CONFIG_DIR");
+    std::env::remove_var("WOOLLAMA_STATE_DIR");
+
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raddr = rl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(rl, woollama_server::router(st)).await.unwrap() });
+    let c = reqwest::Client::new();
+    let call = || {
+        c.post(format!("http://{raddr}/v1/chat/completions"))
+            .json(&json!({"model": "dev/M", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+    };
+
+    // The instance dies mid-request. This failure is expected and is relayed.
+    let r = call().await.unwrap();
+    assert!(r.status().is_server_error(), "the dropped connection is relayed, got {}", r.status());
+
+    // THE POINT: the next call must recover. Without the fix the pool still believes `M` is
+    // resident, never reloads it, and the device answers "model is not loaded" forever.
+    let r = call().await.unwrap();
+    let status = r.status();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "a dropped connection must invalidate residency like a 5xx does — the pool failed \
+         identically forever instead: {body}"
+    );
+    assert!(
+        *starts.lock().unwrap() >= 1,
+        "the model must actually have been RELOADED after the connection dropped"
+    );
+}

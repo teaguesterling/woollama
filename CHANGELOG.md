@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## v0.16.1 — 2026-08-24
+
+**A dropped connection now invalidates residency.** `woollama` 0.16.1 + `woollama-server` 0.15.1;
+`woollama-core` (0.9.0) and `woollama-engine` (0.12.0) are unchanged.
+
+### Fixes
+
+- **A dropped connection now invalidates residency, like a `5xx` already did.** #38 taught the
+  pool to stop believing a model is resident after it disappears, but wired that only to the
+  backend *answering* with a `5xx`. A transport failure — reset, refused, closed mid-response —
+  took a different branch that discarded the error, so our belief survived, `ensure_loaded`
+  short-circuited on it, and **every subsequent request failed identically**. A batch job did not
+  degrade, it stopped. (#48)
+
+  This is the likelier path, not the edge case: hardware measurement for #47 showed the device
+  force-evicting an instance mid-request, deterministically, once per swap — and a killed request
+  is a dropped connection, not a `5xx`. The most common way a model disappears underneath us was
+  the one way we did not notice.
+
+  **Timeouts are deliberately excluded.** A timeout means "no answer yet", and a model that is
+  merely slow would otherwise be marked for reload — so the next request evicts and cold-loads a
+  perfectly healthy hot model, turning one slow request into a thirty-second one. Nothing fails;
+  it just quietly gets worse. That carve-out has its own unit tests, added because mutating it to
+  "always mark" passed the entire integration suite.
+
+
 ## v0.16.0 — 2026-08-18
 
 **A request for a non-resident model queues behind the model swap instead of being refused.**

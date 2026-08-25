@@ -454,17 +454,37 @@ async fn forward_post(
     headers: &HashMap<String, String>,
     timeout: u64,
 ) -> Result<reqwest::Response, Response> {
+    forward_post_classified(url, body, headers, timeout).await.map_err(|(resp, _)| resp)
+}
+
+/// `forward_post`, plus whether the failure suggests the model INSTANCE is gone rather than
+/// merely slow. Only the pooled path needs the second half — see the call sites in
+/// `passthrough_pooled` and #48.
+///
+/// The distinction is the whole point. A **timeout** means "no answer yet": the model may be
+/// perfectly healthy and just slow, and marking it for reload would evict and cold-load it for
+/// nothing — turning a slow request into a 30-second one and a hot model into a cold one. Every
+/// other transport failure means the connection itself did not work, which is exactly what a
+/// dying instance looks like from here.
+async fn forward_post_classified(
+    url: String,
+    body: &Value,
+    headers: &HashMap<String, String>,
+    timeout: u64,
+) -> Result<reqwest::Response, (Response, bool)> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout))
         .build()
-        .map_err(|e| err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"))?;
+        // Our own failure to build a client says nothing about the model.
+        .map_err(|e| (err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"), false))?;
     let mut rb = client.post(url).json(body);
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
-    rb.send()
-        .await
-        .map_err(|e| err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"))
+    rb.send().await.map_err(|e| {
+        let model_may_be_gone = !e.is_timeout();
+        (err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"), model_may_be_gone)
+    })
 }
 
 async fn relay_json(resp: reqwest::Response) -> Response {
@@ -1505,9 +1525,18 @@ async fn passthrough_pooled(
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
-        let resp = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
+        let resp = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
             Ok(r) => r,
-            Err(e) => return e,
+            // The connection failed rather than the backend answering. #38 wired the reload
+            // marker only to a 5xx RESPONSE, so this branch left our residency belief intact and
+            // every later request short-circuited on it — the exact failure #38 exists to
+            // prevent, reached by the likelier route (#48).
+            Err((resp, model_may_be_gone)) => {
+                if model_may_be_gone {
+                    manager.mark_needs_reload(&real);
+                }
+                return resp;
+            }
         };
         if resp.status().as_u16() >= 400 {
             // The backend just refused. Re-check what it is actually running so a model that was
@@ -1533,7 +1562,7 @@ async fn passthrough_pooled(
     }
 
     fwd["stream"] = json!(false);
-    let result = match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
+    let result = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
         Ok(resp) => {
             // See the streaming branch: a 5xx may mean the model went away underneath us.
             let server_error = resp.status().as_u16() >= 500;
@@ -1543,7 +1572,15 @@ async fn passthrough_pooled(
             }
             relayed
         }
-        Err(e) => e,
+        // A dropped connection says the same thing more emphatically than a 5xx does: a 5xx can
+        // be an ordinary application error from a perfectly healthy model, whereas a connection
+        // that died mid-request is what an instance being torn down looks like (#48).
+        Err((resp, model_may_be_gone)) => {
+            if model_may_be_gone {
+                manager.mark_needs_reload(&real);
+            }
+            resp
+        }
     };
     // `slot` drops here (end of scope), after the dispatch has completed.
     result
@@ -2254,5 +2291,67 @@ mod address_tests {
         assert_eq!(parse_tcp_address("[::1]"), ("::1".into(), 0));
         // the exact old-panic input never yields the bogus host `"["`
         assert_ne!(parse_tcp_address("[::]:8080").0, "[");
+    }
+}
+
+#[cfg(test)]
+mod forward_classification_tests {
+    use super::*;
+
+    /// A TIMEOUT must not be reported as "the model may be gone" (#48).
+    ///
+    /// This exists because the carve-out is otherwise untested: mutating
+    /// `!e.is_timeout()` to a bare `true` passed the whole integration suite. The
+    /// consequence of getting it wrong is quiet and expensive — a model that is merely slow
+    /// gets marked for reload, so the next request evicts and cold-loads a perfectly healthy
+    /// hot model, turning one slow request into a 30-second one. Nothing fails; it just gets
+    /// worse, which is the hardest kind of regression to notice later.
+    #[tokio::test]
+    async fn a_timeout_does_not_mean_the_model_is_gone() {
+        // A server that accepts and then never answers.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = l.accept().await.unwrap();
+                // Hold the connection open, answering nothing, until the client gives up.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let err = forward_post_classified(
+            format!("http://{addr}/v1/chat/completions"),
+            &json!({"model": "m"}),
+            &HashMap::new(),
+            1, // 1s client timeout
+        )
+        .await
+        .expect_err("the server never answers, so this must fail");
+
+        assert!(!err.1, "a timeout must NOT mark the model for reload — it may be healthy and slow");
+    }
+
+    /// A refused connection MUST mean the model may be gone — the case #48 was filed for.
+    #[tokio::test]
+    async fn a_refused_connection_means_the_model_may_be_gone() {
+        // Bind and immediately drop, so the port is almost certainly closed.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+
+        let err = forward_post_classified(
+            format!("http://{addr}/v1/chat/completions"),
+            &json!({"model": "m"}),
+            &HashMap::new(),
+            30,
+        )
+        .await
+        .expect_err("nothing is listening, so this must fail");
+
+        assert!(err.1, "a connection failure must mark the model for reload");
     }
 }
