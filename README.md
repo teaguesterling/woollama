@@ -155,6 +155,29 @@ On startup `woollamad` prints its `OpenAI base_url` (e.g.
 written to `$XDG_RUNTIME_DIR/woollama.addr` for programmatic discovery, and it
 serves the same surface over the `woollama.sock` unix socket.)
 
+### Python 3.14: you will build from source, slowly
+
+The `woollama` **Python** package depends on `woollama-core`, a compiled extension. We ship
+wheels for **CPython 3.11–3.13 only** — pyo3 could not build against 3.14 until recently, and the
+cp314 wheels are not published yet (#43).
+
+Our metadata says `requires-python = ">=3.11"` with no upper bound, which is true — 3.14 works —
+but on 3.14 there is no wheel, so the install falls back to **building the extension from
+source**. That needs a Rust toolchain and takes minutes rather than seconds.
+
+The trap is that `uv` picks an interpreter for you. `uv sync` in a project that merely allows
+3.11+ will happily select 3.14 and then do a source build, or fail outright if no Rust toolchain
+is present — and the error names `python-source` and maturin, neither of which mentions us. If
+you want wheels today, pin the interpreter:
+
+```sh
+uv sync --python 3.12            # or any of 3.11-3.13
+```
+
+Any project depending on `woollama-core` **below 0.9.0** should pin 3.11–3.13 outright: those
+versions cannot build on 3.14 at all, and every `woollama-core` sdist at or below 0.8.1 is
+unbuildable on *any* Python (fixed in 0.8.2 — see the changelog for v0.14.4).
+
 ### The Python reference server
 
 The original Python implementation still runs and is used as the live oracle that
