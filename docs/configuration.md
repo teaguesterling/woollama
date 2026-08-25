@@ -710,17 +710,30 @@ Two presets are built in:
 | `device` | `GET {base}/api/v1/models/running`, `POST {base}/api/v1/models/{id}/{start,stop}` |
 | `ollama` | `GET {base}/api/ps`; load/unload via `POST {base}/api/generate` with `keep_alive` (`0` unloads) |
 
-**Resolution order**, at startup, per management-capable inferencer:
+**Resolution order**, at startup, once per `management_url` — *not* once per
+inferencer (see below):
 
 1. built-in presets (`device`, `ollama`);
 2. config-defined `[management_protocols.<name>]` blocks;
-3. an unknown name is a clear config error — and it skips **only that
-   inferencer**, leaving the rest of the router usable;
+3. an unknown name is a clear config error — that device gets no pool, and other
+   devices are unaffected;
 4. **back-compat:** `management_url` with no `management_protocol` ⇒ `device`,
    so existing configs are unchanged.
 
 A config-defined block may not shadow a built-in name; doing so is warned about
 and ignored.
+
+> **The unit of resolution is the device, not the route.** Inferencers sharing a
+> `management_url` share one pool and one gate (see above), and therefore one
+> protocol — resolved from whichever of them is declared **first**. Two
+> consequences worth knowing before you rely on either:
+>
+> - A second inferencer's `management_protocol` is **ignored**, with a warning.
+>   Declaring `device` on one route and `ollama` on another route to the same
+>   device does not give you two backends; it gives you the first one twice.
+> - An unknown protocol name disables pooling for **every** inferencer sharing
+>   that `management_url`, not just the one that named it. Other devices keep
+>   working; other routes onto the *same* device do not.
 
 #### Defining your own (`[management_protocols.<name>]`)
 
