@@ -454,7 +454,37 @@ async fn forward_post(
     headers: &HashMap<String, String>,
     timeout: u64,
 ) -> Result<reqwest::Response, Response> {
-    forward_post_classified(url, body, headers, timeout).await.map_err(|(resp, _)| resp)
+    forward_post_classified(url, body, headers, timeout).await.map_err(ForwardFailure::into_response)
+}
+
+/// Why a forwarded request failed, in the only terms the pooled path cares about.
+///
+/// Named variants rather than a `(Response, bool)` pair: the bool needed a comment at every call
+/// site to say which way round it went, and an `Err` carrying a whole `Response` is large enough
+/// that clippy's `result_large_err` rejects it. Carrying the message and building the response on
+/// demand keeps the error small and says what happened.
+enum ForwardFailure {
+    /// The connection did not work — reset, refused, closed mid-response. This is what a model
+    /// instance being torn down looks like from here, so the pool must stop believing it is
+    /// resident (#48).
+    ConnectionFailed(String),
+    /// A timeout, or our own failure to build a client. Says nothing about whether the model is
+    /// still there: it may be perfectly healthy and slow, and marking it for reload would evict
+    /// and cold-load a hot model for nothing.
+    Inconclusive(String),
+}
+
+impl ForwardFailure {
+    fn model_may_be_gone(&self) -> bool {
+        matches!(self, ForwardFailure::ConnectionFailed(_))
+    }
+
+    fn into_response(self) -> Response {
+        let msg = match self {
+            ForwardFailure::ConnectionFailed(m) | ForwardFailure::Inconclusive(m) => m,
+        };
+        err_response(StatusCode::BAD_GATEWAY, msg, "server_error")
+    }
 }
 
 /// `forward_post`, plus whether the failure suggests the model INSTANCE is gone rather than
@@ -471,19 +501,22 @@ async fn forward_post_classified(
     body: &Value,
     headers: &HashMap<String, String>,
     timeout: u64,
-) -> Result<reqwest::Response, (Response, bool)> {
+) -> Result<reqwest::Response, ForwardFailure> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout))
         .build()
         // Our own failure to build a client says nothing about the model.
-        .map_err(|e| (err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"), false))?;
+        .map_err(|e| ForwardFailure::Inconclusive(e.to_string()))?;
     let mut rb = client.post(url).json(body);
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
     rb.send().await.map_err(|e| {
-        let model_may_be_gone = !e.is_timeout();
-        (err_response(StatusCode::BAD_GATEWAY, e.to_string(), "server_error"), model_may_be_gone)
+        if e.is_timeout() {
+            ForwardFailure::Inconclusive(e.to_string())
+        } else {
+            ForwardFailure::ConnectionFailed(e.to_string())
+        }
     })
 }
 
@@ -1531,11 +1564,11 @@ async fn passthrough_pooled(
             // marker only to a 5xx RESPONSE, so this branch left our residency belief intact and
             // every later request short-circuited on it — the exact failure #38 exists to
             // prevent, reached by the likelier route (#48).
-            Err((resp, model_may_be_gone)) => {
-                if model_may_be_gone {
+            Err(e) => {
+                if e.model_may_be_gone() {
                     manager.mark_needs_reload(&real);
                 }
-                return resp;
+                return e.into_response();
             }
         };
         if resp.status().as_u16() >= 400 {
@@ -1575,11 +1608,11 @@ async fn passthrough_pooled(
         // A dropped connection says the same thing more emphatically than a 5xx does: a 5xx can
         // be an ordinary application error from a perfectly healthy model, whereas a connection
         // that died mid-request is what an instance being torn down looks like (#48).
-        Err((resp, model_may_be_gone)) => {
-            if model_may_be_gone {
+        Err(e) => {
+            if e.model_may_be_gone() {
                 manager.mark_needs_reload(&real);
             }
-            resp
+            e.into_response()
         }
     };
     // `slot` drops here (end of scope), after the dispatch has completed.
@@ -2331,7 +2364,7 @@ mod forward_classification_tests {
         .await
         .expect_err("the server never answers, so this must fail");
 
-        assert!(!err.1, "a timeout must NOT mark the model for reload — it may be healthy and slow");
+        assert!(!err.model_may_be_gone(), "a timeout must NOT mark the model for reload — it may be healthy and slow");
     }
 
     /// A refused connection MUST mean the model may be gone — the case #48 was filed for.
@@ -2352,6 +2385,6 @@ mod forward_classification_tests {
         .await
         .expect_err("nothing is listening, so this must fail");
 
-        assert!(err.1, "a connection failure must mark the model for reload");
+        assert!(err.model_may_be_gone(), "a connection failure must mark the model for reload");
     }
 }
