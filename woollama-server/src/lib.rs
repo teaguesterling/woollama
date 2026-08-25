@@ -448,13 +448,19 @@ fn engine_err_response(e: EngineError) -> Response {
     }
 }
 
+/// Forward a JSON POST upstream.
+///
+/// Returns the small `ForwardFailure` rather than a built `Response`: an `Err` carrying a whole
+/// `axum::Response` is over clippy's `result_large_err` threshold, and that cost is paid on the
+/// success path too, since a `Result` is as large as its largest variant. Callers that just want
+/// to relay the failure call `.into_response()`; the pooled path asks `model_may_be_gone()` first.
 async fn forward_post(
     url: String,
     body: &Value,
     headers: &HashMap<String, String>,
     timeout: u64,
-) -> Result<reqwest::Response, Response> {
-    forward_post_classified(url, body, headers, timeout).await.map_err(ForwardFailure::into_response)
+) -> Result<reqwest::Response, ForwardFailure> {
+    forward_post_classified(url, body, headers, timeout).await
 }
 
 /// Why a forwarded request failed, in the only terms the pooled path cares about.
@@ -570,7 +576,7 @@ async fn native_stream(
     let req = ollama_native::to_native_request(fwd);
     let resp = match forward_post(url, &req, headers, 600).await {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return e.into_response(),
     };
     if resp.status().as_u16() >= 400 {
         return relay_json(resp).await;
@@ -1215,7 +1221,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<V
     fwd["stream"] = json!(false);
     match forward_post(inf.chat_url(), &fwd, &headers, 180).await {
         Ok(resp) => relay_json(resp).await,
-        Err(e) => e,
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1259,7 +1265,7 @@ async fn images_generations(State(state): State<Arc<AppState>>, Json(body): Json
 
     match forward_post(inf.images_url(), &fwd, &headers, 300).await {
         Ok(resp) => relay_json(resp).await,
-        Err(e) => e,
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1302,7 +1308,7 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
 
     match forward_post(inf.embeddings_url(), &fwd, &headers, 180).await {
         Ok(resp) => relay_json(resp).await,
-        Err(e) => e,
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1316,7 +1322,7 @@ async fn passthrough_native(
     let req = ollama_native::to_native_request(fwd);
     let resp = match forward_post(url, &req, headers, 600).await {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return e.into_response(),
     };
     if resp.status().as_u16() >= 400 {
         return relay_json(resp).await;
@@ -1334,7 +1340,7 @@ async fn passthrough_stream(
 ) -> Response {
     let resp = match forward_post(inf.chat_url(), fwd, headers, 180).await {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return e.into_response(),
     };
     if resp.status().as_u16() >= 400 {
         return relay_json(resp).await;
