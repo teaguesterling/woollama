@@ -31,6 +31,32 @@
 
 ### Fixes
 
+- **In-flight work is no longer killed by a swap the device forces.** woollama's eviction
+  protection assumed woollama was the only party that evicts. On a capacity-bound device with
+  `pool_max` unset — the correct configuration, since `pool_max` counts *models* while the
+  hardware counts *capacity* — we never evict at all: we issue `start` and the device makes room
+  by killing something. Measured on hardware: one in-flight request lost per swap,
+  deterministically, with **zero `stop` calls** in a logging proxy. The protection did not fail;
+  it never applied. (#47)
+
+  woollamad now asks the backend, immediately before a load, whether that load will force an
+  eviction and of what. If the named victim has work of ours, the load waits for it to drain,
+  bounded by `queue_timeout`. We cannot decline a device-forced eviction — but nothing else on
+  that device initiates one, so we control *when* it happens, which is enough.
+
+  Costs **one call per load**, not per request (~192 ms measured, against a 25–30 s cold load).
+  Backends that cannot answer are unaffected: the default reports "no eviction required, or I
+  cannot say" as a single answer, deliberately, so a backend that cannot speak is never mistaken
+  for one saying no.
+
+  **Limits, stated rather than promised:** we can only drain work *we* know about — another
+  consumer's in-flight request on the victim is invisible to us and the device will kill it. And
+  a victim that never drains does not block the caller: after the deadline the load proceeds
+  anyway, because refusing would trade a request we might have lost for one we certainly lose.
+
+
+### Fixes
+
 - **A malformed `[management_protocols.*]` block now stops the daemon instead of silently
   disabling pooling.** The block failed to parse, `build_state` degraded it to an empty map, and
   every inferencer naming a config-defined protocol fell through to the unknown-name branch — so

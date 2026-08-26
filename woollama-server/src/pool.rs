@@ -133,6 +133,23 @@ pub trait DeviceBackend: Send + Sync {
     }
     async fn load(&self, id: &str) -> Result<(), PoolError>;
     async fn unload(&self, id: &str) -> Result<(), PoolError>;
+
+    /// Will loading `id` force the device to evict something, and if so, what?
+    ///
+    /// `Ok(None)` means **either** "no eviction required" **or** "this backend cannot say", and
+    /// those are deliberately the same answer: a backend that cannot speak must never be mistaken
+    /// for one that said "no". Callers get no new protection from it — they land exactly where
+    /// they are today.
+    ///
+    /// Why this exists at all: our eviction protection assumes woollama is the only party that
+    /// evicts. On a capacity-bound device with `pool_max` unset — which is the correct
+    /// configuration where `pool_max` counts models and the hardware counts capacity — we never
+    /// evict, so we issue `start` and the DEVICE makes room by killing something. Measured: one
+    /// in-flight request lost per swap, deterministically, with zero `stop` calls in the proxy
+    /// log. The protection did not fail; it never applied (#47).
+    async fn unload_candidate(&self, _id: &str) -> Result<Option<String>, PoolError> {
+        Ok(None)
+    }
 }
 
 /// One HTTP call (`running`/`start`/`stop`) fully resolved against a base URL and
@@ -631,6 +648,11 @@ pub struct DeviceModelManager {
     ///
     /// One reservation at a time: a second would-be swapper waits its turn behind the first.
     swap_reservation: StdMutex<Option<String>>,
+    /// How long to wait for OUR in-flight work on a device-named victim to drain before issuing
+    /// the load that kills it, in milliseconds. Set by `Gate::new` from `queue_timeout`, so a
+    /// manager reached through a gate — which is all of them in production — inherits the same
+    /// budget as every other wait. `0` disables the wait entirely (#47).
+    forced_swap_wait_ms: AtomicU64,
     /// Bumped whenever a model becomes idle or a reservation clears, so waiters re-check rather
     /// than poll.
     ///
@@ -667,6 +689,7 @@ impl DeviceModelManager {
             needs_reload: StdMutex::new(std::collections::HashSet::new()),
             residency_lock: AsyncMutex::new(()),
             swap_reservation: StdMutex::new(None),
+            forced_swap_wait_ms: AtomicU64::new(0),
             swap_epoch: watch::Sender::new(0),
         }
     }
@@ -791,6 +814,61 @@ impl DeviceModelManager {
         self.swap_reservation.lock().unwrap().clone()
     }
 
+    /// Set the budget for waiting out a device-forced swap. Called once by `Gate::new`.
+    pub fn set_forced_swap_wait(&self, secs: f64) {
+        self.forced_swap_wait_ms.store((secs.max(0.0) * 1000.0) as u64, Ordering::SeqCst);
+    }
+
+    /// True if we have work of our own on `real_id` — in flight or queued.
+    fn is_busy(&self, real_id: &str) -> bool {
+        let entries = self.entries.lock().unwrap();
+        entries.get(real_id).map(|e| e.in_flight > 0 || e.queued > 0).unwrap_or(false)
+    }
+
+    /// Hold back the load that would make the device evict work we are still serving (#47).
+    ///
+    /// We cannot decline a device-forced eviction — measured: a holder issuing a request every
+    /// 0.5s, continuously busy, was evicted mid-stream anyway. What we control is WHEN the load
+    /// is issued, because nothing else on that device initiates an eviction (zero `stop` calls in
+    /// a full contention cycle's proxy log).
+    ///
+    /// Returns after the victim drains, or after the budget, whichever comes first. Timing out is
+    /// not a refusal: we load anyway, because declining would trade a request we MIGHT have lost
+    /// for one we certainly lose. `load_lock` is held throughout, which is intended — one swap at
+    /// a time — and does not block the victim from draining, since requests for a resident model
+    /// take the fast path above without touching this lock.
+    async fn await_forced_swap_victim(&self, real_id: &str) {
+        let budget = self.forced_swap_wait_ms.load(Ordering::SeqCst);
+        if budget == 0 {
+            return;
+        }
+        let victim = match self.backend.unload_candidate(real_id).await {
+            Ok(Some(v)) => v,
+            // No eviction required, or the backend cannot say. Deliberately the same answer: a
+            // backend that cannot speak must not be read as having said "no".
+            Ok(None) => return,
+            // A failed pre-flight must not block the load it was only meant to schedule.
+            Err(e) => {
+                eprintln!("woollamad: unload_candidate({real_id}) failed, loading anyway: {e}");
+                return;
+            }
+        };
+        let mut rx = self.swap_watch();
+        let deadline = Instant::now() + Duration::from_millis(budget);
+        while self.is_busy(&victim) {
+            let now = Instant::now();
+            if now >= deadline {
+                eprintln!(
+                    "woollamad: loading '{real_id}' will make the device evict '{victim}', which \
+                     still has work of ours after {}s — proceeding anyway; that work will fail",
+                    budget as f64 / 1000.0
+                );
+                return;
+            }
+            Self::await_swap_change(&mut rx, deadline - now).await;
+        }
+    }
+
     /// Record that something which could change a swap decision has happened.
     fn bump_swap_epoch(&self) {
         self.swap_epoch.send_modify(|v| *v = v.wrapping_add(1));
@@ -912,6 +990,8 @@ impl DeviceModelManager {
             }
         }
 
+        // Immediately before the load, because the load IS what makes the device make room.
+        self.await_forced_swap_victim(real_id).await;
         self.backend.load(real_id).await?;
         self.mark_loaded(real_id);
         Ok(())
@@ -1107,6 +1187,9 @@ impl Gate {
         pool_max: Option<u32>,
         retry_after: f64,
     ) -> Self {
+        // One budget for every wait in the pool: a caller's patience should not depend on which
+        // internal mechanism happens to be making them wait.
+        manager.set_forced_swap_wait(queue_timeout);
         Gate {
             manager,
             parallel: parallel.max(1) as usize,
