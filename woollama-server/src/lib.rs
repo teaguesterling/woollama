@@ -438,6 +438,10 @@ pub fn router(state: Arc<AppState>) -> Router {
     router
         .nest_service("/mcp", mcp_svc)
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+        // Outermost, so every route is covered — including the reverse-proxy mounts above and
+        // anything added later. A layer someone must remember to attach per-route is a layer that
+        // will be missing from the route that matters.
+        .layer(axum::middleware::from_fn(access_log))
         .with_state(state)
 }
 
@@ -557,10 +561,77 @@ async fn forward_post_classified(
     })
 }
 
+/// Marks a response whose status came from the BACKEND rather than from woollama.
+///
+/// Recorded where it is known — at the point of relaying — because the access-log layer cannot
+/// tell the difference from outside, and inferring it is exactly the mistake this exists to stop.
+/// A `502` we generated on a dead connection and a `502` the backend sent are indistinguishable
+/// in the response; only the code that produced it knows which happened.
+#[derive(Clone, Copy)]
+struct RelayedFrom(u16);
+
 async fn relay_json(resp: reqwest::Response) -> Response {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream = resp.status().as_u16();
+    let status = StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY);
     let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
-    (status, Json(data)).into_response()
+    let mut out = (status, Json(data)).into_response();
+    out.extensions_mut().insert(RelayedFrom(upstream));
+    out
+}
+
+/// One line per request, so the component in the middle of every call can say what it did.
+///
+/// woollamad is the mandated path for all device traffic and, until this, said nothing on the
+/// success path — nine `eprintln!`s, all failures. Three separate investigations in one evening
+/// read a silence as evidence: no nginx entry, no device session, no journal line. Each was a log
+/// silent about things it never recorded, taken for a log that would have spoken (#49).
+///
+/// `origin` is the field that earns this. It answers the question a caller cannot answer from
+/// outside — did this status come from the backend, or from us?
+///
+///   origin=relayed upstream=504   the backend said so
+///   origin=local                  woollamad produced it (the 180s forward timeout -> 502)
+///   (no line at all)              the request never reached woollamad
+///
+/// The three are only distinguishable because a line is emitted on EVERY outcome, including those
+/// with no upstream response. A blank field that means two things answers wrongly rather than not
+/// at all — a null must say why it is null.
+fn access_log_enabled() -> bool {
+    access_log_enabled_for(std::env::var("WOOLLAMA_ACCESS_LOG").ok().as_deref())
+}
+
+/// The rule itself, taking the value rather than reading the environment.
+///
+/// Split out so a test can exercise THIS function instead of a copy of its condition. The
+/// version before it took an argument could only be tested by re-deriving `matches!(...)` in the
+/// test and comparing that to the expected answer — which passes whatever this function does, and
+/// is a check whose operand comes from inside the thing it checks.
+fn access_log_enabled_for(v: Option<&str>) -> bool {
+    !matches!(v, Some("0") | Some("false") | Some("off"))
+}
+
+/// The line itself, as a pure function so the format is testable without capturing stderr.
+fn format_access_line(method: &str, path: &str, status: u16, elapsed_ms: u128, upstream: Option<u16>) -> String {
+    match upstream {
+        Some(u) => format!("woollamad: {method} {path} {status} {elapsed_ms}ms origin=relayed upstream={u}"),
+        None => format!("woollamad: {method} {path} {status} {elapsed_ms}ms origin=local"),
+    }
+}
+
+async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !access_log_enabled() {
+        return next.run(req).await;
+    }
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let upstream = resp.extensions().get::<RelayedFrom>().map(|r| r.0);
+    eprintln!(
+        "{}",
+        format_access_line(&method, &path, resp.status().as_u16(), started.elapsed().as_millis(), upstream)
+    );
+    resp
 }
 
 // --- SSE helpers --------------------------------------------------------------
@@ -2423,5 +2494,62 @@ mod forward_classification_tests {
         .expect_err("nothing is listening, so this must fail");
 
         assert!(err.model_may_be_gone(), "a connection failure must mark the model for reload");
+    }
+}
+
+#[cfg(test)]
+mod access_line_tests {
+    use super::*;
+
+    /// The three states must be distinguishable, and the token must be explicit.
+    ///
+    /// An inferred absence ("no upstream field, therefore local") collapses *we generated it* and
+    /// *we never saw the request*. That is the distinction the whole line exists to make, and a
+    /// blank meaning two things answers wrongly rather than declining to answer (#49).
+    #[test]
+    fn relayed_and_local_are_explicitly_distinguishable() {
+        let relayed = format_access_line("POST", "/v1/chat/completions", 504, 60_123, Some(504));
+        assert!(relayed.contains("origin=relayed"), "{relayed}");
+        assert!(relayed.contains("upstream=504"), "the backend's own status must be carried: {relayed}");
+
+        let local = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None);
+        assert!(local.contains("origin=local"), "{local}");
+        assert!(
+            !local.contains("upstream"),
+            "a locally-generated status must carry NO upstream field — an empty one would read as \
+             'the backend returned nothing', which is a different claim: {local}"
+        );
+    }
+
+    /// A relayed status that happens to equal what we would have generated must still say
+    /// `relayed`. This is the case the field exists for: a 502 from a dead connection and a 502
+    /// from the backend are identical in the response and mean opposite things.
+    #[test]
+    fn an_identical_status_from_either_side_is_still_distinguishable() {
+        let from_backend = format_access_line("POST", "/v1/chat/completions", 502, 12, Some(502));
+        let from_us = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None);
+        assert_ne!(from_backend, from_us, "the whole point is that these differ");
+        assert!(from_backend.contains("origin=relayed upstream=502"));
+        assert!(from_us.contains("origin=local"));
+    }
+
+    /// Disabling is opt-out, not opt-in. The default has to be ON: the defect this closes is that
+    /// woollamad said nothing, and a diagnostic nobody enabled is the same as no diagnostic.
+    #[test]
+    fn the_access_log_defaults_to_on() {
+        for (v, want) in [
+            (None, true),           // unset => ON. The defect being closed is that woollamad said
+                                    // nothing; a diagnostic nobody enabled is no diagnostic.
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("off"), false),
+            (Some("1"), true),
+            (Some(""), true),       // set-but-empty is not "off"
+        ] {
+            // Calls the real function. An earlier version of this test re-derived the `matches!`
+            // condition and compared it to `want`, which passes whatever the function does —
+            // f(x) == f(x) with extra steps.
+            assert_eq!(access_log_enabled_for(v), want, "WOOLLAMA_ACCESS_LOG={v:?}");
+        }
     }
 }

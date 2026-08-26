@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Features
+
+- **woollamad now emits one access line per request**, so the component in the middle of every
+  call can say what it did. It previously said nothing on the success path — nine `eprintln!`s,
+  all failures — and has no logging framework at all, so there was no verbosity to raise. (#49)
+
+  ```
+  woollamad: POST /v1/chat/completions 504 60123ms origin=relayed upstream=504
+  woollamad: POST /v1/chat/completions 502 180000ms origin=local
+  ```
+
+  `origin` is the field that earns the line. It answers what a caller cannot determine from
+  outside — **did this status come from the backend, or from us?** A `502` we generate on a dead
+  connection and a `502` the backend sends are identical in the response and mean opposite things.
+  Three states, deliberately distinguishable: `origin=relayed` with the backend's own status,
+  `origin=local` with **no** upstream field, and *no line at all* meaning the request never
+  reached woollamad. A line is emitted on every outcome, which is what makes absence meaningful.
+
+  Motivated by a real attribution: three sessions spent an evening deciding whether a 504 came
+  from the device or from a client hop, and read three separate silences as evidence along the
+  way — no nginx entry, no device session, no journal line. Each was a log silent about things it
+  never recorded, taken for a log that would have spoken.
+
+  On by default. `WOOLLAMA_ACCESS_LOG=0` disables it. The default is deliberate: the defect being
+  closed is that woollamad said nothing, and a diagnostic nobody enabled is no diagnostic.
+
+
 ### Fixes
 
 - **A malformed `[management_protocols.*]` block now stops the daemon instead of silently
