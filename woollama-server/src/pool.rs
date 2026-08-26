@@ -136,10 +136,13 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Will loading `id` force the device to evict something, and if so, what?
     ///
-    /// `Ok(None)` means **either** "no eviction required" **or** "this backend cannot say", and
-    /// those are deliberately the same answer: a backend that cannot speak must never be mistaken
-    /// for one that said "no". Callers get no new protection from it — they land exactly where
-    /// they are today.
+    /// Three states, not two. An earlier version returned `Option<String>`, merging "no eviction
+    /// required" with "this backend cannot say" on the argument that a backend which cannot speak
+    /// must not be read as saying no. The argument is right; collapsing them into one value was
+    /// still wrong, because the merge hid a bug living exactly in that distinction — the `device`
+    /// preset had no implementation at all, so every call took the default and logged "no
+    /// eviction required (or backend cannot say)" while the device, asked directly, was saying
+    /// `unload_required: true`. A null must say why it is null, in the type (#47).
     ///
     /// Why this exists at all: our eviction protection assumes woollama is the only party that
     /// evicts. On a capacity-bound device with `pool_max` unset — which is the correct
@@ -147,9 +150,28 @@ pub trait DeviceBackend: Send + Sync {
     /// evict, so we issue `start` and the DEVICE makes room by killing something. Measured: one
     /// in-flight request lost per swap, deterministically, with zero `stop` calls in the proxy
     /// log. The protection did not fail; it never applied (#47).
-    async fn unload_candidate(&self, _id: &str) -> Result<Option<String>, PoolError> {
-        Ok(None)
+    async fn unload_candidate(&self, _id: &str) -> Result<SwapForecast, PoolError> {
+        Ok(SwapForecast::Unknown)
     }
+}
+
+/// What a backend says about the consequences of loading a model.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SwapForecast {
+    /// This backend has no way to answer. Distinct from `NoEviction` deliberately: they justify
+    /// opposite confidence, and treating them alike is what let an unimplemented method look
+    /// exactly like a device reporting nothing to do.
+    Unknown,
+    /// The device says loading will evict nothing.
+    NoEviction,
+    /// The device says loading will evict these — **all** of them.
+    ///
+    /// A list, not one id, because the singular `candidate` field the device also returns is not
+    /// the whole victim set. Measured on hardware with a busy 30B and an idle embedder resident:
+    /// `candidate` named the idle embedder while `model_id[]` carried both. Keying an "is the
+    /// victim busy?" check on `candidate` alone sees an idle victim, skips the wait, and kills
+    /// the busy one.
+    Evicts(Vec<String>),
 }
 
 /// One HTTP call (`running`/`start`/`stop`) fully resolved against a base URL and
@@ -261,6 +283,15 @@ pub struct RestBackend {
     /// so it is a per-backend detail rather than an assumption: absent ⇒ no discovery, which means
     /// "unknown" and therefore no behaviour change.
     detail: Option<DetailSpec>,
+    /// The `device` preset's read-only swap forecast (`GET {base}/api/v1/models/{id}/unload_candidate`).
+    ///
+    /// `None` for config-defined REST protocols, which have no equivalent and must therefore
+    /// answer `Unknown` rather than be assumed to mean "no eviction" — a distinction that is the
+    /// whole reason `SwapForecast` has three variants.
+    ///
+    /// Verified non-evicting on hardware: the GET returned in 0.02s and the in-flight holder
+    /// survived it, which is what makes learn-then-drain-then-load viable at all.
+    unload_candidate: Option<CompiledEndpoint>,
     poll_interval: f64,
     load_timeout: f64,
 }
@@ -307,6 +338,8 @@ impl RestBackend {
             // describes endpoints, not payload semantics, and guessing where a stranger's backend
             // puts capability data is exactly the inference this design refuses to make.
             detail: None,
+            // Same reasoning: no forecast endpoint declared, so this backend answers `Unknown`.
+            unload_candidate: None,
             poll_interval,
             load_timeout,
         }
@@ -352,12 +385,28 @@ impl RestBackend {
         // The device publishes per-model capabilities in `instances.running[]`, a SIBLING of the
         // bare-string `running` array in the same response — so discovery costs no extra call.
         // Verified against a live device payload rather than inferred.
-        RestBackend::from_spec(&management_url, &headers, &running, &start, &stop, poll_interval, load_timeout)
+        // Read-only swap forecast. GET, no body, and measured non-evicting on hardware.
+        let forecast = engine::EndpointSpec {
+            url: "{base}/api/v1/models/{id}/unload_candidate".to_string(),
+            method: None,
+            body: None,
+            headers: Default::default(),
+            path: None,
+            id_field: None,
+        };
+        let mut b = RestBackend::from_spec(&management_url, &headers, &running, &start, &stop, poll_interval, load_timeout)
             .with_detail(DetailSpec {
                 path: "instances.running".to_string(),
                 id_field: "model_id".to_string(),
                 capabilities_field: "capabilities".to_string(),
-            })
+            });
+        b.unload_candidate = Some(compile_endpoint(
+            management_url.trim_end_matches('/'),
+            &headers,
+            &forecast,
+            reqwest::Method::GET,
+        ));
+        b
     }
 
     /// Issue one templated call: apply `endpoint.render(id)`'s method/url/body/headers
@@ -420,6 +469,59 @@ impl RestBackend {
 
 #[async_trait::async_trait]
 impl DeviceBackend for RestBackend {
+    /// `GET {base}/api/v1/models/{id}/unload_candidate` — the device's own forecast.
+    ///
+    /// Keyed on `model_id[]`, the **full** victim set, not the singular `candidate`. Measured on
+    /// hardware with a busy 30B and an idle embedder resident, asking about a 55% model:
+    ///
+    /// ```text
+    /// candidate  : { Qwen3-Embedding-0.6B, active_request_count: 0 }   <- singular, IDLE
+    /// model_id[] : [ Qwen3-Embedding-0.6B, Qwen3-30B-A3B-Instruct ]    <- the busy holder is HERE
+    /// unload_required: true
+    /// ```
+    ///
+    /// Keying on `candidate` sees an idle victim, skips the wait, loads, and the device kills the
+    /// busy one. `active_request_count` is deliberately ignored: it is offset, not stale — a
+    /// freshly loaded instance that has served nothing reads 1, or 5, with a per-instance floor —
+    /// so `> 0` is the wrong predicate. We gate on our OWN in-flight bookkeeping, which has a
+    /// real zero.
+    async fn unload_candidate(&self, id: &str) -> Result<SwapForecast, PoolError> {
+        let Some(endpoint) = &self.unload_candidate else {
+            // No forecast endpoint (a config-defined REST protocol). Not "no eviction" — unknown.
+            return Ok(SwapForecast::Unknown);
+        };
+        let (status, r) = self
+            .call(endpoint, Some(id))
+            .await
+            .map_err(|e| PoolError::Device(format!("unload_candidate unreachable: {e}")))?;
+        if !ok(status) {
+            return Err(PoolError::Device(format!("unload_candidate failed: {status}")));
+        }
+        let v: Value = r
+            .json()
+            .await
+            .map_err(|e| PoolError::Device(format!("unload_candidate body not JSON: {e}")))?;
+        // A response we cannot read is `Unknown`, never `NoEviction`. Reporting "nothing will be
+        // evicted" because we failed to parse is the merge this type exists to prevent.
+        let Some(required) = v.get("unload_required").and_then(Value::as_bool) else {
+            return Ok(SwapForecast::Unknown);
+        };
+        if !required {
+            return Ok(SwapForecast::NoEviction);
+        }
+        let victims: Vec<String> = v
+            .get("model_id")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        if victims.is_empty() {
+            // The device says an eviction is required but named nobody. Believe the `true` and
+            // admit we do not know who — waiting on an empty set would silently skip the wait.
+            return Ok(SwapForecast::Unknown);
+        }
+        Ok(SwapForecast::Evicts(victims))
+    }
+
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
         let v = self.running_body().await?;
         self.ids_from(&v)
@@ -842,19 +944,27 @@ impl DeviceModelManager {
         if budget == 0 {
             return;
         }
-        // Logged on BOTH answers, deliberately. The claim this design rests on is "one call per
-        // LOAD, not per request", and an operator cannot check that against a path that only
-        // speaks when something goes wrong — counting these lines is how the claim is falsifiable
-        // from outside. Loads are rare enough for this to be cheap (#47, #49).
-        let victim = match self.backend.unload_candidate(real_id).await {
-            Ok(Some(v)) => {
-                eprintln!("woollamad: pre-flight for '{real_id}': device will evict '{v}' to make room");
+        // Logged on EVERY outcome, and the three are distinct lines rather than one merged one.
+        // The merged version — "no eviction required (or backend cannot say)" — is what concealed
+        // an unimplemented backend for a whole hardware run: the device was answering
+        // `unload_required: true` while the log reported the benign half of a merge (#47).
+        let victims = match self.backend.unload_candidate(real_id).await {
+            Ok(SwapForecast::Evicts(v)) => {
+                eprintln!(
+                    "woollamad: pre-flight for '{real_id}': device will evict {} to make room",
+                    v.join(", ")
+                );
                 v
             }
-            // No eviction required, or the backend cannot say. Deliberately the same answer: a
-            // backend that cannot speak must not be read as having said "no".
-            Ok(None) => {
-                eprintln!("woollamad: pre-flight for '{real_id}': no eviction required (or backend cannot say)");
+            Ok(SwapForecast::NoEviction) => {
+                eprintln!("woollamad: pre-flight for '{real_id}': device reports no eviction required");
+                return;
+            }
+            Ok(SwapForecast::Unknown) => {
+                eprintln!(
+                    "woollamad: pre-flight for '{real_id}': backend cannot say whether a swap is \
+                     required — proceeding without protection"
+                );
                 return;
             }
             // A failed pre-flight must not block the load it was only meant to schedule.
@@ -863,20 +973,24 @@ impl DeviceModelManager {
                 return;
             }
         };
+        // ALL of them. The device's singular `candidate` field named an idle embedder while
+        // `model_id[]` also carried the busy 30B, so checking one victim sees an idle one, skips
+        // the wait, and kills the busy one — measured on hardware.
+        let busy = |v: &Vec<String>| -> Option<String> { v.iter().find(|m| self.is_busy(m)).cloned() };
         let mut rx = self.swap_watch();
         let deadline = Instant::now() + Duration::from_millis(budget);
-        if self.is_busy(&victim) {
+        if let Some(b) = busy(&victims) {
             eprintln!(
-                "woollamad: holding the load of '{real_id}' until our in-flight work on '{victim}' \
+                "woollamad: holding the load of '{real_id}' until our in-flight work on '{b}' \
                  drains — issuing it now is what makes the device kill that work"
             );
         }
-        while self.is_busy(&victim) {
+        while let Some(b) = busy(&victims) {
             let now = Instant::now();
             if now >= deadline {
                 eprintln!(
-                    "woollamad: loading '{real_id}' will make the device evict '{victim}', which \
-                     still has work of ours after {}s — proceeding anyway; that work will fail",
+                    "woollamad: loading '{real_id}' will make the device evict '{b}', which still \
+                     has work of ours after {}s — proceeding anyway; that work will fail",
                     budget as f64 / 1000.0
                 );
                 return;

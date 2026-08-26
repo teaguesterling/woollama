@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use woollama_server::pool::{DeviceBackend, DeviceModelManager, Gate, ModelCapabilities, PoolError};
+use woollama_server::pool::{DeviceBackend, DeviceModelManager, Gate, ModelCapabilities, PoolError, SwapForecast};
 
 /// A device that can be told to demand an eviction, and records the order it was driven in.
 struct ForcingDevice {
@@ -77,9 +77,12 @@ impl DeviceBackend for ForcingDevice {
         self.running.lock().unwrap().remove(id);
         Ok(())
     }
-    async fn unload_candidate(&self, _id: &str) -> Result<Option<String>, PoolError> {
+    async fn unload_candidate(&self, _id: &str) -> Result<SwapForecast, PoolError> {
         self.asked.fetch_add(1, Ordering::SeqCst);
-        Ok(self.victim.lock().unwrap().clone())
+        Ok(match self.victim.lock().unwrap().clone() {
+            Some(v) => SwapForecast::Evicts(vec![v]),
+            None => SwapForecast::NoEviction,
+        })
     }
 }
 
@@ -233,4 +236,97 @@ async fn the_pre_flight_costs_one_call_per_load_not_per_request() {
         "requests for a resident model must not pay the pre-flight — it belongs on the load path, \
          and ~192ms per request would make this design cost more than it saves"
     );
+}
+
+// --- the device preset over HTTP -------------------------------------------------------
+//
+// Everything above drives an in-process fixture that answers `unload_candidate` by construction.
+// That is why all of it was green while the `device` preset had NO implementation at all — the
+// trait default returned "cannot say", woollamad never issued the GET, and a full hardware run
+// was spent before anyone noticed. These tests exist so that cannot happen silently again: they
+// assert the real backend issues the real call and parses the real response shape.
+
+/// Serve one `unload_candidate` body and record what was asked for.
+async fn spawn_forecast_device(body: serde_json::Value) -> (String, Arc<StdMutex<Vec<String>>>) {
+    use axum::extract::{Path as AxPath, State};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let state = (seen.clone(), body);
+    let app = Router::new()
+        .route(
+            "/api/v1/models/{*rest}",
+            get(|State((seen, body)): State<(Arc<StdMutex<Vec<String>>>, serde_json::Value)>,
+                 AxPath(rest): AxPath<String>| async move {
+                seen.lock().unwrap().push(rest);
+                Json(body)
+            }),
+        )
+        .with_state(state);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// The regression test for the actual bug: the `device` preset must ISSUE the call, and must key
+/// on `model_id[]` — the full victim set — rather than the singular `candidate`.
+///
+/// The body is the shape measured on hardware: `candidate` names an IDLE embedder while
+/// `model_id[]` also carries the BUSY 30B. Keying on `candidate` sees an idle victim, skips the
+/// wait, loads, and the device kills the busy one.
+#[tokio::test]
+async fn the_device_preset_issues_the_call_and_reads_the_full_victim_list() {
+    let (url, seen) = spawn_forecast_device(serde_json::json!({
+        "unload_required": true,
+        "candidate": { "model_id": "Qwen3-Embedding-0.6B", "active_request_count": 0 },
+        "model_id": ["Qwen3-Embedding-0.6B", "Qwen3-30B-A3B-Instruct"],
+        "npu_required": 55,
+        "npu_available": 44
+    }))
+    .await;
+    let b = woollama_server::pool::RestBackend::device(url, Default::default(), 0.01, 5.0);
+
+    let got = b.unload_candidate("Qwen3.6-35B-A3B-turbo").await.expect("the call must succeed");
+
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &["Qwen3.6-35B-A3B-turbo/unload_candidate".to_string()],
+        "the device preset must actually issue the GET — it previously never did, and the trait \
+         default made that look like a device saying 'nothing to evict'"
+    );
+    match got {
+        SwapForecast::Evicts(v) => assert_eq!(
+            v,
+            vec!["Qwen3-Embedding-0.6B".to_string(), "Qwen3-30B-A3B-Instruct".to_string()],
+            "must read model_id[], the FULL victim set — `candidate` names only the idle embedder"
+        ),
+        other => panic!("expected Evicts, got {other:?}"),
+    }
+}
+
+/// `unload_required: false` is a real "no", distinct from not knowing.
+#[tokio::test]
+async fn the_device_preset_reports_no_eviction_when_the_device_says_so() {
+    let (url, _) = spawn_forecast_device(serde_json::json!({ "unload_required": false })).await;
+    let b = woollama_server::pool::RestBackend::device(url, Default::default(), 0.01, 5.0);
+    assert_eq!(b.unload_candidate("m").await.unwrap(), SwapForecast::NoEviction);
+}
+
+/// A body we cannot read is `Unknown`, never `NoEviction`.
+///
+/// This is the merge that hid the original bug, now impossible to express: reporting "nothing
+/// will be evicted" because parsing failed is a different claim from the device saying so.
+#[tokio::test]
+async fn an_unreadable_forecast_is_unknown_not_no_eviction() {
+    let (url, _) = spawn_forecast_device(serde_json::json!({ "something_else": 1 })).await;
+    let b = woollama_server::pool::RestBackend::device(url, Default::default(), 0.01, 5.0);
+    assert_eq!(b.unload_candidate("m").await.unwrap(), SwapForecast::Unknown);
+
+    // "eviction required, but I won't say of what" is also unknown — waiting on an empty victim
+    // set would silently skip the wait while looking like protection.
+    let (url2, _) = spawn_forecast_device(serde_json::json!({ "unload_required": true, "model_id": [] })).await;
+    let b2 = woollama_server::pool::RestBackend::device(url2, Default::default(), 0.01, 5.0);
+    assert_eq!(b2.unload_candidate("m").await.unwrap(), SwapForecast::Unknown);
 }
