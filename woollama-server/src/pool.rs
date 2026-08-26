@@ -842,11 +842,21 @@ impl DeviceModelManager {
         if budget == 0 {
             return;
         }
+        // Logged on BOTH answers, deliberately. The claim this design rests on is "one call per
+        // LOAD, not per request", and an operator cannot check that against a path that only
+        // speaks when something goes wrong — counting these lines is how the claim is falsifiable
+        // from outside. Loads are rare enough for this to be cheap (#47, #49).
         let victim = match self.backend.unload_candidate(real_id).await {
-            Ok(Some(v)) => v,
+            Ok(Some(v)) => {
+                eprintln!("woollamad: pre-flight for '{real_id}': device will evict '{v}' to make room");
+                v
+            }
             // No eviction required, or the backend cannot say. Deliberately the same answer: a
             // backend that cannot speak must not be read as having said "no".
-            Ok(None) => return,
+            Ok(None) => {
+                eprintln!("woollamad: pre-flight for '{real_id}': no eviction required (or backend cannot say)");
+                return;
+            }
             // A failed pre-flight must not block the load it was only meant to schedule.
             Err(e) => {
                 eprintln!("woollamad: unload_candidate({real_id}) failed, loading anyway: {e}");
@@ -855,6 +865,12 @@ impl DeviceModelManager {
         };
         let mut rx = self.swap_watch();
         let deadline = Instant::now() + Duration::from_millis(budget);
+        if self.is_busy(&victim) {
+            eprintln!(
+                "woollamad: holding the load of '{real_id}' until our in-flight work on '{victim}' \
+                 drains — issuing it now is what makes the device kill that work"
+            );
+        }
         while self.is_busy(&victim) {
             let now = Instant::now();
             if now >= deadline {

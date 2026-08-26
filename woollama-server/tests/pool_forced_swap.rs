@@ -29,8 +29,9 @@ struct ForcingDevice {
     /// Set once `load` is called — the moment the device would kill the victim.
     loaded_at_tick: AtomicU64,
     tick: AtomicU64,
-    /// Records whether `unload_candidate` was consulted at all.
-    asked: AtomicBool,
+    /// How many times `unload_candidate` was consulted — the design claims once per LOAD, never
+    /// per request, and ~192 ms per request would be unacceptable.
+    asked: AtomicU64,
 }
 
 impl ForcingDevice {
@@ -40,7 +41,7 @@ impl ForcingDevice {
             victim: StdMutex::new(victim.map(str::to_string)),
             loaded_at_tick: AtomicU64::new(0),
             tick: AtomicU64::new(0),
-            asked: AtomicBool::new(false),
+            asked: AtomicU64::new(0),
         })
     }
     fn bump(&self) -> u64 {
@@ -49,7 +50,7 @@ impl ForcingDevice {
     fn load_tick(&self) -> u64 {
         self.loaded_at_tick.load(Ordering::SeqCst)
     }
-    fn was_asked(&self) -> bool {
+    fn ask_count(&self) -> u64 {
         self.asked.load(Ordering::SeqCst)
     }
 }
@@ -77,7 +78,7 @@ impl DeviceBackend for ForcingDevice {
         Ok(())
     }
     async fn unload_candidate(&self, _id: &str) -> Result<Option<String>, PoolError> {
-        self.asked.store(true, Ordering::SeqCst);
+        self.asked.fetch_add(1, Ordering::SeqCst);
         Ok(self.victim.lock().unwrap().clone())
     }
 }
@@ -114,7 +115,7 @@ async fn no_forced_eviction_loads_immediately() {
     let started = std::time::Instant::now();
     let slot = gate.enter("B").await.expect("B should load");
     assert!(started.elapsed() < Duration::from_secs(1), "must not wait when nothing is evicted");
-    assert!(dev.was_asked(), "the device should still have been consulted");
+    assert_eq!(dev.ask_count(), 1, "the device should have been consulted exactly once");
     drop(slot);
 }
 
@@ -204,4 +205,32 @@ async fn a_backend_that_cannot_say_is_unaffected() {
     let slot = gate.enter("B").await.expect("B should load");
     assert!(started.elapsed() < Duration::from_secs(1), "default impl must not introduce a wait");
     drop(slot);
+}
+
+/// The pre-flight costs one call per LOAD, never one per request.
+///
+/// ~192 ms per request would be unacceptable on a 0.65 s warm call; per load it is free against a
+/// 25-30 s cold load. The whole cost argument for this design rests on that distinction, so it is
+/// pinned here rather than left to a comment — and mirrored by an explicit log line, since an
+/// operator checking it on real hardware cannot run this test.
+#[tokio::test]
+async fn the_pre_flight_costs_one_call_per_load_not_per_request() {
+    let dev = ForcingDevice::new(&[], None);
+    let m = Arc::new(DeviceModelManager::new(dev.clone()));
+    let gate = Arc::new(Gate::new(m.clone(), 4, None, 10.0, None, 5.0));
+
+    // First request loads the model.
+    drop(gate.enter("B").await.expect("B loads"));
+    assert_eq!(dev.ask_count(), 1, "the load consults the device once");
+
+    // Five more requests for the SAME, now-resident model must add nothing.
+    for _ in 0..5 {
+        drop(gate.enter("B").await.expect("B is resident"));
+    }
+    assert_eq!(
+        dev.ask_count(),
+        1,
+        "requests for a resident model must not pay the pre-flight — it belongs on the load path, \
+         and ~192ms per request would make this design cost more than it saves"
+    );
 }
