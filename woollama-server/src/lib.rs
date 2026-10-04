@@ -1408,6 +1408,47 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
     let mut fwd = body.clone();
     fwd["model"] = json!(bare);
 
+    // Take the SAME gate the chat path takes, for inferencers that have one.
+    //
+    // This route used to be a bare passthrough, which made embeddings the one way to
+    // reach a managed device WITHOUT load-on-demand, without the in-flight permit and
+    // without the queue. That is not a theoretical hole. A bulk embedding client and a
+    // chat client then reach the device concurrently, and on the Tiiny that is the
+    // documented wedge condition: every request times out while the device still looks
+    // healthy — low load, no dmesg errors — and recovery needs ALL models stopped, not
+    // just the embedder. Measured 2026-10-03: a bulk run at 8 rows/s beside two
+    // resident chat models wedged the embedder, and an external watchdog had to stop
+    // all three to bring it back, taking an unrelated image model down with it.
+    //
+    // `enter` also ensures the model is loaded, so an embedding request now brings the
+    // embedder up the same way a chat request brings a chat model up, instead of 404ing
+    // or 503ing on an evicted embedder.
+    //
+    // Bound to a NAMED binding, not `_`: `let _ = ...` drops the `Slot` immediately and
+    // would release the permit before the request it exists to cover.
+    let _slot = match state.pools.get(provider) {
+        Some((manager, gate)) => match gate.enter(&bare).await {
+            Ok(s) => Some(s),
+            Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
+            Err(pool::PoolError::Device(msg)) => {
+                return engine_err_response(EngineError::new(
+                    format!("device error: {msg}"),
+                    "server_error",
+                    502,
+                ));
+            }
+            // As in the chat path: `enter` converts `SwapBlocked` to `Backpressure` once
+            // the queue timeout is spent, so this should be unreachable. Answer as
+            // backpressure rather than invent a status — capacity really is full.
+            Err(pool::PoolError::SwapBlocked) => {
+                return backpressure_response(manager.retry_after())
+            }
+        },
+        // An inferencer with no management URL (plain Ollama, a remote API) has no gate
+        // and never had one here. Unchanged for those.
+        None => None,
+    };
+
     match forward_post(inf.embeddings_url(), &fwd, &headers, 180).await {
         Ok(resp) => relay_json(resp).await,
         Err(e) => e.into_response(),
