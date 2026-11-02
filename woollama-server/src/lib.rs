@@ -579,6 +579,34 @@ async fn relay_json(resp: reqwest::Response) -> Response {
     out
 }
 
+/// Did the backend's answer say that this model may no longer be resident?
+///
+/// A 5xx may mean the model went away underneath us, which is how beta device firmware refused a
+/// model it was not running (#38). tiiny_os 0.1.38 refuses with `404` and
+/// `"type":"model_not_found"` instead. The type is checked because a bare 404 can mean anything,
+/// such as a wrong route, and reloading on one would cold-load a healthy model for nothing.
+///
+/// This field does not separate "not loaded" from "does not exist". It does not need to: a false
+/// positive costs one forced `start` on the next request, and `start` is what settles the question.
+/// An id the device cannot load fails there as a 502, and the marker is taken once, so it cannot loop.
+fn says_model_is_gone(upstream: u16, body: &Value) -> bool {
+    upstream >= 500 || (upstream == 404 && body["error"]["type"] == "model_not_found")
+}
+
+/// `relay_json` for a pooled request. A concrete model id never re-reads residency, so without the
+/// marker `ensure_loaded` short-circuits on a stale belief and EVERY later request fails the same way.
+async fn relay_json_pooled(resp: reqwest::Response, manager: &pool::DeviceModelManager, real_id: &str) -> Response {
+    let upstream = resp.status().as_u16();
+    let status = StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY);
+    let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+    if says_model_is_gone(upstream, &data) {
+        manager.mark_needs_reload(real_id);
+    }
+    let mut out = (status, Json(data)).into_response();
+    out.extensions_mut().insert(RelayedFrom(upstream));
+    out
+}
+
 /// One line per request, so the component in the middle of every call can say what it did.
 ///
 /// woollamad is the mandated path for all device traffic and, until this, said nothing on the
@@ -1426,7 +1454,8 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
     //
     // Bound to a NAMED binding, not `_`: `let _ = ...` drops the `Slot` immediately and
     // would release the permit before the request it exists to cover.
-    let _slot = match state.pools.get(provider) {
+    let pool = state.pools.get(provider);
+    let _slot = match pool {
         Some((manager, gate)) => match gate.enter(&bare).await {
             Ok(s) => Some(s),
             Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
@@ -1449,9 +1478,16 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
         None => None,
     };
 
-    match forward_post(inf.embeddings_url(), &fwd, &headers, 180).await {
-        Ok(resp) => relay_json(resp).await,
-        Err(e) => e.into_response(),
+    // The gate only helps while the pool's belief is true, so keep it true the way chat does.
+    match (forward_post(inf.embeddings_url(), &fwd, &headers, 180).await, pool) {
+        (Ok(resp), Some((manager, _))) => relay_json_pooled(resp, manager, &bare).await,
+        (Ok(resp), None) => relay_json(resp).await,
+        (Err(e), pool) => {
+            if let (true, Some((manager, _))) = (e.model_may_be_gone(), pool) {
+                manager.mark_needs_reload(&bare);
+            }
+            e.into_response()
+        }
     }
 }
 
@@ -1721,13 +1757,8 @@ async fn passthrough_pooled(
             }
         };
         if resp.status().as_u16() >= 400 {
-            // The backend just refused. Re-check what it is actually running so a model that was
-            // dropped from under us stops being believed resident — otherwise `ensure_loaded`
-            // short-circuits on that belief and EVERY later request fails the same way (#38).
-            if resp.status().as_u16() >= 500 {
-                manager.mark_needs_reload(&real);
-            }
-            return relay_json(resp).await;
+            // The backend just refused, possibly because the model was dropped from under us (#38).
+            return relay_json_pooled(resp, manager, &real).await;
         }
         // Hold `slot` for the lifetime of the stream body: it moves into the
         // generator and drops only once the upstream stream is exhausted (or the
@@ -1745,15 +1776,7 @@ async fn passthrough_pooled(
 
     fwd["stream"] = json!(false);
     let result = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
-        Ok(resp) => {
-            // See the streaming branch: a 5xx may mean the model went away underneath us.
-            let server_error = resp.status().as_u16() >= 500;
-            let relayed = relay_json(resp).await;
-            if server_error {
-                manager.mark_needs_reload(&real);
-            }
-            relayed
-        }
+        Ok(resp) => relay_json_pooled(resp, manager, &real).await,
         // A dropped connection says the same thing more emphatically than a 5xx does: a 5xx can
         // be an ordinary application error from a perfectly healthy model, whereas a connection
         // that died mid-request is what an instance being torn down looks like (#48).
