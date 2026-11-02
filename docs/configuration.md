@@ -502,9 +502,9 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | Field | Required | Description |
 |---|---|---|
 | `management_url` | — | Base URL of the backend's model-management API (`GET/POST /api/v1/models/{running,start,stop}`). Its presence is what turns on pooling for this inferencer. |
-| `parallel` | — | How many requests **woollama** sends the backend concurrently per loaded model (default `1`). Sizes the per-model queue semaphore. |
+| `parallel` | — | How many requests **woollama** sends the device concurrently (default `1`). It sizes both the per-model queue semaphore and one device-wide semaphore, so it caps the device's total across all models and all routes sharing the `management_url`, not each model. |
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). If every loaded model is busy, the request **waits** for one to free up rather than being refused — see *Queueing across a model swap* below. Unset ⇒ no cap and no auto-eviction. |
-| `queue_max` | — | Max requests queued per model before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
+| `queue_max` | — | Max requests queued per model (not per device) before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a request waits for its turn before woollama gives up and returns `503` + `Retry-After` (default `30`). Bounds three waits: a place in a model's queue, a cold load, and — since v0.15 — a **model swap** on a full device. |
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
@@ -624,6 +624,11 @@ alternating between them swapped the model on *every* call — and it enforced `
 route, **doubling** the concurrency the device actually saw. The shared gate takes the most
 restrictive limit configured across them, except `queue_timeout`, where the most forgiving value
 wins (a shorter wait causes spurious `503`s on a slow cold load without protecting the device).
+
+The gate covers `/v1/chat/completions`, `/v1/embeddings` and `/v1/images/generations` across
+models, so with `parallel = 1` a long chat makes an embedding wait, and after `queue_timeout` that
+embedding gets a `503` with `Retry-After`. A model load does not take the gate, so it can overlap a
+request in flight.
 
 #### Queueing across a model swap
 

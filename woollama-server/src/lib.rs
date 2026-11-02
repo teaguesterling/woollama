@@ -1393,9 +1393,37 @@ async fn images_generations(State(state): State<Arc<AppState>>, Json(body): Json
     let mut fwd = body.clone();
     fwd["model"] = json!(bare);
 
-    match forward_post(inf.images_url(), &fwd, &headers, 300).await {
-        Ok(resp) => relay_json(resp).await,
-        Err(e) => e.into_response(),
+    // The same gate chat and embeddings take. Image generation runs for tens of seconds on the
+    // same device, so leaving it out would be the longest overlap of all. `_slot` is a NAMED
+    // binding for the reason given in `embeddings`.
+    let pool = state.pools.get(provider);
+    let _slot = match pool {
+        Some((manager, gate)) => match gate.enter(&bare).await {
+            Ok(s) => Some(s),
+            Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
+            Err(pool::PoolError::Device(msg)) => {
+                return engine_err_response(EngineError::new(
+                    format!("device error: {msg}"),
+                    "server_error",
+                    502,
+                ));
+            }
+            Err(pool::PoolError::SwapBlocked) => {
+                return backpressure_response(manager.retry_after())
+            }
+        },
+        None => None,
+    };
+
+    match (forward_post(inf.images_url(), &fwd, &headers, 300).await, pool) {
+        (Ok(resp), Some((manager, _))) => relay_json_pooled(resp, manager, &bare).await,
+        (Ok(resp), None) => relay_json(resp).await,
+        (Err(e), pool) => {
+            if let (true, Some((manager, _))) = (e.model_may_be_gone(), pool) {
+                manager.mark_needs_reload(&bare);
+            }
+            e.into_response()
+        }
     }
 }
 

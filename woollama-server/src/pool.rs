@@ -1056,17 +1056,18 @@ impl DeviceModelManager {
 // protocol for one request: reject early if the per-model queue is already
 // saturated; otherwise register a queue slot (which also protects the model from
 // eviction — `ensure_loaded`'s eviction pass reads `queued`/`in_flight` via the
-// manager's sync counters), ensure the model is loaded, then acquire a concurrency
-// permit within `queue_timeout` and bump the in-flight ref-count. `queue_timeout`
-// bounds ONLY the permit acquisition, not the preceding `ensure_loaded` await —
+// manager's sync counters), ensure the model is loaded, then acquire the model's
+// permit and the device's permit within one `queue_timeout` and bump the in-flight
+// ref-count. `queue_timeout` bounds ONLY the permit acquisition, not the preceding
+// `ensure_loaded` await —
 // time spent waiting on an in-progress load (serialized on the manager's
 // `load_lock`, which can poll up to `load_timeout`, default 120s) is governed
 // separately by `load_timeout` (mirrors the Python docstring on `Gate.enter`).
 
-/// One per-model concurrency permit, held for the lifetime of a pooled request.
-/// `Drop` releases both halves synchronously: the manager's in-flight counter
+/// A model permit and a device permit, held for the lifetime of a pooled request.
+/// `Drop` releases everything synchronously: the manager's in-flight counter
 /// (`DeviceModelManager::release`, sync — see the Task 5 lock-model note at the
-/// top of this module) and the semaphore permit (`OwnedSemaphorePermit`'s own
+/// top of this module) and the semaphore permits (`OwnedSemaphorePermit`'s own
 /// `Drop`). Because `Drop` runs at most once per value, release is idempotent by
 /// construction — no Python-style `_released` guard flag is needed.
 pub struct Slot {
@@ -1075,13 +1076,16 @@ pub struct Slot {
     // Always `Some` until `Drop` — held as an `Option` only so `Drop::drop` (which
     // takes `&mut self`, not `self`) can take it out; never actually `None` while
     // the `Slot` is alive.
-    permit: Option<OwnedSemaphorePermit>,
+    //
+    // (model, device). A tuple drops in order, so the model permit goes first: the next request
+    // for this model then joins the device queue BEHIND anything already waiting there.
+    permit: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         self.manager.release(&self.real_id);
-        // Dropping the permit (if still held) releases the semaphore synchronously.
+        // Dropping the permits (if still held) releases the semaphores synchronously.
         drop(self.permit.take());
     }
 }
@@ -1096,6 +1100,17 @@ pub struct Gate {
     pool_max: Option<u32>,
     retry_after: f64,
     sems: StdMutex<HashMap<String, Arc<Semaphore>>>,
+    /// The ceiling against the device itself, across every model and route sharing this gate.
+    ///
+    /// The per-model semaphores alone do not bound the device: `parallel = 1` with chat and
+    /// embeddings resident put 2 requests on it. On the Tiiny that overlap is the failure, because
+    /// the NPU has one DMA path (beta log #065: HDMA timeout, then a hard reset; 2026-09-14: a chat
+    /// overlapping embedding load hung 108 s and the runtime dropped the chat model).
+    ///
+    /// The per-model semaphores stay in front of this one so a backlog on one model holds one
+    /// place in this queue, not all of them: a chat waits for the request in flight, not for every
+    /// queued embedding.
+    device: Arc<Semaphore>,
 }
 
 impl Gate {
@@ -1107,14 +1122,16 @@ impl Gate {
         pool_max: Option<u32>,
         retry_after: f64,
     ) -> Self {
+        let parallel = parallel.max(1) as usize;
         Gate {
             manager,
-            parallel: parallel.max(1) as usize,
+            parallel,
             queue_max,
             queue_timeout,
             pool_max,
             retry_after,
             sems: StdMutex::new(HashMap::new()),
+            device: Arc::new(Semaphore::new(parallel)),
         }
     }
 
@@ -1160,12 +1177,24 @@ impl Gate {
         // swap waits out `queue_timeout` and then 503s" — a permanent, silent capacity leak whose
         // symptom is indistinguishable from the bug #39 set out to fix.
         let ticket = QueueTicket::new(self.manager.clone(), real_id);
-        let outcome: Result<OwnedSemaphorePermit, PoolError> = async {
+        let outcome: Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), PoolError> = async {
+            // The device permit comes AFTER the load, and that order is load-bearing. A request
+            // holding it while waiting for a swap would stop the resident model's queued requests
+            // from running, so that model could never drain and become evictable: the swap would
+            // wait out `queue_timeout` every time.
             self.ensure_loaded_waiting_for_swap(real_id).await?;
             let sem = self.sem(real_id);
-            match tokio::time::timeout(Duration::from_secs_f64(self.queue_timeout), sem.acquire_owned()).await {
-                Ok(Ok(permit)) => Ok(permit),
-                // The semaphore is never `close()`d, so this arm is unreachable in
+            let device = self.device.clone();
+            // One deadline over both, so a second permit does not double a documented bound. Always
+            // model then device, so two requests can never each hold what the other needs.
+            let both = async move {
+                let model = sem.acquire_owned().await?;
+                let device = device.acquire_owned().await?;
+                Ok::<_, tokio::sync::AcquireError>((model, device))
+            };
+            match tokio::time::timeout(Duration::from_secs_f64(self.queue_timeout), both).await {
+                Ok(Ok(permits)) => Ok(permits),
+                // The semaphores are never `close()`d, so this arm is unreachable in
                 // practice; map it to a Device error rather than panicking/unwrapping.
                 Ok(Err(_)) => Err(PoolError::Device("semaphore closed unexpectedly".to_string())),
                 Err(_) => Err(PoolError::Backpressure(self.retry_after)),
@@ -1181,9 +1210,9 @@ impl Gate {
         // in the gap between them and stop it mid-handoff. No `.await` on either
         // branch (both sync).
         match outcome {
-            Ok(permit) => {
+            Ok(permits) => {
                 ticket.acquire();
-                Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permit) })
+                Ok(Slot { manager: self.manager.clone(), real_id: real_id.to_string(), permit: Some(permits) })
             }
             // `ticket` drops here and decrements, as it does on any abandoned path.
             Err(e) => Err(e),
