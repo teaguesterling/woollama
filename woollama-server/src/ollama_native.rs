@@ -82,6 +82,15 @@ pub fn to_native_request(body: &Value) -> Value {
             req["format"] = f.clone();
         }
     }
+    // Thinking on or off: an explicit `think` wins; else the OpenAI-side
+    // `chat_template_kwargs.enable_thinking`. Unset stays unset (ollama's default).
+    let think = body
+        .get("think")
+        .filter(|v| !v.is_null())
+        .or_else(|| body.pointer("/chat_template_kwargs/enable_thinking").filter(|v| v.is_boolean()));
+    if let Some(t) = think {
+        req["think"] = t.clone();
+    }
     req
 }
 
@@ -202,6 +211,32 @@ mod tests {
             "model": "m", "temperature": 0.9, "options": {"num_ctx": 4096, "temperature": 0.1}
         }));
         assert_eq!(req["options"]["temperature"], 0.1);
+    }
+
+    // Ollama lets qwen3-class models think unless the request says `think: false`. The native
+    // path must carry the caller's choice, or the thinking eats num_predict and the reply is empty
+    // (measured 2026-11-09: done_reason=length, 12,788 thinking chars, content "").
+    #[test]
+    fn to_native_forwards_think() {
+        let off = to_native_request(&json!({"model": "m", "think": false, "options": {"num_ctx": 8192}}));
+        assert_eq!(off["think"], false);
+        let on = to_native_request(&json!({"model": "m", "think": true, "options": {"num_ctx": 8192}}));
+        assert_eq!(on["think"], true);
+        let unset = to_native_request(&json!({"model": "m", "options": {"num_ctx": 8192}}));
+        assert!(unset.get("think").is_none(), "no opinion from the caller means none sent");
+    }
+
+    // OpenAI-shaped clients (and vLLM/tiiny chat templates) say this as chat_template_kwargs.
+    #[test]
+    fn to_native_maps_enable_thinking_to_think() {
+        let req = to_native_request(&json!({
+            "model": "m", "chat_template_kwargs": {"enable_thinking": false}, "options": {"num_ctx": 8192}
+        }));
+        assert_eq!(req["think"], false);
+        let both = to_native_request(&json!({
+            "model": "m", "think": true, "chat_template_kwargs": {"enable_thinking": false}
+        }));
+        assert_eq!(both["think"], true, "an explicit think wins over the template kwarg");
     }
 
     #[test]
