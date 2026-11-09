@@ -63,12 +63,12 @@ jobs:
           name: wheels-musllinux-${{ matrix.target }}
           path: woollama-core/dist
 
-  # macOS — always the arm64 runner (macos-14). macos-13 (Intel) runners are scarce and queue
+  # macOS — always the arm64 runner (macos-15; GitHub refused macos-14 from 2026-11-09). macos-13 (Intel) runners are scarce and queue
   # for ~an hour, which would block the publish (a queued job never "fails", so it can't be
   # tolerated). Build aarch64 natively; cross-compile x86_64 from arm64 (best-effort — if the
   # cross-build fails, Intel users get the sdist rather than blocking the release).
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     continue-on-error: ${{ matrix.target == 'x86_64' }}
     strategy:
       fail-fast: false
