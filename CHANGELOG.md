@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **A streamed answer is no longer cut at 180 s.** Every streaming forward used reqwest's
+  `timeout`, which is a *total* deadline that includes reading the body. A generation that ran
+  longer than 180 s after dispatch was cut mid-answer. Measured 2026-11-22: 36 of 37 pi failures
+  "Stream ended without finish_reason" were this cut. The same kind of stream sent straight to
+  the device ran 651 s and ended normally.
+
+  Streaming forwards now have a 10 s connect timeout and a 300 s **idle** timeout (reqwest's
+  `read_timeout`, which resets on every read and also bounds the wait for headers), and no total
+  deadline. 300 s clears the longest silence measured from a healthy device: 165.9 s from headers
+  to first token. This covers the pooled and plain chat relays, the ollama native (`num_ctx`)
+  relay, and the engine's streaming turns (`woollama/<recipe>` and `/v1/responses` streaming).
+  Non-streaming calls keep their total deadlines. `WOOLLAMA_STREAM_IDLE_TIMEOUT` (seconds)
+  overrides the idle timeout.
+
+- **A stream that fails mid-body now says so.** The relay passed upstream chunks straight
+  through, so an upstream failure just ended the body: no error event, no final chunk, no
+  `[DONE]`. Now the relay ends such a stream with an OpenAI-style error event and `[DONE]`:
+
+  ```
+  data: {"error":{"message":"woollama: the upstream sent nothing for 300s and the stream was abandoned","type":"upstream_error"}}
+
+  data: [DONE]
+  ```
+
+  OpenAI-compatible clients raise this as an error with its message (the openai SDK throws
+  `APIError` on `data.error`). The relay forwards only complete SSE events, so half an event
+  from a dying upstream cannot corrupt the error event.
+
+- **One `stream-end` line per streamed response.** The access line is written when the headers
+  go out, so a stream cut minutes later still logged as `200` in about 100 ms. The new line says
+  what happened to the body:
+
+  ```
+  woollamad: stream-end model=device/Qwen/Qwen3-8B outcome=complete 651000ms chunks=6003 bytes=901234
+  woollamad: stream-end model=device/Qwen/Qwen3-8B outcome=upstream_error 2001ms chunks=1 bytes=143 error="..."
+  woollamad: stream-end model=device/Qwen/Qwen3-8B outcome=client_disconnected 5120ms chunks=51 bytes=7300
+  ```
+
+  The time runs from dispatch to the upstream, so it excludes the gate wait.
+  `WOOLLAMA_ACCESS_LOG=0` turns it off with the access line.
+
 ## v0.17.0
 
 ### Features

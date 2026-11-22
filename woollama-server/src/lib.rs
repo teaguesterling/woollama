@@ -548,6 +548,32 @@ async fn forward_post_classified(
         .build()
         // Our own failure to build a client says nothing about the model.
         .map_err(|e| ForwardFailure::Inconclusive(e.to_string()))?;
+    send_classified(client, url, body, headers).await
+}
+
+/// `forward_post_classified` for a STREAMING forward: a connect timeout and an idle timeout, and
+/// no total deadline, so a long generation is not cut while it is still producing. The reasons
+/// and the values are at `engine::STREAM_IDLE_TIMEOUT_SECS`. Relay the body with `relay_sse`,
+/// which turns a mid-body failure into an error event instead of a silently short body.
+async fn forward_post_stream(
+    url: String,
+    body: &Value,
+    headers: &HashMap<String, String>,
+) -> Result<reqwest::Response, ForwardFailure> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(engine::STREAM_CONNECT_TIMEOUT)
+        .read_timeout(engine::stream_idle_timeout())
+        .build()
+        .map_err(|e| ForwardFailure::Inconclusive(e.to_string()))?;
+    send_classified(client, url, body, headers).await
+}
+
+async fn send_classified(
+    client: reqwest::Client,
+    url: String,
+    body: &Value,
+    headers: &HashMap<String, String>,
+) -> Result<reqwest::Response, ForwardFailure> {
     let mut rb = client.post(url).json(body);
     for (k, v) in headers {
         rb = rb.header(k, v);
@@ -695,6 +721,164 @@ pub(crate) fn sse_response(body: Body) -> Response {
         .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
 }
 
+// --- relaying an upstream stream ------------------------------------------------
+
+/// Relay an upstream OpenAI SSE body to the client, and say how it ended.
+///
+/// Passing the chunks straight through is what this replaced, and it failed silently: when the
+/// upstream failed mid-body, the error went to `Body::from_stream`, which just ends the body. The
+/// client got no error event, no final chunk and no `[DONE]` — pi reported "Stream ended without
+/// finish_reason", and the only log line was the access line, written at header time as a `200`.
+///
+/// Now a mid-body failure becomes an OpenAI-style error event and `[DONE]`. OpenAI-compatible
+/// clients raise an `error` event as an error with its message (the openai SDK throws `APIError`
+/// on `data.error`), so the reason reaches the user.
+///
+/// Only complete SSE events are forwarded. The bytes after the last event boundary are held until
+/// the next chunk completes them. If the upstream dies in the middle of an event, its half is
+/// dropped; forwarding it would glue it to the error event and make that unparseable as well.
+///
+/// `hold` is dropped when the body ends, however it ends — the pooled path passes its gate slot.
+fn relay_sse<H: Send + 'static>(resp: reqwest::Response, label: String, hold: H) -> Response {
+    let body = stream! {
+        let _hold = hold;
+        let mut log = StreamEndLog::new(label);
+        let mut pending: Vec<u8> = Vec::new();
+        let mut bs = resp.bytes_stream();
+        loop {
+            match bs.next().await {
+                Some(Ok(bytes)) => {
+                    log.record(bytes.len());
+                    pending.extend_from_slice(&bytes);
+                    if let Some(end) = last_event_end(&pending) {
+                        let out: Vec<u8> = pending.drain(..end).collect();
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                    }
+                }
+                Some(Err(e)) => {
+                    let msg = describe_stream_error(&e);
+                    log.outcome = Some(StreamOutcome::UpstreamError(msg.clone()));
+                    yield Ok(upstream_error_event(&msg));
+                    break;
+                }
+                None => {
+                    // A clean end: whatever is held is the upstream's last word, complete or not.
+                    if !pending.is_empty() {
+                        yield Ok(Bytes::from(std::mem::take(&mut pending)));
+                    }
+                    log.outcome = Some(StreamOutcome::Complete);
+                    break;
+                }
+            }
+        }
+    };
+    sse_response(Body::from_stream(body))
+}
+
+/// The index just past the last SSE event boundary (a blank line) in `buf`, if there is one.
+fn last_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).rposition(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buf.windows(4).rposition(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    lf.max(crlf)
+}
+
+/// The error event, then `[DONE]`, that ends a stream whose upstream failed.
+fn upstream_error_event(message: &str) -> Bytes {
+    let payload = json!({"error": {"message": message, "type": "upstream_error"}});
+    Bytes::from(format!("data: {payload}\n\ndata: [DONE]\n\n"))
+}
+
+/// Why the upstream stream failed, in words a user can act on.
+///
+/// reqwest's own `Display` for a body failure is "error decoding response body" or "request or
+/// response body error", which says nothing. The cause is in the `source()` chain.
+fn describe_stream_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return format!(
+            "woollama: the upstream sent nothing for {}s and the stream was abandoned",
+            engine::stream_idle_timeout().as_secs_f64()
+        );
+    }
+    let mut parts = vec![e.to_string()];
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        let text = s.to_string();
+        if !parts.iter().any(|p| p.contains(&text)) {
+            parts.push(text);
+        }
+        src = s.source();
+    }
+    format!("woollama: the upstream stream failed: {}", parts.join(": "))
+}
+
+/// How a relayed stream ended.
+enum StreamOutcome {
+    Complete,
+    UpstreamError(String),
+}
+
+/// Writes one `stream-end` line when the relay ends — however it ends.
+///
+/// The access line is written when the HEADERS go out, so a stream cut minutes later still logs
+/// as `200` in about 100 ms. This is the line that says what happened to the body. It is written
+/// on drop, so a client that goes away (the generator is dropped mid-stream, with no outcome set)
+/// is logged too, as `client_disconnected`.
+///
+/// `chunks` and `bytes` count what the UPSTREAM sent. The time runs from dispatch to the
+/// upstream, so it excludes any wait at the gate.
+struct StreamEndLog {
+    label: String,
+    started: std::time::Instant,
+    chunks: u64,
+    bytes: u64,
+    outcome: Option<StreamOutcome>,
+}
+
+impl StreamEndLog {
+    fn new(label: String) -> Self {
+        StreamEndLog { label, started: std::time::Instant::now(), chunks: 0, bytes: 0, outcome: None }
+    }
+
+    fn record(&mut self, n: usize) {
+        self.chunks += 1;
+        self.bytes += n as u64;
+    }
+}
+
+impl Drop for StreamEndLog {
+    fn drop(&mut self) {
+        if access_log_enabled() {
+            eprintln!(
+                "{}",
+                format_stream_end_line(
+                    &self.label,
+                    self.started.elapsed().as_millis(),
+                    self.chunks,
+                    self.bytes,
+                    self.outcome.as_ref(),
+                )
+            );
+        }
+    }
+}
+
+/// The `stream-end` line, as a pure function so the format is testable without capturing stderr.
+fn format_stream_end_line(
+    label: &str,
+    elapsed_ms: u128,
+    chunks: u64,
+    bytes: u64,
+    outcome: Option<&StreamOutcome>,
+) -> String {
+    let head = format!("woollamad: stream-end model={label}");
+    let tail = format!("{elapsed_ms}ms chunks={chunks} bytes={bytes}");
+    match outcome {
+        Some(StreamOutcome::Complete) => format!("{head} outcome=complete {tail}"),
+        Some(StreamOutcome::UpstreamError(m)) => format!("{head} outcome=upstream_error {tail} error={m:?}"),
+        None => format!("{head} outcome=client_disconnected {tail}"),
+    }
+}
+
 /// num_ctx + stream → native `/api/chat` NDJSON, translated frame-by-frame to OpenAI SSE.
 async fn native_stream(
     inf: &engine::Inferencer,
@@ -704,7 +888,7 @@ async fn native_stream(
 ) -> Response {
     let url = ollama_native::native_chat_url(&inf.base_url);
     let req = ollama_native::to_native_request(fwd);
-    let resp = match forward_post(url, &req, headers, 600).await {
+    let resp = match forward_post_stream(url, &req, headers).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
@@ -712,16 +896,34 @@ async fn native_stream(
         return relay_json(resp).await;
     }
     let model = model.to_string();
+    let label = format!("{}/{model}", inf.name);
     let body = Body::from_stream(stream! {
+        let mut log = StreamEndLog::new(label);
         let mut t = ollama_native::SseTranslator::new(&model);
         let mut buf: Vec<u8> = Vec::new();
         let mut bs = resp.bytes_stream();
-        while let Some(chunk) = bs.next().await {
-            let Ok(bytes) = chunk else { break };
-            buf.extend_from_slice(&bytes);
-            while let Some(line) = take_line(&mut buf) {
-                for out in t.translate(&line) {
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+        loop {
+            match bs.next().await {
+                Some(Ok(bytes)) => {
+                    log.record(bytes.len());
+                    buf.extend_from_slice(&bytes);
+                    while let Some(line) = take_line(&mut buf) {
+                        for out in t.translate(&line) {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(out));
+                        }
+                    }
+                }
+                // Translation is line by line, so a half line left in `buf` is never sent and
+                // cannot corrupt the error event.
+                Some(Err(e)) => {
+                    let msg = describe_stream_error(&e);
+                    log.outcome = Some(StreamOutcome::UpstreamError(msg.clone()));
+                    yield Ok(upstream_error_event(&msg));
+                    break;
+                }
+                None => {
+                    log.outcome = Some(StreamOutcome::Complete);
+                    break;
                 }
             }
         }
@@ -1517,17 +1719,15 @@ async fn passthrough_stream(
     fwd: &Value,
     headers: &HashMap<String, String>,
 ) -> Response {
-    let resp = match forward_post(inf.chat_url(), fwd, headers, 180).await {
+    let resp = match forward_post_stream(inf.chat_url(), fwd, headers).await {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
     if resp.status().as_u16() >= 400 {
         return relay_json(resp).await;
     }
-    Response::builder()
-        .header("content-type", "text/event-stream")
-        .body(Body::from_stream(resp.bytes_stream()))
-        .unwrap_or_else(|_| err_response(StatusCode::BAD_GATEWAY, "stream build failed", "server_error"))
+    let label = format!("{}/{}", inf.name, fwd["model"].as_str().unwrap_or(""));
+    relay_sse(resp, label, ())
 }
 
 /// Warn once per inferencer that `default` resolution has fallen open. Once, not per request:
@@ -1743,7 +1943,7 @@ async fn passthrough_pooled(
 
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if stream {
-        let resp = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
+        let resp = match forward_post_stream(inf.chat_url(), &fwd, &headers).await {
             Ok(r) => r,
             // The connection failed rather than the backend answering. #38 wired the reload
             // marker only to a 5xx RESPONSE, so this branch left our residency belief intact and
@@ -1764,14 +1964,7 @@ async fn passthrough_pooled(
         // generator and drops only once the upstream stream is exhausted (or the
         // body is dropped early, e.g. a client disconnect) — releasing the
         // in-flight counter and the concurrency permit at that point, never before.
-        let body_stream = stream! {
-            let _slot = slot;
-            let mut bs = resp.bytes_stream();
-            while let Some(chunk) = bs.next().await {
-                yield chunk;
-            }
-        };
-        return sse_response(Body::from_stream(body_stream));
+        return relay_sse(resp, format!("{}/{real}", inf.name), slot);
     }
 
     fwd["stream"] = json!(false);
@@ -2595,6 +2788,29 @@ mod access_line_tests {
         assert_ne!(from_backend, from_us, "the whole point is that these differ");
         assert!(from_backend.contains("origin=relayed upstream=502"));
         assert!(from_us.contains("origin=local"));
+    }
+
+    /// Only whole SSE events go out, in either line-ending style. A half event held back is what
+    /// keeps a mid-event upstream failure from gluing that half to the error event.
+    #[test]
+    fn only_whole_sse_events_are_released() {
+        assert_eq!(last_event_end(b"data: {\"a\":1}\n\ndata: {\"b\""), Some(15));
+        assert_eq!(last_event_end(b"data: {\"a\":1}\r\n\r\ndata: x"), Some(17));
+        assert_eq!(last_event_end(b"data: {\"a\":1}\n"), None, "one newline ends a line, not an event");
+        assert_eq!(last_event_end(b""), None);
+    }
+
+    /// The three endings of a stream must be distinguishable, and an upstream error must carry
+    /// its reason in a form that survives quotes inside it.
+    #[test]
+    fn the_stream_end_line_names_how_the_stream_ended() {
+        let ok = format_stream_end_line("device/m", 651_000, 6003, 900_000, Some(&StreamOutcome::Complete));
+        assert_eq!(ok, "woollamad: stream-end model=device/m outcome=complete 651000ms chunks=6003 bytes=900000");
+        let err = StreamOutcome::UpstreamError("reset \"by peer\"".into());
+        let bad = format_stream_end_line("device/m", 2_000, 1, 10, Some(&err));
+        assert!(bad.contains("outcome=upstream_error") && bad.ends_with(r#"error="reset \"by peer\"""#), "{bad}");
+        let gone = format_stream_end_line("device/m", 2_000, 1, 10, None);
+        assert!(gone.contains("outcome=client_disconnected"), "{gone}");
     }
 
     /// Disabling is opt-out, not opt-in. The default has to be ON: the defect this closes is that

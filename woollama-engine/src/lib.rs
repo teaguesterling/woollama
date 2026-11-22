@@ -235,6 +235,56 @@ fn obj(v: &Option<Value>) -> Option<&serde_json::Map<String, Value>> {
     v.as_ref().and_then(Value::as_object)
 }
 
+// --- streaming deadlines --------------------------------------------------------
+
+// A streaming forward has NO total deadline. reqwest's `timeout` is a total deadline that includes
+// reading the body, so the 180 s one these paths used to carry cut every generation longer than
+// that: measured 2026-11-22, 36 of 37 pi "Stream ended without finish_reason" failures were that
+// cut, while the same kind of stream sent straight to the device ran 651 s and ended normally.
+//
+// What replaces it: a connect timeout, and an IDLE timeout (reqwest's `read_timeout`, which
+// resets on every read and also bounds the wait for the response headers). A stream that keeps
+// producing runs as long as it produces; one that goes quiet is abandoned.
+
+/// Connect timeout for a streaming forward. The backends are on the LAN or loopback; a connect
+/// that takes longer than this is not going to succeed.
+pub const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default for [`stream_idle_timeout`], in seconds.
+///
+/// The longest silence a healthy backend produces is before the FIRST token, while it processes
+/// the prompt (and, on a Tiiny, finishes a model swap). Measured 2026-11-22 straight to the device:
+/// headers at 0.0 s, first token at 165.9 s. After that the gaps are one token apart (15–30 tok/s).
+/// 300 s clears the measured worst case by more than half again; a backend silent for five minutes
+/// is wedged, and the client is better served by an error than by more waiting.
+pub const STREAM_IDLE_TIMEOUT_SECS: f64 = 300.0;
+
+/// How long a streaming forward may go without receiving a byte from the backend.
+///
+/// `WOOLLAMA_STREAM_IDLE_TIMEOUT` (seconds, fractions allowed) overrides it. The tests use the
+/// override to scale minutes down to seconds; an operator can use it the same way.
+pub fn stream_idle_timeout() -> Duration {
+    stream_idle_timeout_for(std::env::var("WOOLLAMA_STREAM_IDLE_TIMEOUT").ok().as_deref())
+}
+
+/// The rule itself, taking the value rather than reading the environment.
+pub fn stream_idle_timeout_for(v: Option<&str>) -> Duration {
+    let secs = v
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(STREAM_IDLE_TIMEOUT_SECS);
+    Duration::from_secs_f64(secs)
+}
+
+/// The HTTP client for a streaming forward. (The engine's own: it is on reqwest 0.12 and
+/// woollama-server is on 0.13, so the server builds its own client from the same settings.)
+fn streaming_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(STREAM_CONNECT_TIMEOUT)
+        .read_timeout(stream_idle_timeout())
+        .build()
+}
+
 // --- stateless request build / run -------------------------------------------
 
 /// Everything needed to issue one request. Built synchronously (can fail on
@@ -1129,7 +1179,13 @@ pub fn events_stream(setup: Setup, stream_mode: bool) -> impl Stream<Item = Resu
     } = setup;
     stream! {
         let mut messages = messages;
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(180)).build() {
+        // Streaming turns get the idle-timeout client; a non-streaming turn keeps its total deadline.
+        let built = if stream_mode {
+            streaming_client()
+        } else {
+            reqwest::Client::builder().timeout(Duration::from_secs(180)).build()
+        };
+        let client = match built {
             Ok(c) => c,
             Err(e) => { yield Err(EngineError::new(e.to_string(), "server_error", 502)); return; }
         };
@@ -1285,7 +1341,7 @@ fn next_delta(buf: &mut Vec<u8>) -> Delta {
 /// real upstream status + payload) then ends.
 pub fn complete_stream_events(req: Request) -> impl Stream<Item = Result<String, EngineError>> + Send {
     stream! {
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(req.timeout)).build() {
+        let client = match streaming_client() {
             Ok(c) => c,
             Err(e) => { yield Err(EngineError::new(e.to_string(), "server_error", 502)); return; }
         };
@@ -1327,6 +1383,18 @@ mod tests {
     /// asserted there (`tests/test_config.py`). A config file is read by both implementations, so
     /// a divergence is a config that behaves differently depending on which one loaded it — the
     /// two test lists are the only thing that catches that, since nothing compiles them together.
+    /// The override scales the idle timeout; anything unusable falls back to the default rather
+    /// than to zero, which would abandon every stream at once.
+    #[test]
+    fn stream_idle_timeout_override() {
+        use super::{stream_idle_timeout_for as t, STREAM_IDLE_TIMEOUT_SECS as D};
+        assert_eq!(t(None).as_secs_f64(), D);
+        assert_eq!(t(Some("1.5")).as_secs_f64(), 1.5);
+        for bad in ["", "0", "-3", "abc", "inf", "NaN"] {
+            assert_eq!(t(Some(bad)).as_secs_f64(), D, "{bad:?}");
+        }
+    }
+
     #[test]
     fn expand_env_bare_and_defaulted_forms() {
         // Injected environment: no `set_var`, so this races nothing. (`expand_env` is a thin
