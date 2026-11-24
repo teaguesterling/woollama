@@ -548,7 +548,7 @@ async fn forward_post_classified(
         .build()
         // Our own failure to build a client says nothing about the model.
         .map_err(|e| ForwardFailure::Inconclusive(e.to_string()))?;
-    send_classified(client, url, body, headers).await
+    send_classified(client, url, body, headers, &format!("forward timeout of {timeout}s")).await
 }
 
 /// `forward_post_classified` for a STREAMING forward: a connect timeout and an idle timeout, and
@@ -565,22 +565,29 @@ async fn forward_post_stream(
         .read_timeout(engine::stream_idle_timeout())
         .build()
         .map_err(|e| ForwardFailure::Inconclusive(e.to_string()))?;
-    send_classified(client, url, body, headers).await
+    let limit = format!("connect timeout of {}s", engine::STREAM_CONNECT_TIMEOUT.as_secs());
+    send_classified(client, url, body, headers, &limit).await
 }
 
+/// `limit` names the timeout this client enforces, for the message a timeout produces. Without
+/// it the client sees reqwest's "error sending request for url (...)", which reads like a backend
+/// failure, and retries the same long request into the same wall.
 async fn send_classified(
     client: reqwest::Client,
     url: String,
     body: &Value,
     headers: &HashMap<String, String>,
+    limit: &str,
 ) -> Result<reqwest::Response, ForwardFailure> {
-    let mut rb = client.post(url).json(body);
+    let mut rb = client.post(&url).json(body);
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
     rb.send().await.map_err(|e| {
         if e.is_timeout() {
-            ForwardFailure::Inconclusive(e.to_string())
+            ForwardFailure::Inconclusive(format!(
+                "woollama: no answer from {url} within woollama's {limit}; the backend may still be working"
+            ))
         } else {
             ForwardFailure::ConnectionFailed(e.to_string())
         }
@@ -2729,6 +2736,39 @@ mod forward_classification_tests {
         .expect_err("the server never answers, so this must fail");
 
         assert!(!err.model_may_be_gone(), "a timeout must NOT mark the model for reload — it may be healthy and slow");
+    }
+
+    /// A timeout's message must say that WOOLLAMA gave up, and after how long.
+    ///
+    /// reqwest's own text ("error sending request for url (...)") reads like a backend failure.
+    /// A client that sees a bare 502 retries the same long prompt and gets the same 502, because
+    /// nothing tells it the limit is woollama's forward timeout and not the device.
+    #[tokio::test]
+    async fn a_timeout_says_it_is_woollamas_forward_timeout() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(sock);
+                });
+            }
+        });
+
+        let err = forward_post_classified(
+            format!("http://{addr}/v1/chat/completions"),
+            &json!({"model": "m"}),
+            &HashMap::new(),
+            1,
+        )
+        .await
+        .expect_err("the server never answers, so this must fail");
+
+        let ForwardFailure::Inconclusive(msg) = err else { panic!("a timeout is inconclusive") };
+        assert!(msg.contains("woollama"), "must say woollama gave up: {msg}");
+        assert!(msg.contains("forward timeout of 1s"), "must name the limit: {msg}");
     }
 
     /// A refused connection MUST mean the model may be gone — the case #48 was filed for.
