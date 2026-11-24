@@ -13,14 +13,14 @@
 
 ## Global Constraints
 
-- **Interpreter:** `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest` (a bare `python`/`pytest` lacks woollama). Lint gate: `/home/teague/Projects/Tiiny/.venv/bin/python -m ruff check .` clean (CI runs `ruff check .` hard). The whole existing suite must stay green.
+- **Interpreter:** `/home/user/.venv/bin/python -m pytest` (a bare `python`/`pytest` lacks woollama). Lint gate: `/home/user/.venv/bin/python -m ruff check .` clean (CI runs `ruff check .` hard). The whole existing suite must stay green.
 - **Back-compat:** `management_url` with no `management_protocol` ⇒ `device`; the existing `tests/test_pool.py` (which uses a device-shaped `FakeDevice`) stays green — the `device` `RestBackend` reproduces `_running`/`_start`/`_stop` byte-for-byte.
 - **Match the Rust reference** exactly for every behavior the differential oracle could observe. When a choice arises, read the Rust and mirror it.
 - Generic example names only (`device`, `mybox`, `oll`) — never a product brand.
 - **Commits:** conventional subject; body ends with:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01MNbD4t3EqzQuXXoVZApnHu
+  Claude-Session: https://claude.ai/code/<session-id>
   ```
 
 ---
@@ -48,7 +48,7 @@ Add to `tests/test_pool.py` (or a new `tests/test_backend.py`): a test that buil
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest tests/test_pool.py -k backend -x -q`
+Run: `/home/user/.venv/bin/python -m pytest tests/test_pool.py -k backend -x -q`
 Expected: FAIL — `RestBackend` doesn't exist.
 
 - [ ] **Step 3: Implement the protocol + `RestBackend`; make the manager backend-driven**
@@ -61,7 +61,7 @@ In `tests/test_pool.py`, replace every `DeviceModelManager(url, headers=…, pol
 
 - [ ] **Step 5: Run the gate**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest -q` then `… -m ruff check .`
+Run: `/home/user/.venv/bin/python -m pytest -q` then `… -m ruff check .`
 Expected: the ENTIRE suite green (proves the refactor is behavior-preserving); ruff clean.
 
 - [ ] **Step 6: Commit**
@@ -95,7 +95,7 @@ Mirror the Rust `Inferencer.management_protocol` + `load_management_protocols`.
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest tests/test_management_protocols.py -q`
+Run: `/home/user/.venv/bin/python -m pytest tests/test_management_protocols.py -q`
 Expected: FAIL — the field/function don't exist.
 
 - [ ] **Step 3: Implement the field + the parser**
@@ -104,7 +104,7 @@ Add the dataclass field + merge; implement `load_management_protocols` per the i
 
 - [ ] **Step 4: Run the gate**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest -q` then ruff.
+Run: `/home/user/.venv/bin/python -m pytest -q` then ruff.
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -134,7 +134,7 @@ git commit   # "feat: management_protocol field + [management_protocols] parsing
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest tests/test_pool_protocols.py -q`
+Run: `/home/user/.venv/bin/python -m pytest tests/test_pool_protocols.py -q`
 Expected: FAIL — `from_spec`/the resolution don't exist.
 
 - [ ] **Step 3: Implement `from_spec` + templating; re-express `device` via it**
@@ -145,7 +145,7 @@ Extract the per-inferencer backend selection into a small helper (e.g. `pool.bui
 
 - [ ] **Step 5: Gate**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest -q` then ruff.
+Run: `/home/user/.venv/bin/python -m pytest -q` then ruff.
 Expected: new + existing green.
 
 - [ ] **Step 6: Commit**
@@ -174,7 +174,7 @@ git commit   # "feat: config-defined rest protocols + management_protocol resolu
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest tests/test_pool_ollama.py -q`
+Run: `/home/user/.venv/bin/python -m pytest tests/test_pool_ollama.py -q`
 Expected: FAIL — `OllamaBackend` doesn't exist.
 
 - [ ] **Step 3: Implement + wire**
@@ -183,7 +183,7 @@ Implement `OllamaBackend`; replace the Task-3 temporary arms with real construct
 
 - [ ] **Step 4: Gate**
 
-Run: `/home/teague/Projects/Tiiny/.venv/bin/python -m pytest -q` then ruff.
+Run: `/home/user/.venv/bin/python -m pytest -q` then ruff.
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**

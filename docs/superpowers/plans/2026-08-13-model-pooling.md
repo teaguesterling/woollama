@@ -14,7 +14,7 @@
 
 - **Backward compatible / additive only.** An inferencer with no `management_url` behaves exactly as today (stateless passthrough). Existing `inferencers.toml` files must be unaffected. Every existing test must still pass.
 - **No Rust changes.** The Rust engine parses `inferencers.toml` independently (`woollama-engine/src/lib.rs:382-474`) and ignores keys it doesn't extract; there is no Python↔Rust field-parity test. The `/v1/responses` (core) path is **out of scope** this branch — pooling is wired into the Python `_passthrough` only. `pool.py`/`resolver.py` MUST NOT import `woollama.router` or FastAPI (keep `resolver` pure/server-free).
-- **Device management API (verified live 2026-08-13):** base `management_url` = `http://<ip>:8800`. Auth header `Authorization: Bearer <auth_key>` (same key as the inferencer's `api_key_env`). `GET {management_url}/api/v1/models/running` → `{"object":"list","running":[<real_id>,...],"pending":[...],"instances":{...}}` — parse the top-level `"running"` list. Load/unload: `POST {management_url}/api/v1/models/{real_id}/start` and `/stop`. Real ids contain slashes (e.g. `Qwen/Qwen3-Coder-30B-A3B-Instruct`) — send them raw in the path.
+- **Device management API (verified live):** base `management_url` = `http://<ip>:8800`. Auth header `Authorization: Bearer <auth_key>` (same key as the inferencer's `api_key_env`). `GET {management_url}/api/v1/models/running` → `{"object":"list","running":[<real_id>,...],"pending":[...],"instances":{...}}` — parse the top-level `"running"` list. Load/unload: `POST {management_url}/api/v1/models/{real_id}/start` and `/stop`. Real ids contain slashes (e.g. `Qwen/Qwen3-Coder-30B-A3B-Instruct`) — send them raw in the path.
 - **`--parallel` default is 1** (matches the device). Per-model concurrency is `parallel`.
 - **Backpressure over failure:** queue saturated (`queue_max`) or waited past `queue_timeout` → HTTP `503` with a `Retry-After` header. Device unreachable / `start` failed → HTTP `502`. Never a hang, never a bare not-loaded 503.
 - **Eviction is queue-aware and conservative:** never evict a model with `in_flight > 0` or `queued > 0`; evict only the LRU idle model; only when `pool_max` is set and reached. `pool_max` unset ⇒ no cap, no eviction.
@@ -22,7 +22,7 @@
 - **Commits:** conventional-commit subject; end every commit message body with the two trailers:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01MNbD4t3EqzQuXXoVZApnHu
+  Claude-Session: https://claude.ai/code/<session-id>
   ```
 
 ---
@@ -93,7 +93,7 @@ Note `config` is already imported at the top of `tests/test_config.py`; if not, 
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cd ~/Projects/woollama/trees/model-pooling && python -m pytest tests/test_config.py -k pooling_keys -q`
+Run: `cd /home/user/woollama && python -m pytest tests/test_config.py -k pooling_keys -q`
 Expected: FAIL — `KeyError: 'management_url'` (keys not yet parsed).
 
 - [ ] **Step 3: Add the whitelist+validation in `config.load_inferencers`**
@@ -1320,7 +1320,7 @@ Per the spec's phasing — do not implement here, but named so a reviewer knows 
 
 ## Deployment note (device repo, outside this plan)
 
-To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.device]`, and `run-woollama.sh` must export the `:8800` base. That is device-side configuration, tracked separately from this woollama code change.
+To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.device]`, and the service's launch script must export the `:8800` base. That is device-side configuration, tracked separately from this woollama code change.
 
 ## Self-Review
 

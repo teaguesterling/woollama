@@ -128,7 +128,7 @@ none is fixed. Recorded here so they aren't lost.
   silently breaking any recipe allow-list entry or client-cached name on the
   hashed path. Dormant today because almost nothing exceeds 64 chars, but
   federation is what pushes names over the line
-  (`mcp__mcp-suite__mcp__reader__parse_structured` is 45 chars at two levels),
+  (`mcp__toolsuite__mcp__reader__parse_structured` is 45 chars at two levels),
   and in a mutual-cycle topology names gain a level per restart. At that point a
   hashed name stops being a cosmetic fallback and becomes a **load-bearing
   identity that must stay stable across restarts.** Fix: a pinned hash (FNV or

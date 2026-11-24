@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `rmcp` 1.8 (resolved from the `"1.7"` caret req; `transport-streamable-http-client` + `transport-streamable-http-client-reqwest` are already enabled and unused), `reqwest` 0.13 (unifies with rmcp's own reqwest 0.13.4), `axum` 0.8 (re-exports the `http` 1.5.0 header types — no new dependency).
 
-**Spec:** `/home/teague/Projects/woollama/ISSUE-19-BRIEF.md`, as amended by "Spec amendments" below.
+**Spec:** the issue #19 brief (kept outside the repo), as amended by "Spec amendments" below.
 
 ## Global Constraints
 
@@ -29,7 +29,7 @@ Binding where they conflict with the brief:
 3. **The startup tool-list recursion does not exist.** The brief's decision 2 assumes `list_all_tools` can recurse across routers. It cannot: `mcp_surface.rs:118-126` serves `list_tools` from `registry.reexport_tools()` (`mcp_registry.rs:160-176`), which reads the `ServerConn.tools` vec cached once at connect (`:136`). No downstream call happens at request time. A mutual A↔B config is a startup ordering race over stale-or-empty rosters, bounded by `connect_timeout` and the concurrent skip-on-failure at `:97-117`.
 4. **No self-loop guard ships, but loop protection is DEFERRED — NOT UNNECESSARY.** Read this whole amendment before concluding anything about loops; an earlier draft said "unreachable code" and that was misleading.
    - *Self-reference (A→A) is unreachable.* `build_state()` — which connects every downstream — runs at `main.rs:13`; `axum::serve` starts at `:62`. The process is not listening while it connects, so an instance naming its own address gets connection-refused and never reaches any inbound check.
-   - *Mutual cycles (A→B→A) ARE reachable, through ordinary restarts, and are currently UNGUARDED.* A starts (B down, skipped); B starts and connects to A; A restarts and now connects to B. Both directions established, neither instance ever self-references, startup ordering never violated. Credit: the `tiiny-85` session, which caught this after the first draft.
+   - *Mutual cycles (A→B→A) ARE reachable, through ordinary restarts, and are currently UNGUARDED.* A starts (B down, skipped); B starts and connects to A; A restarts and now connects to B. Both directions established, neither instance ever self-references, startup ordering never violated.
    - *An inbound self-id check would not have helped.* It compares an inbound id to our own; in A→B→A neither side ever sees its own id. The mechanism for mutual cycles is the instance-id **Via chain plus hop cap**, which is what amendment 5 defers. Do not read "no self-loop guard" as "loops handled".
    - *Bounded in dispatch, unbounded in names.* A federated call terminates: `resolve()` (`mcp_registry.rs:147-151`) returns the **stripped** bare name, so each hop removes one `mcp__<server>__` prefix and the finite name shrinks monotonically — the innermost hop errors with `unknown tool` rather than looping. What is NOT bounded is name growth: one nesting level per mutual restart cycle, hitting the 64-char `wire_name` limit and degrading silently to hashed names.
 5. **The hop cap belongs to the future retry slice.** Caching is what keeps federation safe today — rosters snapshot at connect and serve from cache, so nothing recurses at request time. A retry loop that refreshes rosters removes that property, making live recursion reachable for the first time, and is also what would make an inbound identity check able to fire at all. Both obligations land there together. Task 4 records this so neither is orphaned.
@@ -748,7 +748,7 @@ async fn tool_names(base: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn woollamad_consumes_another_woollamad_over_http() {
-    // B: a leaf with no downstreams of its own, like the real mcp-suite. Its /mcp still
+    // B: a leaf with no downstreams of its own, like a real MCP server. Its /mcp still
     // advertises the built-in `chat` verb (mcp_surface.rs:123) — the stable thing to assert on
     // without depending on the ambient config dir.
     let b = spawn_woollamad(r#"{"mcpServers": {}}"#).await;
@@ -996,7 +996,7 @@ In `docs/roadmap.md`'s "Shipped" table:
 Open these (or hand the text to whoever owns the tracker). None belongs in #19:
 
 1. **`engine::expand_env` fails open.** `woollama-engine/src/lib.rs:417` uses `unwrap_or_default()`, so any unset `${VAR}` silently becomes an empty string across `mcp.json` *and* `inferencers.toml`. #19 guards the one case it introduces (MCP headers); the general fix belongs in the engine, which is parity-locked, so it needs its own decision about whether unset-is-empty is intended.
-2. **`wire_name` uses `DefaultHasher` for its >64-char fallback** (`mcp_registry.rs:64-68`). `std::collections::hash_map::DefaultHasher`'s algorithm is explicitly not guaranteed stable across Rust releases, so a hashed tool name can change under a toolchain upgrade — silently breaking any recipe allow-list entry or client-cached name that landed on the hashed path. Dormant today because almost nothing exceeds 64 chars; **federation is what pushes names over the line** (`mcp__mcp-suite__mcp__reader__parse_structured` is 45 chars at two levels), so it gets worse the longer #19 is deployed. Worse still in a mutual-cycle topology, where names gain a nesting level per restart cycle: the hashed name stops being a cosmetic fallback for one over-long tool and becomes a **load-bearing identity that must stay stable across restarts** (credit: `tiiny-85`). Fix is a pinned hash (FNV or truncated SHA-256), no behavior change for names that already fit. Link this issue from #19.
+2. **`wire_name` uses `DefaultHasher` for its >64-char fallback** (`mcp_registry.rs:64-68`). `std::collections::hash_map::DefaultHasher`'s algorithm is explicitly not guaranteed stable across Rust releases, so a hashed tool name can change under a toolchain upgrade — silently breaking any recipe allow-list entry or client-cached name that landed on the hashed path. Dormant today because almost nothing exceeds 64 chars; **federation is what pushes names over the line** (`mcp__toolsuite__mcp__reader__parse_structured` is 45 chars at two levels), so it gets worse the longer #19 is deployed. Worse still in a mutual-cycle topology, where names gain a nesting level per restart cycle: the hashed name stops being a cosmetic fallback for one over-long tool and becomes a **load-bearing identity that must stay stable across restarts**. Fix is a pinned hash (FNV or truncated SHA-256), no behavior change for names that already fit. Link this issue from #19.
 3. **`/v1/tools` exists only in the Python reference** (`src/woollama/router.py:255`); `woollamad` has no such route, but `README.md` lists it under "What works today" for the router generally. Either port it or correct the README — federation makes tool introspection more valuable, not less.
 
 - [ ] **Step 6: Commit**
@@ -1015,12 +1015,12 @@ no after-startup: connect happens once, before the listener opens."
 
 ## Acceptance
 
-**The builder does not declare this working.** Per the working agreement in the brief, the
-`tiiny-85` session validates by pointing the device-management woollamad at the real
-`mcp-suite` container over the `url` form and reporting what actually happens.
+**The builder does not declare this working.** Per the working agreement in the brief, a
+separate validation run points the device-management woollamad at a real MCP server over the
+`url` form and reports what actually happens.
 
 A green `cargo test` here proves the transport compiles and talks to another woollamad. That is
-a different claim from "it consumes mcp-suite." Report the former; do not report the latter.
+a different claim from "it consumes a real MCP server." Report the former; do not report the latter.
 
 ## Known divergence introduced by this plan
 

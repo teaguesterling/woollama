@@ -239,8 +239,8 @@ fn obj(v: &Option<Value>) -> Option<&serde_json::Map<String, Value>> {
 
 // A streaming forward has NO total deadline. reqwest's `timeout` is a total deadline that includes
 // reading the body, so the 180 s one these paths used to carry cut every generation longer than
-// that: measured 2026-11-22, 36 of 37 pi "Stream ended without finish_reason" failures were that
-// cut, while the same kind of stream sent straight to the device ran 651 s and ended normally.
+// that. The client then saw "Stream ended without finish_reason", while the same kind of stream
+// sent straight to the device ran 651 s and ended normally.
 //
 // What replaces it: a connect timeout, and an IDLE timeout (reqwest's `read_timeout`, which
 // resets on every read and also bounds the wait for the response headers). A stream that keeps
@@ -253,7 +253,7 @@ pub const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default for [`stream_idle_timeout`], in seconds.
 ///
 /// The longest silence a healthy backend produces is before the FIRST token, while it processes
-/// the prompt (and, on a Tiiny, finishes a model swap). Measured 2026-11-22 straight to the device:
+/// the prompt (and, on a Tiiny, finishes a model swap). Measured straight to the device:
 /// headers at 0.0 s, first token at 165.9 s. After that the gaps are one token apart (15–30 tok/s).
 /// 300 s clears the measured worst case by more than half again; a backend silent for five minutes
 /// is wedged, and the client is better served by an error than by more waiting.

@@ -22,7 +22,7 @@
 - **Commits:** conventional subject; body ends with the two trailers:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01MNbD4t3EqzQuXXoVZApnHu
+  Claude-Session: https://claude.ai/code/<session-id>
   ```
 
 ---

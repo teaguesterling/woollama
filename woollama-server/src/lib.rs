@@ -1646,9 +1646,8 @@ async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
     // chat client then reach the device concurrently, and on the Tiiny that is the
     // documented wedge condition: every request times out while the device still looks
     // healthy — low load, no dmesg errors — and recovery needs ALL models stopped, not
-    // just the embedder. Measured 2026-10-03: a bulk run at 8 rows/s beside two
-    // resident chat models wedged the embedder, and an external watchdog had to stop
-    // all three to bring it back, taking an unrelated image model down with it.
+    // just the embedder. A bulk embedding run beside resident chat models is enough
+    // to wedge the embedder.
     //
     // `enter` also ensures the model is loaded, so an embedding request now brings the
     // embedder up the same way a chat request brings a chat model up, instead of 404ing

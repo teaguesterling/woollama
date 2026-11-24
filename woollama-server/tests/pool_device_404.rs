@@ -7,7 +7,7 @@
 //! that signal, and the embeddings route treated nothing as that signal. Every later request then
 //! took the "already loaded" short-circuit and failed the same way until the daemon restarted.
 //!
-//! The fake device speaks the 0.1.38 shapes, as measured through dobby on 2026-11-01:
+//! The fake device speaks the 0.1.38 shapes, as measured on the device:
 //!   GET  running -> {"object":"list","running":[],"pending":[],"instances":{"running":[],"pending":[]}}
 //!   POST start   -> 200 {"message":"start loading ...","progress":0}, and the model appears later
 //!   not loaded   -> 404 {"error":{"code":404,"message":"\"<id>\" is not loaded.","type":"model_not_found"}}

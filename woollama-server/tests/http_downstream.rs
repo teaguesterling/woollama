@@ -56,7 +56,7 @@ async fn tool_names(base: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn woollamad_consumes_another_woollamad_over_http() {
-    // B: a leaf with no downstreams of its own, like the real mcp-suite. Its /mcp still
+    // B: a leaf with no downstreams of its own, like a real MCP server. Its /mcp still
     // advertises the built-in `chat` verb — the stable thing to assert on without depending on
     // whatever the ambient config dir happens to hold.
     let b = spawn_woollamad(r#"{"mcpServers": {}}"#).await;

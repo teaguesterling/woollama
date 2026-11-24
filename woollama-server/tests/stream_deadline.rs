@@ -1,6 +1,6 @@
 //! A streamed answer must not be cut by a request deadline, and a stream that DOES fail must say so.
 //!
-//! Measured 2026-11-22: 36 of 37 pi failures "Stream ended without finish_reason" were woollamad's
+//! The client failures "Stream ended without finish_reason" came from woollamad's
 //! own 180 s upstream deadline. `reqwest`'s `timeout` is a TOTAL deadline that includes reading the
 //! body, so a long generation was cut at 180 s after dispatch. The relay then just ended the body:
 //! no SSE error event, no final chunk, no `[DONE]`. The access line, written at header time, said

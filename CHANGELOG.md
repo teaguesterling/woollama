@@ -6,8 +6,8 @@
 
 - **A streamed answer is no longer cut at 180 s.** Every streaming forward used reqwest's
   `timeout`, which is a *total* deadline that includes reading the body. A generation that ran
-  longer than 180 s after dispatch was cut mid-answer. Measured 2026-11-22: 36 of 37 pi failures
-  "Stream ended without finish_reason" were this cut. The same kind of stream sent straight to
+  longer than 180 s after dispatch was cut mid-answer, and the client saw
+  "Stream ended without finish_reason". The same kind of stream sent straight to
   the device ran 651 s and ended normally.
 
   Streaming forwards now have a 10 s connect timeout and a 300 s **idle** timeout (reqwest's
