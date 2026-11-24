@@ -240,7 +240,10 @@ async fn gate_protects_serving_model_from_eviction() {
     let m = mgr(&device);
     m.ensure_loaded("A", None).await.unwrap();
     m.ensure_loaded("B", None).await.unwrap();
-    let gate = Arc::new(Gate::new(m.clone(), 1, None, 5.0, Some(2), 5.0));
+    // parallel = 2: this test holds A and B in flight at once. Since the device-wide gate,
+    // `parallel` caps the whole device, so parallel = 1 would never admit the second holder
+    // and the test would hang. What it checks (a busy model is never evicted) is unchanged.
+    let gate = Arc::new(Gate::new(m.clone(), 2, None, 5.0, Some(2), 5.0));
 
     let ready = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
