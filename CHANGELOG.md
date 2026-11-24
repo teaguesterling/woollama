@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Features
+
+- **A reply says which route and which model served it.** The body carries only the bare id the
+  backend chose, so a client that asked for `device/default` could not tell what answered.
+  Replies on `/v1/chat/completions` and `/v1/embeddings` (streamed or not) now carry two headers:
+
+  ```
+  x-woollama-route: device
+  x-woollama-model: Qwen/Qwen3-4B-Instruct-2507
+  ```
+
+  `x-woollama-model` is the id sent to the backend, after `default` and aliases resolve. A
+  woollamad that relays to another woollamad passes the inner pair through and prefixes its own
+  route (`x-woollama-route: hop/device`), so a client behind a forwarder still learns the real
+  model. The access line ends with the same pair: `... origin=relayed upstream=200 route=device
+  model=Qwen/Qwen3-4B-Instruct-2507`. The body is unchanged. `woollama/<recipe>` replies carry no
+  pair, because a recipe is not a device route.
+
 ### Fixes
 
 - **A streamed answer is no longer cut at 180 s.** Every streaming forward used reqwest's

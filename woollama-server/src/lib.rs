@@ -606,10 +606,72 @@ struct RelayedFrom(u16);
 async fn relay_json(resp: reqwest::Response) -> Response {
     let upstream = resp.status().as_u16();
     let status = StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY);
+    let inner = upstream_served(&resp);
     let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
     let mut out = (status, Json(data)).into_response();
     out.extensions_mut().insert(RelayedFrom(upstream));
+    if let Some(s) = inner {
+        out.extensions_mut().insert(UpstreamServed(s));
+    }
     out
+}
+
+/// Which route and which model served a reply. A reply's body carries only the bare id the
+/// backend chose, so a client that asked for `device/default` cannot tell what answered; callers
+/// have compared device clock times to prove it. The handler that picked the route (and, on the
+/// pooled path, resolved `default`) records it here; `access_log` writes it as the
+/// `x-woollama-route` / `x-woollama-model` headers and into the access line.
+#[derive(Clone, Debug, PartialEq)]
+struct Served {
+    route: String,
+    model: String,
+}
+
+/// The `Served` pair that an upstream woollamad reported, when this hop relays to one.
+#[derive(Clone)]
+struct UpstreamServed(Served);
+
+const ROUTE_HEADER: &str = "x-woollama-route";
+const MODEL_HEADER: &str = "x-woollama-model";
+
+fn upstream_served(resp: &reqwest::Response) -> Option<Served> {
+    let h = |n: &str| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+    Some(Served { route: h(ROUTE_HEADER)?, model: h(MODEL_HEADER)? })
+}
+
+/// Record the route and model on a response, unless a deeper step already recorded them (the
+/// pooled path knows the resolved model; its caller knows only the requested one).
+fn tag_served(mut resp: Response, route: &str, model: &str) -> Response {
+    if resp.extensions().get::<Served>().is_none() {
+        resp.extensions_mut().insert(Served { route: route.to_string(), model: model.to_string() });
+    }
+    resp
+}
+
+/// What this hop reports: its own route, and through a relay to another woollamad, the inner
+/// route appended and the inner model, so a client behind a forwarder still learns the real model.
+fn compose_served(own: Option<&Served>, inner: Option<&Served>) -> Option<Served> {
+    let own = own?;
+    Some(match inner {
+        Some(i) => Served { route: format!("{}/{}", own.route, i.route), model: i.model.clone() },
+        None => own.clone(),
+    })
+}
+
+/// Write the composed pair as headers. A value that is not a valid header value is left out of
+/// the headers; the access line still names it.
+fn apply_served(resp: &mut Response) -> Option<Served> {
+    let served = compose_served(
+        resp.extensions().get::<Served>(),
+        resp.extensions().get::<UpstreamServed>().map(|u| &u.0),
+    )?;
+    let headers = resp.headers_mut();
+    for (name, value) in [(ROUTE_HEADER, &served.route), (MODEL_HEADER, &served.model)] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+            headers.insert(name, v);
+        }
+    }
+    Some(served)
 }
 
 /// Did the backend's answer say that this model may no longer be resident?
@@ -631,12 +693,16 @@ fn says_model_is_gone(upstream: u16, body: &Value) -> bool {
 async fn relay_json_pooled(resp: reqwest::Response, manager: &pool::DeviceModelManager, real_id: &str) -> Response {
     let upstream = resp.status().as_u16();
     let status = StatusCode::from_u16(upstream).unwrap_or(StatusCode::BAD_GATEWAY);
+    let inner = upstream_served(&resp);
     let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
     if says_model_is_gone(upstream, &data) {
         manager.mark_needs_reload(real_id);
     }
     let mut out = (status, Json(data)).into_response();
     out.extensions_mut().insert(RelayedFrom(upstream));
+    if let Some(s) = inner {
+        out.extensions_mut().insert(UpstreamServed(s));
+    }
     out
 }
 
@@ -672,25 +738,49 @@ fn access_log_enabled_for(v: Option<&str>) -> bool {
 }
 
 /// The line itself, as a pure function so the format is testable without capturing stderr.
-fn format_access_line(method: &str, path: &str, status: u16, elapsed_ms: u128, upstream: Option<u16>) -> String {
-    match upstream {
-        Some(u) => format!("woollamad: {method} {path} {status} {elapsed_ms}ms origin=relayed upstream={u}"),
-        None => format!("woollamad: {method} {path} {status} {elapsed_ms}ms origin=local"),
+fn format_access_line(
+    method: &str,
+    path: &str,
+    status: u16,
+    elapsed_ms: u128,
+    upstream: Option<u16>,
+    served: Option<&Served>,
+) -> String {
+    let origin = match upstream {
+        Some(u) => format!("origin=relayed upstream={u}"),
+        None => "origin=local".to_string(),
+    };
+    match served {
+        Some(s) => format!(
+            "woollamad: {method} {path} {status} {elapsed_ms}ms {origin} route={} model={}",
+            s.route, s.model
+        ),
+        None => format!("woollamad: {method} {path} {status} {elapsed_ms}ms {origin}"),
     }
 }
 
 async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     if !access_log_enabled() {
-        return next.run(req).await;
+        let mut resp = next.run(req).await;
+        apply_served(&mut resp);
+        return resp;
     }
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let started = std::time::Instant::now();
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
+    let served = apply_served(&mut resp);
     let upstream = resp.extensions().get::<RelayedFrom>().map(|r| r.0);
     eprintln!(
         "{}",
-        format_access_line(&method, &path, resp.status().as_u16(), started.elapsed().as_millis(), upstream)
+        format_access_line(
+            &method,
+            &path,
+            resp.status().as_u16(),
+            started.elapsed().as_millis(),
+            upstream,
+            served.as_ref()
+        )
     );
     resp
 }
@@ -747,6 +837,7 @@ pub(crate) fn sse_response(body: Body) -> Response {
 ///
 /// `hold` is dropped when the body ends, however it ends — the pooled path passes its gate slot.
 fn relay_sse<H: Send + 'static>(resp: reqwest::Response, label: String, hold: H) -> Response {
+    let inner = upstream_served(&resp);
     let body = stream! {
         let _hold = hold;
         let mut log = StreamEndLog::new(label);
@@ -779,7 +870,11 @@ fn relay_sse<H: Send + 'static>(resp: reqwest::Response, label: String, hold: H)
             }
         }
     };
-    sse_response(Body::from_stream(body))
+    let mut out = sse_response(Body::from_stream(body));
+    if let Some(s) = inner {
+        out.extensions_mut().insert(UpstreamServed(s));
+    }
+    out
 }
 
 /// The index just past the last SSE event boundary (a blank line) in `buf`, if there is one.
@@ -1471,6 +1566,27 @@ async fn backend_proxy(
 // --- POST /v1/chat/completions ------------------------------------------------
 
 async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let routed = served_route(&state, &body);
+    let resp = chat_completions_inner(state, body).await;
+    match routed {
+        Some((route, model)) => tag_served(resp, &route, &model),
+        None => resp,
+    }
+}
+
+/// The route and model a `<provider>/<model>` request names, when the provider is a known
+/// inferencer. `woollama/<recipe>` is not a device route, so it is not tagged.
+fn served_route(state: &AppState, body: &Value) -> Option<(String, String)> {
+    let model = body.get("model").and_then(Value::as_str)?;
+    let (provider, bare) = model.split_once('/')?;
+    if provider == "woollama" {
+        return None;
+    }
+    state.inferencers.resolve(provider)?;
+    Some((provider.to_string(), bare.to_string()))
+}
+
+async fn chat_completions_inner(state: Arc<AppState>, body: Value) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
 
     if let Some(name) = model.strip_prefix("woollama/") {
@@ -1642,6 +1758,15 @@ async fn images_generations(State(state): State<Arc<AppState>>, Json(body): Json
 /// `/v1/embeddings` (e.g. the device's Qwen3-Embedding). For local vectorization/RAG through
 /// woollama. Embeddings are quick, so the chat path's 180s timeout is plenty.
 async fn embeddings(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let routed = served_route(&state, &body);
+    let resp = embeddings_inner(state, body).await;
+    match routed {
+        Some((route, model)) => tag_served(resp, &route, &model),
+        None => resp,
+    }
+}
+
+async fn embeddings_inner(state: Arc<AppState>, body: Value) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     let provider = model.split('/').next().unwrap_or("");
     let Some(inf) = state.inferencers.resolve(provider) else {
@@ -1952,70 +2077,76 @@ async fn passthrough_pooled(
         Err(e) => return err_response(StatusCode::BAD_REQUEST, e.0, "invalid_request_error"),
     };
 
-    let mut fwd = body.clone();
-    fwd["model"] = json!(real);
+    // Everything after resolution answers for `real`, so tag it here: the caller knows only the
+    // requested id, which for `default` is not the model that served.
+    let resp = async {
+        let mut fwd = body.clone();
+        fwd["model"] = json!(real);
 
-    let headers = match inf.auth_headers() {
-        Ok(h) => h,
-        Err(e) => return engine_err_response(e),
-    };
+        let headers = match inf.auth_headers() {
+            Ok(h) => h,
+            Err(e) => return engine_err_response(e),
+        };
 
-    let slot = match gate.enter(&real).await {
-        Ok(s) => s,
-        Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
-        Err(pool::PoolError::Device(msg)) => {
-            // Matches Python's `_error(f"device error: {e}", "server_error", 502)`
-            // in `router.py::_passthrough_pooled`.
-            return engine_err_response(EngineError::new(format!("device error: {msg}"), "server_error", 502));
+        let slot = match gate.enter(&real).await {
+            Ok(s) => s,
+            Err(pool::PoolError::Backpressure(secs)) => return backpressure_response(secs),
+            Err(pool::PoolError::Device(msg)) => {
+                // Matches Python's `_error(f"device error: {e}", "server_error", 502)`
+                // in `router.py::_passthrough_pooled`.
+                return engine_err_response(EngineError::new(format!("device error: {msg}"), "server_error", 502));
+            }
+            // `Gate::enter` converts `SwapBlocked` into `Backpressure` once the caller's
+            // `queue_timeout` is spent, so it should be unreachable here. Answer as backpressure
+            // anyway rather than inventing a new status: if the conversion is ever missed, a client
+            // that retries is the right outcome, and a `503` is not a lie — capacity really is full.
+            Err(pool::PoolError::SwapBlocked) => return backpressure_response(manager.retry_after()),
+        };
+
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        if stream {
+            let resp = match forward_post_stream(inf.chat_url(), &fwd, &headers).await {
+                Ok(r) => r,
+                // The connection failed rather than the backend answering. #38 wired the reload
+                // marker only to a 5xx RESPONSE, so this branch left our residency belief intact and
+                // every later request short-circuited on it — the exact failure #38 exists to
+                // prevent, reached by the likelier route (#48).
+                Err(e) => {
+                    if e.model_may_be_gone() {
+                        manager.mark_needs_reload(&real);
+                    }
+                    return e.into_response();
+                }
+            };
+            if resp.status().as_u16() >= 400 {
+                // The backend just refused, possibly because the model was dropped from under us (#38).
+                return relay_json_pooled(resp, manager, &real).await;
+            }
+            // Hold `slot` for the lifetime of the stream body: it moves into the
+            // generator and drops only once the upstream stream is exhausted (or the
+            // body is dropped early, e.g. a client disconnect) — releasing the
+            // in-flight counter and the concurrency permit at that point, never before.
+            return relay_sse(resp, format!("{}/{real}", inf.name), slot);
         }
-        // `Gate::enter` converts `SwapBlocked` into `Backpressure` once the caller's
-        // `queue_timeout` is spent, so it should be unreachable here. Answer as backpressure
-        // anyway rather than inventing a new status: if the conversion is ever missed, a client
-        // that retries is the right outcome, and a `503` is not a lie — capacity really is full.
-        Err(pool::PoolError::SwapBlocked) => return backpressure_response(manager.retry_after()),
-    };
 
-    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    if stream {
-        let resp = match forward_post_stream(inf.chat_url(), &fwd, &headers).await {
-            Ok(r) => r,
-            // The connection failed rather than the backend answering. #38 wired the reload
-            // marker only to a 5xx RESPONSE, so this branch left our residency belief intact and
-            // every later request short-circuited on it — the exact failure #38 exists to
-            // prevent, reached by the likelier route (#48).
+        fwd["stream"] = json!(false);
+        let result = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
+            Ok(resp) => relay_json_pooled(resp, manager, &real).await,
+            // A dropped connection says the same thing more emphatically than a 5xx does: a 5xx can
+            // be an ordinary application error from a perfectly healthy model, whereas a connection
+            // that died mid-request is what an instance being torn down looks like (#48).
             Err(e) => {
                 if e.model_may_be_gone() {
                     manager.mark_needs_reload(&real);
                 }
-                return e.into_response();
+                e.into_response()
             }
         };
-        if resp.status().as_u16() >= 400 {
-            // The backend just refused, possibly because the model was dropped from under us (#38).
-            return relay_json_pooled(resp, manager, &real).await;
-        }
-        // Hold `slot` for the lifetime of the stream body: it moves into the
-        // generator and drops only once the upstream stream is exhausted (or the
-        // body is dropped early, e.g. a client disconnect) — releasing the
-        // in-flight counter and the concurrency permit at that point, never before.
-        return relay_sse(resp, format!("{}/{real}", inf.name), slot);
+        // `slot` drops here (end of scope), after the dispatch has completed.
+        result
     }
-
-    fwd["stream"] = json!(false);
-    let result = match forward_post_classified(inf.chat_url(), &fwd, &headers, 180).await {
-        Ok(resp) => relay_json_pooled(resp, manager, &real).await,
-        // A dropped connection says the same thing more emphatically than a 5xx does: a 5xx can
-        // be an ordinary application error from a perfectly healthy model, whereas a connection
-        // that died mid-request is what an instance being torn down looks like (#48).
-        Err(e) => {
-            if e.model_may_be_gone() {
-                manager.mark_needs_reload(&real);
-            }
-            e.into_response()
-        }
-    };
-    // `slot` drops here (end of scope), after the dispatch has completed.
-    result
+    .await;
+    tag_served(resp, &inf.name, &real)
 }
 
 // --- POST /v1/responses (stateless, non-stream) -------------------------------
@@ -2832,11 +2963,11 @@ mod access_line_tests {
     /// blank meaning two things answers wrongly rather than declining to answer (#49).
     #[test]
     fn relayed_and_local_are_explicitly_distinguishable() {
-        let relayed = format_access_line("POST", "/v1/chat/completions", 504, 60_123, Some(504));
+        let relayed = format_access_line("POST", "/v1/chat/completions", 504, 60_123, Some(504), None);
         assert!(relayed.contains("origin=relayed"), "{relayed}");
         assert!(relayed.contains("upstream=504"), "the backend's own status must be carried: {relayed}");
 
-        let local = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None);
+        let local = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None);
         assert!(local.contains("origin=local"), "{local}");
         assert!(
             !local.contains("upstream"),
@@ -2850,11 +2981,37 @@ mod access_line_tests {
     /// from the backend are identical in the response and mean opposite things.
     #[test]
     fn an_identical_status_from_either_side_is_still_distinguishable() {
-        let from_backend = format_access_line("POST", "/v1/chat/completions", 502, 12, Some(502));
-        let from_us = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None);
+        let from_backend = format_access_line("POST", "/v1/chat/completions", 502, 12, Some(502), None);
+        let from_us = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None);
         assert_ne!(from_backend, from_us, "the whole point is that these differ");
         assert!(from_backend.contains("origin=relayed upstream=502"));
         assert!(from_us.contains("origin=local"));
+    }
+
+    /// The access line names the route and model that served, so the journal answers "which model
+    /// did that call reach" without the client's help. A request with no route says nothing rather
+    /// than an empty field.
+    #[test]
+    fn the_access_line_names_route_and_model() {
+        let s = Served { route: "device".into(), model: "Qwen/Chat-A".into() };
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 9, Some(200), Some(&s));
+        assert!(line.ends_with("origin=relayed upstream=200 route=device model=Qwen/Chat-A"), "{line}");
+        let none = format_access_line("GET", "/v1/models", 200, 1, None, None);
+        assert!(!none.contains("route="), "{none}");
+    }
+
+    /// A hop appends the inner route and reports the inner model; with no inner answer it reports
+    /// its own pair; with no own pair (not a routed request) it reports nothing.
+    #[test]
+    fn a_hop_composes_its_route_with_the_inner_one() {
+        let own = Served { route: "hop".into(), model: "device/default".into() };
+        let inner = Served { route: "device".into(), model: "Qwen/Chat-A".into() };
+        assert_eq!(
+            compose_served(Some(&own), Some(&inner)),
+            Some(Served { route: "hop/device".into(), model: "Qwen/Chat-A".into() })
+        );
+        assert_eq!(compose_served(Some(&own), None), Some(own.clone()));
+        assert_eq!(compose_served(None, Some(&inner)), None);
     }
 
     /// Only whole SSE events go out, in either line-ending style. A half event held back is what
