@@ -46,12 +46,9 @@ that slice; the suite has grown since — see the per-slice "Verified" lines and
   router implementation. cosmic-fabric remains as the COSMIC **frontend
   client** and its design docs are now stale (still cite `/tmp`, still read
   the naming question as open — it's settled: `woollama`).
-- **Mount move gotcha**: the project moved `/mnt/fast/...` →
-  `/srv/physical/fast/...` (also reachable as `/home/teague/Projects/woollama`
-  via bind mount). This broke the `.venv` editable install (the
-  `_editable_impl_woollama.pth` pointed at the dead `/mnt/fast` path). Fix
-  already applied: `uv sync --extra dev` repointed it. **All 43 tests pass.**
-  If imports break again as "unknown location", re-run `uv sync --extra dev`.
+- **Mount move gotcha**: moving the project directory breaks the `.venv`
+  editable install (the `_editable_impl_woollama.pth` keeps the old path).
+  If imports break as "unknown location", re-run `uv sync --extra dev`.
 - Dev deps live in the `dev` **optional-dependency extra** (not a
   `dependency-groups` table). Run tests with `uv run --extra dev pytest`.
 

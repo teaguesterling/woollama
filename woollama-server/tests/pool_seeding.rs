@@ -13,7 +13,7 @@
 //! the device but loaded by someone else was invisible, and `<provider>/default` either 400'd or
 //! fell through to the `[virtual]` table and evicted a perfectly good model to load its entry.
 //!
-//! Reported from real hardware by the `Tiiny` session; the discriminating setup is theirs:
+//! Found on real hardware; the discriminating setup is:
 //! start against a device with a model already resident that woollamad did not load.
 
 mod common;
@@ -180,7 +180,7 @@ async fn spawn_device(resident: &str) -> (String, Dev) {
     (format!("http://{addr}"), state)
 }
 
-/// Tiiny's repro, end to end: a model resident on the device that woollamad did not load, no
+/// The real-hardware repro, end to end: a model resident on the device that woollamad did not load, no
 /// `[virtual]` table configured. Before #26 this returned
 /// `400 "model 'default' requested but no model is loaded ..."` — with the model loaded.
 #[tokio::test]

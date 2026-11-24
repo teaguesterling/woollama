@@ -215,7 +215,7 @@ mod tests {
 
     // Ollama lets qwen3-class models think unless the request says `think: false`. The native
     // path must carry the caller's choice, or the thinking eats num_predict and the reply is empty
-    // (measured 2026-11-09: done_reason=length, 12,788 thinking chars, content "").
+    // (measured: done_reason=length, 12,788 thinking chars, content "").
     #[test]
     fn to_native_forwards_think() {
         let off = to_native_request(&json!({"model": "m", "think": false, "options": {"num_ctx": 8192}}));

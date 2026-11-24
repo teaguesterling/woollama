@@ -22,7 +22,7 @@
 - **Commits:** conventional-commit subject; end every commit message body with the two trailers:
   ```
   Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
-  Claude-Session: https://claude.ai/code/session_01MNbD4t3EqzQuXXoVZApnHu
+  Claude-Session: https://claude.ai/code/<session-id>
   ```
 
 ---
@@ -93,7 +93,7 @@ Note `config` is already imported at the top of `tests/test_config.py`; if not, 
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cd ~/Projects/woollama/trees/model-pooling && python -m pytest tests/test_config.py -k pooling_keys -q`
+Run: `cd /home/user/woollama && python -m pytest tests/test_config.py -k pooling_keys -q`
 Expected: FAIL — `KeyError: 'management_url'` (keys not yet parsed).
 
 - [ ] **Step 3: Add the whitelist+validation in `config.load_inferencers`**
@@ -1320,7 +1320,7 @@ Per the spec's phasing — do not implement here, but named so a reviewer knows 
 
 ## Deployment note (device repo, outside this plan)
 
-To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.device]`, and `run-woollama.sh` must export the `:8800` base. That is device-side configuration, tracked separately from this woollama code change.
+To actually enable pooling for the device, `~/.config/woollama/inferencers.toml` needs `management_url` + `virtual` on `[inferencers.device]`, and the service's launch script must export the `:8800` base. That is device-side configuration, tracked separately from this woollama code change.
 
 ## Self-Review
 

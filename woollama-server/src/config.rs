@@ -1432,7 +1432,7 @@ mod tests {
         // Exercises the WIRING, not just the predicate: a warning that is disconnected from its
         // trigger would still pass `plaintext_detection_exempts_loopback_only` below.
         let (specs, errors, warnings) = parse_mcp_servers(&engine::expand_env(
-            r#"{"mcpServers": {"suite": {"url": "http://mcp.dobby.lan:9200/mcp",
+            r#"{"mcpServers": {"suite": {"url": "http://mcp.gateway-host.example.com:9200/mcp",
                  "headers": {"Authorization": "Bearer sk-cleartext"}}}}"#,
         ))
         .unwrap();
@@ -1453,7 +1453,7 @@ mod tests {
         quiet(r#"{"mcpServers": {"a": {"url": "https://h/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
         quiet(r#"{"mcpServers": {"b": {"url": "http://127.0.0.1:9200/mcp", "headers": {"Authorization": "Bearer x"}}}}"#);
         // No credential to expose ⇒ nothing to warn about, even over plaintext.
-        quiet(r#"{"mcpServers": {"c": {"url": "http://mcp.dobby.lan:9200/mcp"}}}"#);
+        quiet(r#"{"mcpServers": {"c": {"url": "http://mcp.gateway-host.example.com:9200/mcp"}}}"#);
     }
 
     #[test]
@@ -1463,7 +1463,7 @@ mod tests {
         assert!(is_encrypted_or_local("http://localhost/mcp"));
         assert!(is_encrypted_or_local("http://[::1]:9200/mcp"));
         // The case that must warn: a real network hop carrying a credential in the clear.
-        assert!(!is_encrypted_or_local("http://mcp.dobby.lan:9200/mcp"));
+        assert!(!is_encrypted_or_local("http://mcp.gateway-host.example.com:9200/mcp"));
         assert!(!is_encrypted_or_local("http://10.0.0.5/mcp"));
     }
 
