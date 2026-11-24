@@ -5,9 +5,9 @@
 //! `pool_seeding.rs`) does not make that true if the permit inside it is per model.
 //!
 //! Why it matters: on the Tiiny the failure is on the single NPU DMA path, not on one model's slot.
-//! Beta log #065 (2026-09-03): embedding + chat overlap → `xh2a_pcie_hdma_chan_transfer: timeout`,
-//! then a hard reset. 2026-09-14: a chat request overlapping embedding load hung 108 s, returned 200
-//! with empty content, and the runtime dropped the chat model. Those overlaps are CROSS-MODEL, which
+//! An embedding + chat overlap can end in `xh2a_pcie_hdma_chan_transfer: timeout`, then a hard
+//! reset. A chat request that overlaps an embedding-model load can hang, return 200 with empty
+//! content, and make the runtime drop the chat model. Those overlaps are CROSS-MODEL, which
 //! is exactly what a per-model permit lets through.
 //!
 //! Separate test binary: `WOOLLAMA_CONFIG_DIR` is process-global and would race other files.

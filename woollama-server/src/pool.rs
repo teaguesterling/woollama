@@ -1104,8 +1104,9 @@ pub struct Gate {
     ///
     /// The per-model semaphores alone do not bound the device: `parallel = 1` with chat and
     /// embeddings resident put 2 requests on it. On the Tiiny that overlap is the failure, because
-    /// the NPU has one DMA path (beta log #065: HDMA timeout, then a hard reset; 2026-09-14: a chat
-    /// overlapping embedding load hung 108 s and the runtime dropped the chat model).
+    /// the NPU has one DMA path: overlapping requests can end in a DMA timeout and a hard reset,
+    /// and a chat that overlaps an embedding-model load can hang and make the runtime drop the
+    /// chat model.
     ///
     /// The per-model semaphores stay in front of this one so a backlog on one model holds one
     /// place in this queue, not all of them: a chat waits for the request in flight, not for every
