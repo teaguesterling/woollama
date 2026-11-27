@@ -506,7 +506,7 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `parallel` | — | How many requests **woollama** sends the device concurrently (default `1`). It sizes both the per-model queue semaphore and one device-wide semaphore, so it caps the device's total across all models and all routes sharing the `management_url`, not each model. |
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). If every loaded model is busy, the request **waits** for one to free up rather than being refused — see *Queueing across a model swap* below. Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model (not per device) before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
-| `queue_timeout` | — | Seconds a request waits for its turn before woollama gives up and returns `503` + `Retry-After` (default `30`). Bounds three waits: a place in a model's queue, a cold load, and — since v0.15 — a **model swap** on a full device. |
+| `queue_timeout` | — | Seconds a request waits for its turn before woollama gives up and returns `503` + `Retry-After` (default `30`). Bounds the waits around a load: a place in a model's queue, and — since v0.15 — a **model swap** on a full device. The load itself is bounded by `load_timeout`. |
 | `load_timeout` | — | Seconds woollama waits for a model to report running after it asks the backend to start it (default `120`). Past that, the request fails with `502`. Raise it for large models on a slow device. Routes sharing a `management_url` use the **largest** value among them, and a route that omits the key counts as `120`. The Ollama management protocol ignores it. |
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
@@ -624,8 +624,9 @@ achievable even in principle, and two things follow:
 device are two views of one truth, so keeping them separate meant neither saw the other's loads —
 alternating between them swapped the model on *every* call — and it enforced `parallel` once per
 route, **doubling** the concurrency the device actually saw. The shared gate takes the most
-restrictive limit configured across them, except `queue_timeout`, where the most forgiving value
-wins (a shorter wait causes spurious `503`s on a slow cold load without protecting the device).
+restrictive limit configured across them, except `queue_timeout` and `load_timeout`, where the most
+forgiving value wins (a shorter wait causes spurious `503`s or `502`s on a slow device without
+protecting it).
 
 The gate covers `/v1/chat/completions`, `/v1/embeddings` and `/v1/images/generations` across
 models, so with `parallel = 1` a long chat makes an embedding wait, and after `queue_timeout` that

@@ -1437,7 +1437,7 @@ impl PoolRegistry {
                 eprintln!(
                     "woollamad: inferencers {names:?} share management_url '{url}' — they will \
                      share one device pool and one concurrency gate, using the most restrictive \
-                     limits configured across them"
+                     limits configured across them (the most forgiving queue_timeout and load_timeout)"
                 );
                 for other in &infs[1..] {
                     if other.management_protocol != lead.management_protocol {
