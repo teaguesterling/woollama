@@ -1007,10 +1007,7 @@ impl DeviceModelManager {
             e.loaded = false;
         }
         self.needs_reload.lock().unwrap().insert(real_id.to_string());
-        eprintln!(
-            "woollamad: the backend failed a request for '{real_id}'; it will be reloaded on the \
-             next request rather than assumed resident"
-        );
+        eprintln!("{}", reload_line(real_id));
     }
 
     fn fresh_enough(&self) -> bool {
@@ -1486,8 +1483,25 @@ impl PoolRegistry {
     }
 }
 
+/// The line `mark_needs_reload` writes. `real_id` can be the client's own model id, unchanged.
+fn reload_line(real_id: &str) -> String {
+    let real_id = crate::log_safe(real_id, crate::ID_MAX);
+    format!(
+        "woollamad: the backend failed a request for '{real_id}'; it will be reloaded on the \
+         next request rather than assumed resident"
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// The client chooses the model id; the reload line must not carry a field or a line from it.
+    #[test]
+    fn the_reload_line_escapes_a_client_model_id() {
+        let line = super::reload_line("m'\nwoollamad: forged");
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(line.contains("for 'mwoollamad:forged';"), "{line}");
+    }
+
     use super::*;
 
     /// `from_registry` should build a pool ONLY for inferencers that declare a

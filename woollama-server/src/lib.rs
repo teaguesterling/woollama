@@ -583,6 +583,12 @@ async fn send_classified(
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
+    // The next hop logs the original caller, not this woollamad. A configured header wins.
+    if !headers.keys().any(|k| k.eq_ignore_ascii_case(CALLER_HEADER)) {
+        if let Ok(c) = CALLER.try_with(|c| c.clone()) {
+            rb = rb.header(CALLER_HEADER, c);
+        }
+    }
     rb.send().await.map_err(|e| {
         if e.is_timeout() {
             ForwardFailure::Inconclusive(format!(
@@ -745,43 +751,129 @@ fn format_access_line(
     elapsed_ms: u128,
     upstream: Option<u16>,
     served: Option<&Served>,
+    caller: Option<&str>,
 ) -> String {
     let origin = match upstream {
         Some(u) => format!("origin=relayed upstream={u}"),
         None => "origin=local".to_string(),
     };
-    match served {
-        Some(s) => format!(
-            "woollamad: {method} {path} {status} {elapsed_ms}ms {origin} route={} model={}",
-            s.route, s.model
-        ),
-        None => format!("woollamad: {method} {path} {status} {elapsed_ms}ms {origin}"),
+    let mut line = format!("woollamad: {method} {path} {status} {elapsed_ms}ms {origin}");
+    if let Some(s) = served {
+        // A client chooses the model id, and the route is resolved from it: same rule as caller.
+        line.push_str(&format!(" route={} model={}", log_safe(&s.route, ID_MAX), log_safe(&s.model, ID_MAX)));
+    }
+    if let Some(c) = caller {
+        line.push_str(&format!(" caller={c}"));
+    }
+    line
+}
+
+/// The header a client sets to name itself, and that a hop sets on its forward so the next
+/// woollamad logs the original caller rather than the hop. One token is shared by every client,
+/// so the token cannot name the caller; this header is self-declared, and the log says only what
+/// the client claimed.
+const CALLER_HEADER: &str = "x-woollama-caller";
+const CALLER_MAX: usize = 64;
+const ID_MAX: usize = 128;
+
+/// A value as the access line may hold it: only `[A-Za-z0-9._/:@-]`, at most `max` characters,
+/// `-` when nothing is left. No space, `=`, CR or LF survives, so a value cannot add a field or a
+/// line.
+fn log_safe(v: &str, max: usize) -> String {
+    let c: String = v.chars().filter(|c| c.is_ascii_alphanumeric() || "._/:@-".contains(*c)).take(max).collect();
+    if c.is_empty() { "-".to_string() } else { c }
+}
+
+/// Who sent this request, as the access line names it: the `x-woollama-caller` header if the
+/// client set one, else `ua:` and the first product token of its User-Agent, else `-`. Only
+/// `[A-Za-z0-9._/:@-]` survives, so a value cannot add a field to the line or forge one.
+fn caller_from(headers: &axum::http::HeaderMap) -> String {
+    let get = |n: axum::http::header::HeaderName| headers.get(n).and_then(|v| v.to_str().ok()).map(str::trim);
+    let clean = |v: &str| log_safe(v, CALLER_MAX);
+    if let Some(c) = get(axum::http::header::HeaderName::from_static(CALLER_HEADER)).map(clean) {
+        if c != "-" {
+            return c;
+        }
+    }
+    if let Some(ua) = get(axum::http::header::USER_AGENT).and_then(|u| u.split_whitespace().next()).map(clean) {
+        if ua != "-" {
+            return format!("ua:{ua}");
+        }
+    }
+    "-".to_string()
+}
+
+tokio::task_local! {
+    /// The caller of the request this task serves, so `send_classified` can pass it on to the next
+    /// hop without threading it through every handler.
+    static CALLER: String;
+}
+
+/// A request in flight. If the handler's future is dropped before it answers — the client went
+/// away, so axum dropped the handler — `Drop` writes the line the normal path never reached:
+/// `499 ... origin=cancelled`. Without it, a client that gave up while queued behind the device
+/// gate left no line at all, which reads the same as "the request never reached woollamad".
+struct InFlight {
+    method: String,
+    path: String,
+    caller: String,
+    started: std::time::Instant,
+    answered: bool,
+    emit: fn(&str),
+}
+
+impl InFlight {
+    fn cancelled_line(&self) -> String {
+        format!(
+            "woollamad: {} {} 499 {}ms origin=cancelled caller={}",
+            self.method,
+            self.path,
+            self.started.elapsed().as_millis(),
+            self.caller
+        )
     }
 }
 
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if !self.answered {
+            (self.emit)(&self.cancelled_line());
+        }
+    }
+}
+
+fn eprint_line(line: &str) {
+    eprintln!("{line}");
+}
+
 async fn access_log(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let caller = caller_from(req.headers());
     if !access_log_enabled() {
-        let mut resp = next.run(req).await;
+        let mut resp = CALLER.scope(caller, next.run(req)).await;
         apply_served(&mut resp);
         return resp;
     }
-    let method = req.method().to_string();
-    let path = req.uri().path().to_string();
-    let started = std::time::Instant::now();
-    let mut resp = next.run(req).await;
+    let mut flight = InFlight {
+        method: req.method().to_string(),
+        path: req.uri().path().to_string(),
+        caller: caller.clone(),
+        started: std::time::Instant::now(),
+        answered: false,
+        emit: eprint_line,
+    };
+    let mut resp = CALLER.scope(caller, next.run(req)).await;
+    flight.answered = true;
     let served = apply_served(&mut resp);
     let upstream = resp.extensions().get::<RelayedFrom>().map(|r| r.0);
-    eprintln!(
-        "{}",
-        format_access_line(
-            &method,
-            &path,
-            resp.status().as_u16(),
-            started.elapsed().as_millis(),
-            upstream,
-            served.as_ref()
-        )
-    );
+    eprint_line(&format_access_line(
+        &flight.method,
+        &flight.path,
+        resp.status().as_u16(),
+        flight.started.elapsed().as_millis(),
+        upstream,
+        served.as_ref(),
+        Some(&flight.caller),
+    ));
     resp
 }
 
@@ -972,7 +1064,8 @@ fn format_stream_end_line(
     bytes: u64,
     outcome: Option<&StreamOutcome>,
 ) -> String {
-    let head = format!("woollamad: stream-end model={label}");
+    // The label holds the client-chosen model id: same rule as the access line.
+    let head = format!("woollamad: stream-end model={}", log_safe(label, 2 * ID_MAX));
     let tail = format!("{elapsed_ms}ms chunks={chunks} bytes={bytes}");
     match outcome {
         Some(StreamOutcome::Complete) => format!("{head} outcome=complete {tail}"),
@@ -2963,11 +3056,11 @@ mod access_line_tests {
     /// blank meaning two things answers wrongly rather than declining to answer (#49).
     #[test]
     fn relayed_and_local_are_explicitly_distinguishable() {
-        let relayed = format_access_line("POST", "/v1/chat/completions", 504, 60_123, Some(504), None);
+        let relayed = format_access_line("POST", "/v1/chat/completions", 504, 60_123, Some(504), None, None);
         assert!(relayed.contains("origin=relayed"), "{relayed}");
         assert!(relayed.contains("upstream=504"), "the backend's own status must be carried: {relayed}");
 
-        let local = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None);
+        let local = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None, None);
         assert!(local.contains("origin=local"), "{local}");
         assert!(
             !local.contains("upstream"),
@@ -2981,8 +3074,8 @@ mod access_line_tests {
     /// from the backend are identical in the response and mean opposite things.
     #[test]
     fn an_identical_status_from_either_side_is_still_distinguishable() {
-        let from_backend = format_access_line("POST", "/v1/chat/completions", 502, 12, Some(502), None);
-        let from_us = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None);
+        let from_backend = format_access_line("POST", "/v1/chat/completions", 502, 12, Some(502), None, None);
+        let from_us = format_access_line("POST", "/v1/chat/completions", 502, 180_000, None, None, None);
         assert_ne!(from_backend, from_us, "the whole point is that these differ");
         assert!(from_backend.contains("origin=relayed upstream=502"));
         assert!(from_us.contains("origin=local"));
@@ -2994,10 +3087,69 @@ mod access_line_tests {
     #[test]
     fn the_access_line_names_route_and_model() {
         let s = Served { route: "device".into(), model: "Qwen/Chat-A".into() };
-        let line = format_access_line("POST", "/v1/chat/completions", 200, 9, Some(200), Some(&s));
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 9, Some(200), Some(&s), None);
         assert!(line.ends_with("origin=relayed upstream=200 route=device model=Qwen/Chat-A"), "{line}");
-        let none = format_access_line("GET", "/v1/models", 200, 1, None, None);
+        let none = format_access_line("GET", "/v1/models", 200, 1, None, None, None);
         assert!(!none.contains("route="), "{none}");
+    }
+
+    /// The caller is what the client declared, else its User-Agent product, else `-`; and nothing
+    /// a client sends can add a field to the line (a space or `=` would let it forge `origin=`).
+    #[test]
+    fn the_caller_is_declared_or_taken_from_the_user_agent() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(caller_from(&h), "-");
+        h.insert("user-agent", HeaderValue::from_static("OpenAI/Python 1.40.0"));
+        assert_eq!(caller_from(&h), "ua:OpenAI/Python");
+        h.insert(CALLER_HEADER, HeaderValue::from_static("kb-indexer"));
+        assert_eq!(caller_from(&h), "kb-indexer", "a declared caller wins over the User-Agent");
+        h.insert(CALLER_HEADER, HeaderValue::from_static("x origin=local"));
+        assert_eq!(caller_from(&h), "xoriginlocal", "a value must not add a field to the line");
+        h.insert(CALLER_HEADER, HeaderValue::from_static("   "));
+        assert_eq!(caller_from(&h), "ua:OpenAI/Python", "an empty declaration falls back");
+        let line = format_access_line("GET", "/v1/models", 200, 1, None, None, Some("kb-indexer"));
+        assert!(line.ends_with("origin=local caller=kb-indexer"), "{line}");
+    }
+
+    /// A client chooses the model id, and the route comes from it, so neither may add a field or a
+    /// line to the access line: a space could add a second `caller=`, a newline a forged line.
+    #[test]
+    fn a_client_model_id_cannot_forge_a_field_or_a_line() {
+        let s = Served { route: "dev ice".into(), model: "m caller=admin\nwoollamad: GET /x 200 1ms origin=local".into() };
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 1, None, Some(&s), Some("kb-indexer"));
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+        assert_eq!(line.matches("caller=").count(), 1, "{line}");
+        assert_eq!(line.matches("origin=").count(), 1, "{line}");
+        assert!(line.ends_with("caller=kb-indexer"), "{line}");
+        let ok = Served { route: "hop/device".into(), model: "Qwen/Qwen3-4B-Instruct-2507".into() };
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 1, None, Some(&ok), None);
+        assert!(line.ends_with("route=hop/device model=Qwen/Qwen3-4B-Instruct-2507"), "a real id is kept: {line}");
+    }
+
+    /// A request whose handler is dropped before it answers still leaves one line, and says why;
+    /// a request that answered leaves no second line.
+    #[test]
+    fn a_dropped_request_writes_a_cancelled_line() {
+        use std::sync::Mutex;
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn collect(l: &str) {
+            LINES.lock().unwrap().push(l.to_string());
+        }
+        let flight = |answered| InFlight {
+            method: "POST".into(),
+            path: "/v1/embeddings".into(),
+            caller: "kb-indexer".into(),
+            started: std::time::Instant::now(),
+            answered,
+            emit: collect,
+        };
+        drop(flight(false));
+        drop(flight(true));
+        let lines = LINES.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("woollamad: POST /v1/embeddings 499 "), "{}", lines[0]);
+        assert!(lines[0].ends_with("ms origin=cancelled caller=kb-indexer"), "{}", lines[0]);
     }
 
     /// A hop appends the inner route and reports the inner model; with no inner answer it reports
@@ -3035,6 +3187,15 @@ mod access_line_tests {
         assert!(bad.contains("outcome=upstream_error") && bad.ends_with(r#"error="reset \"by peer\"""#), "{bad}");
         let gone = format_stream_end_line("device/m", 2_000, 1, 10, None);
         assert!(gone.contains("outcome=client_disconnected"), "{gone}");
+    }
+
+    /// The stream-end label holds the client-chosen model id, so it follows the access line's rule.
+    #[test]
+    fn the_stream_end_label_escapes_a_client_model_id() {
+        let line = format_stream_end_line("device/m x=\"y\"\nwoollamad: z", 5, 1, 2, Some(&StreamOutcome::Complete));
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert_eq!(line.split(' ').count(), 7, "one field per name, none added: {line}");
+        assert!(line.starts_with("woollamad: stream-end model=device/mxywoollamad:z outcome=complete"), "{line}");
     }
 
     /// Disabling is opt-out, not opt-in. The default has to be ON: the defect this closes is that
