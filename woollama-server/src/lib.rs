@@ -2685,6 +2685,7 @@ mod default_candidate_tests {
             pool_max: None,
             queue_max: None,
             queue_timeout: 30.0,
+            load_timeout: 120.0,
             virtual_models,
         }
     }

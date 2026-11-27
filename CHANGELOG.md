@@ -36,6 +36,13 @@
   `woollamad: POST /v1/embeddings 499 61234ms origin=cancelled caller=...`. The backend is not
   told to stop; that is separate work.
 
+- **`load_timeout` sets how long the pool waits for a model to load.** The wait was fixed at
+  120 s, so a model that needed longer failed with `502` and `start <id>: not running after
+  120s`. The new `inferencers.toml` key takes seconds and defaults to `120`, so existing configs
+  behave as before. Routes that share a `management_url` use the largest value among them. The
+  Ollama management protocol ignores it. A value that is not a number of seconds above `0` and at
+  most `86400` is refused when the config loads.
+
 ### Fixes
 
 - **A streamed answer is no longer cut at 180 s.** Every streaming forward used reqwest's

@@ -18,7 +18,15 @@ parallel = 2
 pool_max = 3
 queue_max = 8
 queue_timeout = 45
+load_timeout = 300
 virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }
+
+# No `load_timeout`: one new provider, and one that extends a built-in.
+[inferencers.plain]
+base_url = "http://plain/v1"
+
+[inferencers.groq]
+queue_timeout = 45
 "#,
     )
     .unwrap();
@@ -32,6 +40,10 @@ virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }
     assert_eq!(device.pool_max, Some(3));
     assert_eq!(device.queue_max, Some(8));
     assert_eq!(device.queue_timeout, 45.0);
+    assert_eq!(device.load_timeout, 300.0);
+    // A config that does not name the key keeps the 120 s the pool always waited.
+    assert_eq!(reg.resolve("plain").expect("plain inferencer").load_timeout, 120.0);
+    assert_eq!(reg.resolve("groq").expect("groq override").load_timeout, 120.0);
     assert_eq!(device.virtual_models["default"], "Qwen/Coder");
     assert_eq!(device.virtual_models["coder"], "Qwen/Coder");
     assert_eq!(device.images_url(), "http://dev/v1/images/generations");
@@ -43,6 +55,7 @@ virtual = { default = "Qwen/Coder", coder = "Qwen/Coder" }
     assert_eq!(anthropic.pool_max, None);
     assert_eq!(anthropic.queue_max, None);
     assert_eq!(anthropic.queue_timeout, 30.0);
+    assert_eq!(anthropic.load_timeout, 120.0);
     assert!(anthropic.virtual_models.is_empty());
 
     std::env::remove_var("WOOLLAMA_CONFIG_DIR");

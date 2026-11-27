@@ -133,6 +133,12 @@ pub trait DeviceBackend: Send + Sync {
     }
     async fn load(&self, id: &str) -> Result<(), PoolError>;
     async fn unload(&self, id: &str) -> Result<(), PoolError>;
+
+    /// How long `load` polls for readiness, in seconds. `None`: this backend has no such wait.
+    #[cfg(test)]
+    fn load_timeout(&self) -> Option<f64> {
+        None
+    }
 }
 
 /// One HTTP call (`running`/`start`/`stop`) fully resolved against a base URL and
@@ -403,6 +409,11 @@ impl RestBackend {
 
 #[async_trait::async_trait]
 impl DeviceBackend for RestBackend {
+    #[cfg(test)]
+    fn load_timeout(&self) -> Option<f64> {
+        Some(self.load_timeout)
+    }
+
     async fn list_loaded(&self) -> Result<HashSet<String>, PoolError> {
         let v = self.running_body().await?;
         self.ids_from(&v)
@@ -1426,7 +1437,7 @@ impl PoolRegistry {
                 eprintln!(
                     "woollamad: inferencers {names:?} share management_url '{url}' — they will \
                      share one device pool and one concurrency gate, using the most restrictive \
-                     limits configured across them"
+                     limits configured across them (the most forgiving queue_timeout and load_timeout)"
                 );
                 for other in &infs[1..] {
                     if other.management_protocol != lead.management_protocol {
@@ -1440,12 +1451,14 @@ impl PoolRegistry {
             }
             let headers = lead.auth_headers().unwrap_or_default();
             let protocol_name = lead.management_protocol.as_deref().unwrap_or("device");
+            // Largest wins: a longer load is a property of the device, not of one route.
+            let load_timeout = infs.iter().map(|i| i.load_timeout).fold(0.0f64, f64::max);
             let backend: Arc<dyn DeviceBackend> = match protocol_name {
-                "device" => Arc::new(RestBackend::device(url.clone(), headers, 0.5, 120.0)),
+                "device" => Arc::new(RestBackend::device(url.clone(), headers, 0.5, load_timeout)),
                 "ollama" => Arc::new(OllamaBackend::new(url.clone(), None)),
                 other => match protocols.get(other) {
                     Some(engine::ProtocolSpec::Rest { running, start, stop }) => {
-                        Arc::new(RestBackend::from_spec(&url, &headers, running, start, stop, 0.5, 120.0))
+                        Arc::new(RestBackend::from_spec(&url, &headers, running, start, stop, 0.5, load_timeout))
                     }
                     Some(engine::ProtocolSpec::Ollama { keep_alive }) => {
                         Arc::new(OllamaBackend::new(url.clone(), keep_alive.clone()))
@@ -1504,6 +1517,45 @@ mod tests {
 
     use super::*;
 
+    /// Routes onto one device share one backend, which waits for the LARGEST `load_timeout` among
+    /// them. The 60 s route sorts first, so it leads the group: taking the lead's value fails here.
+    #[test]
+    fn a_shared_device_backend_waits_for_the_largest_load_timeout() {
+        let endpoint = engine::EndpointSpec {
+            url: "{base}/models".to_string(),
+            method: None,
+            body: None,
+            headers: Default::default(),
+            path: None,
+            id_field: None,
+        };
+        let rest = engine::ProtocolSpec::Rest {
+            running: endpoint.clone(),
+            start: endpoint.clone(),
+            stop: endpoint,
+        };
+        let protocols = HashMap::from([("custom".to_string(), rest)]);
+
+        // The built-in preset and a config-defined REST protocol are built separately.
+        for protocol in ["device", "custom"] {
+            let mut reg = engine::Registry::new();
+            for (name, load_timeout) in [("a-short", 60.0), ("b-long", 300.0)] {
+                let mut inf = engine::get_inferencer("openai").expect("built-in");
+                inf.name = name.to_string();
+                inf.management_url = Some("http://device.example:8800".to_string());
+                inf.management_protocol = Some(protocol.to_string());
+                inf.load_timeout = load_timeout;
+                reg.insert(inf);
+            }
+
+            let pools = PoolRegistry::from_registry(&reg, &protocols);
+            for name in ["a-short", "b-long"] {
+                let (manager, _) = pools.get(name).expect("pooled");
+                assert_eq!(manager.backend.load_timeout(), Some(300.0), "{protocol}: {name}");
+            }
+        }
+    }
+
     /// `from_registry` should build a pool ONLY for inferencers that declare a
     /// `management_url`; a plain (non-device) inferencer is skipped entirely.
     #[test]
@@ -1523,6 +1575,7 @@ mod tests {
             pool_max: None,
             queue_max: None,
             queue_timeout: 30.0,
+            load_timeout: 120.0,
             virtual_models: Default::default(),
         });
         reg.add("cloud".to_string(), "http://cloud.example/v1".to_string(), None, serde_json::json!({}));
@@ -1557,6 +1610,7 @@ mod tests {
                 pool_max: None,
                 queue_max: None,
                 queue_timeout: 30.0,
+                load_timeout: 120.0,
                 virtual_models: Default::default(),
             }
         }
