@@ -26,7 +26,9 @@
   `-`. Only `[A-Za-z0-9._/:@-]` is kept, at most 64 characters, so a value cannot add a field.
   A woollamad passes the caller on to its backend in the same header, so the woollamad nearest
   the device logs the original caller, not the forwarder. The value is what the client claims;
-  it is not authenticated.
+  it is not authenticated. The `route=` and `model=` fields now follow the same rule (at most
+  128 characters): a client chooses the model id, and before this a space or a newline in it
+  could add a field or a whole forged line.
 
 - **A client that gives up leaves a line.** When a client disconnected before the answer, axum
   dropped the handler and no access line was written, which read the same as "the request never

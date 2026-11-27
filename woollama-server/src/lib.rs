@@ -759,7 +759,8 @@ fn format_access_line(
     };
     let mut line = format!("woollamad: {method} {path} {status} {elapsed_ms}ms {origin}");
     if let Some(s) = served {
-        line.push_str(&format!(" route={} model={}", s.route, s.model));
+        // A client chooses the model id, and the route is resolved from it: same rule as caller.
+        line.push_str(&format!(" route={} model={}", log_safe(&s.route, ID_MAX), log_safe(&s.model, ID_MAX)));
     }
     if let Some(c) = caller {
         line.push_str(&format!(" caller={c}"));
@@ -773,22 +774,29 @@ fn format_access_line(
 /// the client claimed.
 const CALLER_HEADER: &str = "x-woollama-caller";
 const CALLER_MAX: usize = 64;
+const ID_MAX: usize = 128;
+
+/// A value as the access line may hold it: only `[A-Za-z0-9._/:@-]`, at most `max` characters,
+/// `-` when nothing is left. No space, `=`, CR or LF survives, so a value cannot add a field or a
+/// line.
+fn log_safe(v: &str, max: usize) -> String {
+    let c: String = v.chars().filter(|c| c.is_ascii_alphanumeric() || "._/:@-".contains(*c)).take(max).collect();
+    if c.is_empty() { "-".to_string() } else { c }
+}
 
 /// Who sent this request, as the access line names it: the `x-woollama-caller` header if the
 /// client set one, else `ua:` and the first product token of its User-Agent, else `-`. Only
 /// `[A-Za-z0-9._/:@-]` survives, so a value cannot add a field to the line or forge one.
 fn caller_from(headers: &axum::http::HeaderMap) -> String {
     let get = |n: axum::http::header::HeaderName| headers.get(n).and_then(|v| v.to_str().ok()).map(str::trim);
-    let clean = |v: &str| -> String {
-        v.chars().filter(|c| c.is_ascii_alphanumeric() || "._/:@-".contains(*c)).take(CALLER_MAX).collect()
-    };
+    let clean = |v: &str| log_safe(v, CALLER_MAX);
     if let Some(c) = get(axum::http::header::HeaderName::from_static(CALLER_HEADER)).map(clean) {
-        if !c.is_empty() {
+        if c != "-" {
             return c;
         }
     }
     if let Some(ua) = get(axum::http::header::USER_AGENT).and_then(|u| u.split_whitespace().next()).map(clean) {
-        if !ua.is_empty() {
+        if ua != "-" {
             return format!("ua:{ua}");
         }
     }
@@ -3101,6 +3109,21 @@ mod access_line_tests {
         assert_eq!(caller_from(&h), "ua:OpenAI/Python", "an empty declaration falls back");
         let line = format_access_line("GET", "/v1/models", 200, 1, None, None, Some("kb-indexer"));
         assert!(line.ends_with("origin=local caller=kb-indexer"), "{line}");
+    }
+
+    /// A client chooses the model id, and the route comes from it, so neither may add a field or a
+    /// line to the access line: a space could add a second `caller=`, a newline a forged line.
+    #[test]
+    fn a_client_model_id_cannot_forge_a_field_or_a_line() {
+        let s = Served { route: "dev ice".into(), model: "m caller=admin\nwoollamad: GET /x 200 1ms origin=local".into() };
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 1, None, Some(&s), Some("kb-indexer"));
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+        assert_eq!(line.matches("caller=").count(), 1, "{line}");
+        assert_eq!(line.matches("origin=").count(), 1, "{line}");
+        assert!(line.ends_with("caller=kb-indexer"), "{line}");
+        let ok = Served { route: "hop/device".into(), model: "Qwen/Qwen3-4B-Instruct-2507".into() };
+        let line = format_access_line("POST", "/v1/chat/completions", 200, 1, None, Some(&ok), None);
+        assert!(line.ends_with("route=hop/device model=Qwen/Qwen3-4B-Instruct-2507"), "a real id is kept: {line}");
     }
 
     /// A request whose handler is dropped before it answers still leaves one line, and says why;
