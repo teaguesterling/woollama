@@ -40,7 +40,8 @@
   120 s, so a model that needed longer failed with `502` and `start <id>: not running after
   120s`. The new `inferencers.toml` key takes seconds and defaults to `120`, so existing configs
   behave as before. Routes that share a `management_url` use the largest value among them. The
-  Ollama management protocol ignores it.
+  Ollama management protocol ignores it. A value that is not a number of seconds above `0` and at
+  most `86400` is refused when the config loads.
 
 ### Fixes
 

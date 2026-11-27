@@ -893,10 +893,24 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
             .get("queue_timeout")
             .and_then(Value::as_f64)
             .unwrap_or_else(|| base.as_ref().map_or(30.0, |b| b.queue_timeout));
-        let load_timeout = spec
-            .get("load_timeout")
-            .and_then(Value::as_f64)
-            .unwrap_or_else(|| base.as_ref().map_or(120.0, |b| b.load_timeout));
+        // Refused here, not at use: the pool turns it into a `Duration`, which panics on a
+        // negative, non-finite or huge value, and a non-number would silently mean 120 s.
+        let load_timeout = match spec.get("load_timeout") {
+            None => base.as_ref().map_or(120.0, |b| b.load_timeout),
+            Some(v) => match v.as_f64() {
+                Some(s) if s > 0.0 && s <= 86400.0 => s,
+                _ => {
+                    return Err(EngineError::new(
+                        format!(
+                            "inferencer '{name}': load_timeout must be a number of seconds \
+                             above 0 and at most 86400, got {v}"
+                        ),
+                        "invalid_request_error",
+                        400,
+                    ))
+                }
+            },
+        };
         let virtual_models = spec
             .get("virtual")
             .and_then(Value::as_object)
