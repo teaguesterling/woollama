@@ -1064,7 +1064,8 @@ fn format_stream_end_line(
     bytes: u64,
     outcome: Option<&StreamOutcome>,
 ) -> String {
-    let head = format!("woollamad: stream-end model={label}");
+    // The label holds the client-chosen model id: same rule as the access line.
+    let head = format!("woollamad: stream-end model={}", log_safe(label, 2 * ID_MAX));
     let tail = format!("{elapsed_ms}ms chunks={chunks} bytes={bytes}");
     match outcome {
         Some(StreamOutcome::Complete) => format!("{head} outcome=complete {tail}"),
@@ -3186,6 +3187,15 @@ mod access_line_tests {
         assert!(bad.contains("outcome=upstream_error") && bad.ends_with(r#"error="reset \"by peer\"""#), "{bad}");
         let gone = format_stream_end_line("device/m", 2_000, 1, 10, None);
         assert!(gone.contains("outcome=client_disconnected"), "{gone}");
+    }
+
+    /// The stream-end label holds the client-chosen model id, so it follows the access line's rule.
+    #[test]
+    fn the_stream_end_label_escapes_a_client_model_id() {
+        let line = format_stream_end_line("device/m x=\"y\"\nwoollamad: z", 5, 1, 2, Some(&StreamOutcome::Complete));
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert_eq!(line.split(' ').count(), 7, "one field per name, none added: {line}");
+        assert!(line.starts_with("woollamad: stream-end model=device/mxywoollamad:z outcome=complete"), "{line}");
     }
 
     /// Disabling is opt-out, not opt-in. The default has to be ON: the defect this closes is that
