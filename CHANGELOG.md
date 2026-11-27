@@ -20,6 +20,20 @@
   model=Qwen/Qwen3-4B-Instruct-2507`. The body is unchanged. `woollama/<recipe>` replies carry no
   pair, because a recipe is not a device route.
 
+- **The access line names the caller.** Every client shares one token, so the token cannot say
+  who sent a request. Each line now ends with `caller=`: the value of an `x-woollama-caller`
+  header if the client sets one, else `ua:` and the first product token of its User-Agent, else
+  `-`. Only `[A-Za-z0-9._/:@-]` is kept, at most 64 characters, so a value cannot add a field.
+  A woollamad passes the caller on to its backend in the same header, so the woollamad nearest
+  the device logs the original caller, not the forwarder. The value is what the client claims;
+  it is not authenticated.
+
+- **A client that gives up leaves a line.** When a client disconnected before the answer, axum
+  dropped the handler and no access line was written, which read the same as "the request never
+  reached woollamad". Such a request now writes
+  `woollamad: POST /v1/embeddings 499 61234ms origin=cancelled caller=...`. The backend is not
+  told to stop; that is separate work.
+
 ### Fixes
 
 - **A streamed answer is no longer cut at 180 s.** Every streaming forward used reqwest's
