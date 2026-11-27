@@ -108,6 +108,9 @@ pub struct Inferencer {
     pub queue_max: Option<u32>,
     /// Seconds a request may wait before 503 + Retry-After.
     pub queue_timeout: f64,
+    /// Seconds the device pool polls for a model to report running after `start`, before the
+    /// load fails. Used by REST management protocols; the Ollama protocol ignores it.
+    pub load_timeout: f64,
     /// alias -> real model id; reserved key `default`. TOML key is `virtual`
     /// (`virtual` is a Rust keyword, hence the field rename).
     pub virtual_models: std::collections::BTreeMap<String, String>,
@@ -130,6 +133,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
         pool_max: None,
         queue_max: None,
         queue_timeout: 30.0,
+        load_timeout: 120.0,
         virtual_models: std::collections::BTreeMap::new(),
     };
     match provider {
@@ -152,6 +156,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
                 pool_max: None,
                 queue_max: None,
                 queue_timeout: 30.0,
+                load_timeout: 120.0,
                 virtual_models: std::collections::BTreeMap::new(),
             })
         }
@@ -169,6 +174,7 @@ pub fn get_inferencer(provider: &str) -> Option<Inferencer> {
             pool_max: None,
             queue_max: None,
             queue_timeout: 30.0,
+            load_timeout: 120.0,
             virtual_models: std::collections::BTreeMap::new(),
         }),
         "openai" => Some(cloud("openai", "https://api.openai.com/v1", "OPENAI_API_KEY")),
@@ -887,6 +893,10 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
             .get("queue_timeout")
             .and_then(Value::as_f64)
             .unwrap_or_else(|| base.as_ref().map_or(30.0, |b| b.queue_timeout));
+        let load_timeout = spec
+            .get("load_timeout")
+            .and_then(Value::as_f64)
+            .unwrap_or_else(|| base.as_ref().map_or(120.0, |b| b.load_timeout));
         let virtual_models = spec
             .get("virtual")
             .and_then(Value::as_object)
@@ -913,6 +923,7 @@ fn build_config_registry() -> Result<HashMap<String, Inferencer>, EngineError> {
                 pool_max,
                 queue_max,
                 queue_timeout,
+                load_timeout,
                 virtual_models,
             },
         );
@@ -961,6 +972,7 @@ impl Registry {
                 pool_max: None,
                 queue_max: None,
                 queue_timeout: 30.0,
+                load_timeout: 120.0,
                 virtual_models: std::collections::BTreeMap::new(),
             },
         );

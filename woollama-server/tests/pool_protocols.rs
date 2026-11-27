@@ -37,6 +37,7 @@ fn device_inferencer(name: &str, management_url: String, management_protocol: Op
         pool_max: None,
         queue_max: None,
         queue_timeout: 30.0,
+        load_timeout: 120.0,
         virtual_models: Default::default(),
     }
 }

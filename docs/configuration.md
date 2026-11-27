@@ -493,6 +493,7 @@ parallel = 1                                # concurrent requests the backend se
 pool_max = 2                                # max concurrently-loaded models before eviction
 queue_max = 8                               # requests queued per model before 503
 queue_timeout = 30                          # seconds a queued request waits before 503
+load_timeout = 120                          # seconds to wait for a model to load before 502
 
 [inferencers.device.virtual]
 default = "big-model-7b"     # device/default -> whatever's currently loaded, else this
@@ -506,6 +507,7 @@ coder = "code-model-14b"     # device/coder -> code-model-14b
 | `pool_max` | — | Max models kept loaded at once. When a new model is needed at capacity, the LRU **idle** model is evicted to fit (never a model that's in-flight or has a queued request). If every loaded model is busy, the request **waits** for one to free up rather than being refused — see *Queueing across a model swap* below. Unset ⇒ no cap and no auto-eviction. |
 | `queue_max` | — | Max requests queued per model (not per device) before woollama returns `503` + `Retry-After` instead of enqueuing more. Unset ⇒ no queue-depth limit (only `queue_timeout` bounds the wait). |
 | `queue_timeout` | — | Seconds a request waits for its turn before woollama gives up and returns `503` + `Retry-After` (default `30`). Bounds three waits: a place in a model's queue, a cold load, and — since v0.15 — a **model swap** on a full device. |
+| `load_timeout` | — | Seconds woollama waits for a model to report running after it asks the backend to start it (default `120`). Past that, the request fails with `502`. Raise it for large models on a slow device. Routes sharing a `management_url` use the **largest** value among them, and a route that omits the key counts as `120`. The Ollama management protocol ignores it. |
 | `virtual` | — | Table of alias → real model id. The reserved key `default` resolves `<provider>/default` against the backend's **current residency, read from the backend itself** at request time, falling back to this table entry if nothing is loaded. Other keys are ordinary aliases (`<provider>/<alias>` → the real id). |
 
 #### Model capabilities — what `default` is allowed to pick
